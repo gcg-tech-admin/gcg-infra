@@ -1,0 +1,20 @@
+[Unit]
+Description=GCG OpenAI Codex OAuth Token Refresh
+Documentation=https://github.com/gcg/fleet-infra#89
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/gcg-openai-oauth-refresh.sh
+User=root
+# Fail loudly — systemd marks failed so it shows in systemctl --failed
+# and alerts are visible. No RestartSec to avoid tight retry loop.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-oauth-refresh
+# Minimal attack surface
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/root/.openclaw/credentials/auth-profiles /etc/credstore.encrypted /var/log/gcg /opt/gcg/_archived /run
+ReadOnlyPaths=/root/.config/openclaw /run/openclaw-talos/env /opt/gcg/shared/bin

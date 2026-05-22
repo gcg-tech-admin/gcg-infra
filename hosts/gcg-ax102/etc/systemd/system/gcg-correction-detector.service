@@ -1,0 +1,19 @@
+[Unit]
+Description=GCG Correction Detector — session correction signal watcher
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/correction_detector.py --hours 1
+WorkingDirectory=/opt/gcg/shared/scripts
+StandardOutput=append:/opt/gcg/shared/logs/correction_detector.log
+StandardError=append:/opt/gcg/shared/logs/correction_detector.log
+SyslogIdentifier=correction-detector
+
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=GCG LightRAG Queue Drainer (Blocker #4 fix)
+Documentation=file:/opt/gcg/shared/docs/runbooks/session_end_hook.md
+After=network.target
+Wants=gcg-lightrag-drainer.timer
+
+[Service]
+Type=oneshot
+Slice=lightrag.slice
+User=root
+WorkingDirectory=/opt/gcg/shared
+Environment=GCG_DB_HOST=10.0.0.2
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/lightrag_queue_drainer.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-lightrag-drainer
+TimeoutStartSec=600

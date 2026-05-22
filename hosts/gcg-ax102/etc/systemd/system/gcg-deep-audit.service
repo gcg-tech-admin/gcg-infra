@@ -1,0 +1,9 @@
+[Unit]
+Description=GCG deep_audit_v2 sweep
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/gcg-deep-audit-wrapper.sh
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30m

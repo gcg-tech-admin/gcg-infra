@@ -1,0 +1,30 @@
+[Unit]
+Description=OpenClaw Agent - Angela (GCG - Jacques Isabelle)
+After=network.target docker.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=angela
+Environment=HOOK_AGENT_ID=angela
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-angela
+EnvironmentFile=/opt/gcg/openclaw-angela/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-angela/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-angela/state
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-angela/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+MemoryMax=3G
+MemoryHigh=2G
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/gcg/openclaw-angela/logs/gateway.log
+StandardError=append:/opt/gcg/openclaw-angela/logs/gateway.log
+
+[Install]
+WantedBy=multi-user.target

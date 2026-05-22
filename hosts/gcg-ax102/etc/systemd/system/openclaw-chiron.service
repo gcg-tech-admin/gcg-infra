@@ -1,0 +1,33 @@
+[Unit]
+StartLimitBurst=5
+StartLimitIntervalSec=300
+Description=OpenClaw Agent - Chiron (Health Research)
+After=network.target
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+EnvironmentFile=-/opt/gcg/shared/credentials/gateway.env
+EnvironmentFile=-/opt/gcg/openclaw-chiron/.env
+Environment=FLEET_AGENT_NAME=chiron
+Environment=HOOK_AGENT_ID=chiron
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-chiron
+Environment=HOME=/opt/gcg/openclaw-chiron
+Environment=NODE_OPTIONS=--max-old-space-size=3072
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-chiron/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-chiron/state
+Environment=GOOGLE_API_KEY_FILE=/opt/gcg/shared/credentials/google-api-key.txt
+Environment=ANTHROPIC_API_KEY_FILE=/opt/gcg/shared/credentials/anthropic-api-key.txt
+Environment=NODE_ENV=production
+ExecStartPre=/bin/sh -c 'rm -f /opt/gcg/openclaw-chiron/state/.openclaw/agents/*/sessions/*.jsonl.lock'
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-chiron/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+Restart=always
+RestartSec=15
+MemoryMax=4G
+MemoryHigh=10G
+
+[Install]
+WantedBy=multi-user.target

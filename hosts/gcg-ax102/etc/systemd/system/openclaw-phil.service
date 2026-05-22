@@ -1,0 +1,29 @@
+[Unit]
+Description=OpenClaw Agent - phil
+After=network.target docker.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=phil
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-phil
+EnvironmentFile=/opt/gcg/openclaw-phil/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-phil/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-phil/state
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-phil/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+MemoryMax=3G
+MemoryHigh=2G
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/gcg/logs/openclaw-phil/gateway.log
+StandardError=append:/opt/gcg/logs/openclaw-phil/gateway.log
+
+[Install]
+WantedBy=multi-user.target

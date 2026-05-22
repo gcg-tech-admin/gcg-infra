@@ -1,0 +1,19 @@
+[Unit]
+Description=GCG QA Loop — Vulcan Orchestrator
+After=network.target
+Documentation=https://gcg-hetzner/opt/gcg/shared/docs/architecture/QA_LOOP_ARCHITECTURE.md
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+User=root
+WorkingDirectory=/opt/gcg/shared/gcg_tools
+ExecStart=/opt/gcg/shared/venv/bin/python3 -m qa_verifier vulcan
+Environment=PYTHONPATH=/opt/gcg/shared/gcg_tools
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-qa-vulcan
+
+[Install]
+WantedBy=multi-user.target

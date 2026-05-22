@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""
+gcg-doc-sort — classify + move docs into canonical buckets per DOC_ONTOLOGY_CANONICAL.md
+
+Buckets (per canonical doc §2):
+  - architecture/  → how something is built (design, schema, decisions)
+  - reference/     → how to use something (usage, runbooks, sops, playbooks, guides)
+  - handoffs/      → cold-start briefings (top-level /opt/gcg/shared/handoffs/, NOT docs/)
+  - reviews/       → point-in-time audits, redteams, postmortems
+
+Existing subdir mapping (per canonical §4):
+  compliance → reference (with `compliance` tag)
+  council → architecture
+  decisions → architecture
+  fleet → architecture or reference (per-doc)
+  guides → reference
+  playbooks → reference
+  proposals → architecture
+  research → reference (with `research` tag)
+  rollback_refs → reference (with `rollback` tag)
+  runbooks → reference
+  sops → reference
+  strategies → architecture
+
+Classification signal priority:
+  1. Frontmatter `bucket:` field (if present)
+  2. Filename pattern (date-prefix → handoffs/reviews; topic-architecture → architecture; etc.)
+  3. Source subdir mapping table
+  4. Default: leave in place, flag for human review
+
+Default mode: --dry-run. Use --apply to actually move.
+
+Usage:
+    gcg-doc-sort                          # dry-run, all docs
+    gcg-doc-sort --apply                  # actually move, all docs
+    gcg-doc-sort --only research          # only process research/ subdir
+    gcg-doc-sort --only council --apply   # move council/ docs to architecture/
+    gcg-doc-sort --dest <bucket>          # override inferred bucket
+    gcg-doc-sort --json                   # machine-readable output
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+DOCS_ROOT = Path("/opt/gcg/shared/docs")
+HANDOFFS_ROOT = Path("/opt/gcg/shared/handoffs")
+ARCHIVED_ROOT = DOCS_ROOT / "_archived"
+
+# Canonical buckets per DOC_ONTOLOGY_CANONICAL §2
+BUCKETS = ("architecture", "reference", "handoffs", "reviews")
+
+# Source-subdir → target-bucket map (per canonical §4)
+SUBDIR_MAP = {
+    "architecture":  ("architecture", None),
+    "reference":     ("reference",    None),
+    "compliance":    ("reference",    "compliance"),
+    "council":       ("architecture", "council"),
+    "decisions":     ("architecture", "decision"),
+    "fleet":         ("architecture", "agent-fleet"),  # default; per-doc may override
+    "guides":        ("reference",    None),
+    "playbooks":     ("reference",    None),
+    "proposals":     ("architecture", "proposal"),
+    "research":      ("reference",    "research"),
+    "rollback_refs": ("reference",    "rollback"),
+    "runbooks":      ("reference",    None),
+    "sops":          ("reference",    None),
+    "strategies":    ("architecture", None),
+    "reviews":       ("reviews",      None),
+}
+
+# Top-level handoffs dir (separate from docs/)
+HANDOFFS_SUBDIR_MAP = {None: ("handoffs", None)}  # everything in /opt/gcg/shared/handoffs/
+
+# Filename hints
+DATE_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2})[-_].+\.md$")
+HANDOFF_HINT = re.compile(r"(?i)handoff|briefing")
+REVIEW_HINT = re.compile(r"(?i)review|audit|redteam|red-team|postmortem|post-mortem|retrospective")
+
+FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+
+def read_frontmatter(path: Path):
+    """Return dict or None."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = f.read(4096)
+    except Exception:
+        return None
+    m = FRONTMATTER_RE.match(head)
+    if not m:
+        return None
+    raw = m.group(1)
+    out = {}
+    for line in raw.splitlines():
+        if ":" in line:
+            k, _, v = line.partition(":")
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out or None
+
+
+def classify(path: Path):
+    """Return (target_bucket, suggested_tag, reason)."""
+    fm = read_frontmatter(path)
+
+    # 1. Frontmatter override
+    if fm and fm.get("bucket") in BUCKETS:
+        return (fm["bucket"], None, f"frontmatter bucket={fm['bucket']}")
+
+    # 2. Filename hints
+    name = path.name
+    if HANDOFF_HINT.search(name):
+        return ("handoffs", None, "filename contains 'handoff' or 'briefing'")
+    if REVIEW_HINT.search(name):
+        return ("reviews", None, "filename contains review/audit/redteam pattern")
+
+    # 3. Source-subdir map
+    # Determine which top-level we're in
+    try:
+        rel = path.relative_to(DOCS_ROOT)
+    except ValueError:
+        try:
+            rel = path.relative_to(HANDOFFS_ROOT)
+            return ("handoffs", None, "already under /opt/gcg/shared/handoffs/")
+        except ValueError:
+            return (None, None, f"path outside known roots: {path}")
+
+    parts = rel.parts
+    if len(parts) == 1:
+        # Loose file at docs root — no bucket
+        return (None, None, "loose file at docs/ root — needs manual placement")
+
+    subdir = parts[0]
+    if subdir == "_archived":
+        return (None, None, "archived — skip")
+    if subdir.startswith("."):
+        return (None, None, "hidden dir — skip")
+
+    if subdir in SUBDIR_MAP:
+        bucket, tag = SUBDIR_MAP[subdir]
+        # Date-prefix in architecture/ → check filename for handoff/review hints again
+        if subdir == "architecture" and DATE_PREFIX.match(name):
+            if HANDOFF_HINT.search(name):
+                return ("handoffs", tag, f"in architecture/ but filename suggests handoff")
+            if REVIEW_HINT.search(name):
+                return ("reviews", tag, f"in architecture/ but filename suggests review")
+            return (bucket, tag, f"in architecture/ with date prefix — keep but flag for rename")
+        return (bucket, tag, f"subdir map: {subdir} → {bucket}")
+
+    return (None, None, f"unknown subdir '{subdir}' — needs map entry")
+
+
+def plan_move(path: Path, target_bucket: str):
+    """Return (target_path, would_collide, action)."""
+    if target_bucket == "handoffs":
+        target_dir = HANDOFFS_ROOT
+    else:
+        target_dir = DOCS_ROOT / target_bucket
+
+    # If already in the right place, no move
+    try:
+        path.relative_to(target_dir)
+        return (None, False, "already in target bucket")
+    except ValueError:
+        pass
+
+    target_path = target_dir / path.name
+    collision = target_path.exists() and not target_path.is_symlink()
+    if collision:
+        return (target_path, True, "WOULD COLLIDE with existing file")
+    return (target_path, False, "ready to move + symlink")
+
+
+def do_move(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    # Symlink old location → new
+    rel = os.path.relpath(dst, src.parent)
+    os.symlink(rel, src)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Classify + move docs into canonical buckets.")
+    ap.add_argument("--apply", action="store_true", help="Actually move (default: dry-run).")
+    ap.add_argument("--only", help="Only process this subdir under docs/ (e.g. 'research', 'council').")
+    ap.add_argument("--dest", choices=BUCKETS, help="Override inferred bucket.")
+    ap.add_argument("--json", action="store_true", help="Machine-readable output.")
+    ap.add_argument("--limit", type=int, default=None, help="Cap number of items processed.")
+    args = ap.parse_args()
+
+    if not args.apply:
+        if not args.json:
+            print("=== DRY RUN — no files moved. Pass --apply to commit. ===\n")
+
+    # Walk
+    roots = []
+    if args.only:
+        only_path = DOCS_ROOT / args.only
+        if not only_path.is_dir():
+            print(f"FATAL: --only target does not exist: {only_path}", file=sys.stderr)
+            sys.exit(2)
+        roots.append(only_path)
+    else:
+        roots = [DOCS_ROOT, HANDOFFS_ROOT]
+
+    results = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for r, dirs, files in os.walk(root):
+            # Skip _archived
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "_archived"]
+            for f in files:
+                if not f.endswith(".md"):
+                    continue
+                p = Path(r) / f
+                # Skip symlinks — they've already been relocated. Their target gets processed instead.
+                if p.is_symlink():
+                    continue
+                bucket, tag, reason = classify(p)
+                if args.dest:
+                    bucket = args.dest
+                    reason = f"--dest override → {bucket}"
+
+                entry = {
+                    "path": str(p),
+                    "bucket": bucket,
+                    "tag": tag,
+                    "reason": reason,
+                    "action": "skip",
+                    "target": None,
+                    "collision": False,
+                }
+                if bucket is not None:
+                    target, collision, action = plan_move(p, bucket)
+                    entry["target"] = str(target) if target else None
+                    entry["collision"] = collision
+                    entry["action"] = action
+
+                results.append(entry)
+                if args.limit and len(results) >= args.limit:
+                    break
+            if args.limit and len(results) >= args.limit:
+                break
+        if args.limit and len(results) >= args.limit:
+            break
+
+    # Summarize
+    by_bucket = {}
+    by_action = {}
+    collisions = []
+    unmapped = []
+    for e in results:
+        by_bucket[e["bucket"]] = by_bucket.get(e["bucket"], 0) + 1
+        by_action[e["action"]] = by_action.get(e["action"], 0) + 1
+        if e["collision"]:
+            collisions.append(e)
+        if e["bucket"] is None:
+            unmapped.append(e)
+
+    if args.json:
+        json.dump({
+            "dry_run": not args.apply,
+            "total": len(results),
+            "by_bucket": by_bucket,
+            "by_action": by_action,
+            "collisions": collisions,
+            "unmapped": unmapped,
+            "items": results,
+        }, sys.stdout, indent=2, default=str)
+        sys.stdout.write("\n")
+    else:
+        print(f"Scanned: {len(results)} docs")
+        print("\nBy target bucket:")
+        for b, n in sorted(by_bucket.items(), key=lambda x: (x[0] or "", -x[1])):
+            print(f"  {b or '(unmapped)':>16} : {n}")
+        print("\nBy action:")
+        for a, n in sorted(by_action.items(), key=lambda x: -x[1]):
+            print(f"  {a:>40} : {n}")
+        if collisions:
+            print(f"\n!!! Collisions ({len(collisions)} — would not auto-move):")
+            for c in collisions[:20]:
+                print(f"  {c['path']}\n     → {c['target']} (collision)")
+        if unmapped:
+            print(f"\n? Unmapped ({len(unmapped)} — needs review):")
+            for u in unmapped[:20]:
+                print(f"  {u['path']}  [{u['reason']}]")
+
+    # Apply
+    if args.apply:
+        moved = 0
+        skipped = 0
+        errors = 0
+        for e in results:
+            if e["bucket"] is None or e["collision"]:
+                skipped += 1
+                continue
+            if e["action"] == "already in target bucket":
+                continue
+            if not e["target"]:
+                continue
+            try:
+                do_move(Path(e["path"]), Path(e["target"]))
+                moved += 1
+            except Exception as ex:
+                errors += 1
+                print(f"ERROR moving {e['path']}: {ex}", file=sys.stderr)
+        print(f"\n=== APPLIED: moved={moved} skipped={skipped} errors={errors} ===")
+        if moved > 0:
+            print("Symlinks left at old paths. Re-run `knowledge_maintenance.py` to refresh KNOWLEDGE_INDEX.")
+
+
+if __name__ == "__main__":
+    main()

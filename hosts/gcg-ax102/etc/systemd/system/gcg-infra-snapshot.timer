@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily infra snapshot at 04:00 Dubai
+[Timer]
+OnCalendar=*-*-* 04:00:00 Asia/Dubai
+AccuracySec=2min
+Persistent=true
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,40 @@
+[Unit]
+Description=GCG Daily LLM Security Review (DeepSeek V4 Flash)
+Documentation=https://github.com/gcg-internal/fleet-ops
+After=network-online.target
+Wants=network-online.target
+# Run after deep audit completes (deep audit fires at 02:30 Dubai = 22:30 UTC)
+# We run at 02:00 UTC (06:00 Dubai), which is before the audit timer but after
+# the prior day's audit logs are accumulated. This is intentional — we review
+# the accumulated 24h window, not just the most recent single audit run.
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/gcg/shared/bin/gcg-daily-security-review.sh
+
+# Load the same credentials as openclaw agents:
+# op-sa-token needed to fetch DeepSeek key from 1Password
+LoadCredentialEncrypted=op-sa-token:/etc/credstore.encrypted/op-sa-token
+LoadCredentialEncrypted=db-env:/etc/credstore.encrypted/db-env
+
+# Reasonable resource limits — don't starve the fleet
+CPUQuota=20%
+MemoryMax=256M
+TimeoutStartSec=300
+
+# Logging
+StandardOutput=append:/var/log/gcg/security-review-runner.log
+StandardError=append:/var/log/gcg/security-review-runner.log
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=no
+# Note: NOT using ProtectSystem=strict because we need to write to /var/log/gcg
+# and /opt/gcg paths. AX102 is root-only so this is acceptable.
+
+[Install]
+# Timer activates this unit; no direct WantedBy needed.
+# Enable the .timer, not this .service directly.
+WantedBy=gcg-daily-security-review.timer

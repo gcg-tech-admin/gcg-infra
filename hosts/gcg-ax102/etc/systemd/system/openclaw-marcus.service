@@ -1,0 +1,28 @@
+[Unit]
+StartLimitBurst=5
+StartLimitIntervalSec=300
+Description=OpenClaw Agent - Marcus (GCG Sales Advisor)
+After=network.target
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=marcus
+Environment=HOOK_AGENT_ID=marcus
+Type=simple
+WorkingDirectory=/opt/gcg/openclaw-marcus
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-marcus/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+EnvironmentFile=/opt/gcg/openclaw-marcus/.env
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-marcus/state
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-marcus/openclaw.json
+Environment=NODE_ENV=production
+MemoryMax=3G
+MemoryHigh=2G
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

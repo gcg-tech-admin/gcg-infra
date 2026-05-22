@@ -1,0 +1,304 @@
+#!/bin/bash
+# fleet — GCG fleet CLI
+# Adds durable a2a inbox via Postgres `agent_messages` table on AX42.
+# Backed by gcg_fleet role (INSERT/SELECT/UPDATE only).
+#
+# Subcommands:
+#   list                          — list agents + service status
+#   status <agent>                — service status of one agent
+#   ping <agent> <msg>            — drop NOTICE.md in agent's workspace (legacy)
+#   broadcast <msg>               — NOTICE.md to every agent (legacy)
+#   exec <agent> <cmd...>         — run command from agent's workspace
+#   send [--from S] <to> <msg>    — durable a2a message via Postgres
+#   inbox <agent> [--all]         — show open (pending|delivered|acked|in_progress|blocked) messages
+#   ack <id>                      — legacy: mark delivered (use `start` going forward)
+#   start <id>                    — agent claims it: status=in_progress
+#   progress <id> <note>          — update progress_note (status unchanged)
+#   block <id> <reason>           — agent stuck: status=blocked + reason
+#   done <id>                     — mark complete: status=done
+#   fail <id> <reason>            — could not process: status=failed + reason
+#   cancel <id>                   — sender/operator withdraws: status=cancelled
+#   reply <id> <msg>              — reply to a message (preserves correlation_id)
+#   tail [agent] [N]              — last N messages (default 20), optionally filtered
+#
+# DB credentials: /opt/gcg/shared/credentials/db/gcg_fleet.pwd
+
+set -euo pipefail
+
+PGUSER_FLEET="gcg_fleet"
+PGHOST="95.217.114.49"
+PGPORT="5432"
+PGDB="gcg_intelligence"
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+
+# ----- helpers -----
+
+_psql() {
+  # Pipe SQL on stdin OR pass it as $1. Uses fleet role.
+  if [ ! -r "$PWD_FILE" ]; then
+    echo "fleet: cannot read $PWD_FILE" >&2; exit 1
+  fi
+  PGPASSWORD=$(tr -d '\r\n' < "$PWD_FILE") \
+    psql "host=$PGHOST port=$PGPORT user=$PGUSER_FLEET dbname=$PGDB sslmode=require" \
+    -v ON_ERROR_STOP=1 "$@"
+}
+
+_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then uuidgen; else
+    cat /proc/sys/kernel/random/uuid
+  fi
+}
+
+_resolve_sender() {
+  # If --from passed, use it. Else default to 'cowork' (or $FLEET_SENDER).
+  echo "${FLEET_SENDER:-cowork}"
+}
+
+# Lookup hostname of the *agent* running this CLI, if any.
+# When fleet is invoked from inside an openclaw service unit, AGENT_NAME may be set.
+_self_agent() { echo "${AGENT_NAME:-}"; }
+
+# Validate an agent name: lowercase letters + digits only (matches the openclaw-<name> dir pattern).
+# Stops path-traversal and weird input from leaking into shell or SQL contexts.
+_validate_agent() {
+  case "$1" in
+    *[!a-z0-9]*|'') echo "fleet: invalid agent name '$1'" >&2; exit 2;;
+  esac
+}
+
+# ----- subcommands -----
+
+cmd_list() {
+  systemctl list-units 'openclaw-*.service' --no-legend --plain | awk '{print $1, $4}'
+}
+
+cmd_status() {
+  local agent="${1:?usage: fleet status <agent>}"
+  _validate_agent "$agent"
+  systemctl status "openclaw-${agent}.service" --no-pager -l | head -20
+}
+
+cmd_ping() {
+  local agent="${1:?usage: fleet ping <agent> <msg>}"; shift
+  _validate_agent "$agent"
+  local msg="${*:?usage: fleet ping <agent> <msg>}"
+  local ws="/opt/gcg/openclaw-${agent}/workspace"
+  [ ! -d "$ws" ] && { echo "no workspace for $agent" >&2; exit 1; }
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  {
+    echo "## NOTICE from $(_resolve_sender) — $ts"
+    echo "$msg"
+  } > "$ws/NOTICE.md"
+  echo "delivered to $ws/NOTICE.md"
+}
+
+cmd_broadcast() {
+  local msg="${*:?usage: fleet broadcast <msg>}"
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local n=0
+  for ws in /opt/gcg/openclaw-*/workspace; do
+    { echo "## NOTICE from $(_resolve_sender) — $ts"; echo "$msg"; } > "$ws/NOTICE.md"
+    n=$((n+1))
+  done
+  echo "delivered to $n agents"
+}
+
+cmd_exec() {
+  local agent="${1:?usage: fleet exec <agent> <cmd>}"; shift
+  _validate_agent "$agent"
+  local ws="/opt/gcg/openclaw-${agent}/workspace"
+  [ ! -d "$ws" ] && { echo "fleet exec: no workspace for '$agent'" >&2; exit 1; }
+  cd "$ws" && "$@"
+}
+
+cmd_send() {
+  # Optional: --from <sender>, --correlation <uuid>, --parent <id>, --priority <1-9>, --type <task_type>
+  local sender corr parent prio ttype
+  sender=""; corr=""; parent="NULL"; prio=5; ttype="message"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)        sender="$2"; shift 2;;
+      --correlation) corr="$2"; shift 2;;
+      --parent)      parent="$2"; shift 2;;
+      --priority)    prio="$2"; shift 2;;
+      --type)        ttype="$2"; shift 2;;
+      --)            shift; break;;
+      *)             break;;
+    esac
+  done
+  local to="${1:?usage: fleet send [--from S] <to> <msg>}"; shift
+  local msg="${*:?usage: fleet send [--from S] <to> <msg>}"
+  _validate_agent "$to"
+  [ -z "$sender" ] && sender=$(_resolve_sender)
+  [ -z "$corr" ] && corr=$(_uuid)
+  local nonce; nonce=$(_uuid)
+
+  # Use psql variables so the message is safely quoted regardless of contents
+  _psql -tA \
+    -v corr="$corr" -v parent="$parent" -v sender="$sender" -v to="$to" \
+    -v ttype="$ttype" -v prio="$prio" -v nonce="$nonce" -v msg="$msg" <<'SQL'
+INSERT INTO agent_messages
+  (correlation_id, parent_id, sender, recipient, task_type, payload, priority, nonce)
+VALUES
+  (:'corr', NULLIF(:'parent','NULL')::bigint, :'sender', :'to', :'ttype',
+   jsonb_build_object('text', :'msg'),
+   :'prio'::smallint, :'nonce')
+RETURNING id, correlation_id, status;
+SQL
+}
+
+cmd_inbox() {
+  local agent="${1:?usage: fleet inbox <agent> [--all]}"; shift || true
+  _validate_agent "$agent"
+  if [ "${1:-}" = "--all" ]; then
+    _psql -v agent="$agent" <<'SQL'
+\pset border 2
+SELECT id, sender, task_type, status, priority,
+       to_char(issued_at, 'YYYY-MM-DD HH24:MI:SS') AS issued,
+       left(payload->>'text', 80) AS preview
+  FROM agent_messages
+ WHERE recipient = :'agent'
+ ORDER BY issued_at DESC
+ LIMIT 50;
+SQL
+  else
+    # "open" inbox = anything not yet done / failed / cancelled
+    _psql -v agent="$agent" <<'SQL'
+\pset border 2
+SELECT id, sender, task_type, status, priority,
+       to_char(issued_at, 'YYYY-MM-DD HH24:MI:SS') AS issued,
+       left(coalesce(progress_note, blocked_reason, payload->>'text'), 60) AS preview
+  FROM agent_messages
+ WHERE recipient = :'agent'
+   AND status IN ('pending','delivered','acked','in_progress','blocked')
+ ORDER BY priority ASC, issued_at ASC;
+SQL
+  fi
+}
+
+cmd_ack()    { local id="${1:?usage: fleet ack <id>}";    _set_status "$id" acked       acked_at;   }
+cmd_done()   { local id="${1:?usage: fleet done <id>}";   _set_status "$id" done        done_at;    }
+cmd_start()  { local id="${1:?usage: fleet start <id>}";  _set_status "$id" in_progress started_at; }
+cmd_fail()   {
+  local id="${1:?usage: fleet fail <id> <reason>}"; shift
+  local reason="${*:?usage: fleet fail <id> <reason>}"
+  _psql -tA -v id="$id" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET status = 'failed', done_at = NOW(), blocked_reason = :'reason'
+ WHERE id = :'id'::bigint
+RETURNING id, status;
+SQL
+}
+cmd_cancel() {
+  local id="${1:?usage: fleet cancel <id>}"; _set_status "$id" cancelled done_at
+}
+cmd_block() {
+  local id="${1:?usage: fleet block <id> <reason>}"; shift
+  local reason="${*:?usage: fleet block <id> <reason>}"
+  _psql -tA -v id="$id" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET status = 'blocked', blocked_at = NOW(), blocked_reason = :'reason'
+ WHERE id = :'id'::bigint
+RETURNING id, status;
+SQL
+}
+cmd_progress() {
+  local id="${1:?usage: fleet progress <id> <note>}"; shift
+  local note="${*:?usage: fleet progress <id> <note>}"
+  _psql -tA -v id="$id" -v note="$note" <<'SQL'
+UPDATE agent_messages
+   SET progress_note = :'note'
+ WHERE id = :'id'::bigint
+RETURNING id, status, progress_note;
+SQL
+}
+
+_set_status() {
+  local id="$1"; local new="$2"; local tscol="$3"
+  # Hard whitelist on the timestamp column — only these are valid.
+  # Prevents future refactors from accidentally introducing SQL injection.
+  case "$tscol" in
+    acked_at|done_at|started_at|blocked_at) ;;
+    *) echo "_set_status: invalid tscol '$tscol'" >&2; exit 2;;
+  esac
+  # id is interpolated as ::bigint via psql var; rejected if non-numeric.
+  _psql -tA -v id="$id" -v new="$new" <<SQL
+UPDATE agent_messages
+   SET status = :'new', $tscol = NOW()
+ WHERE id = :'id'::bigint
+RETURNING id, status, $tscol;
+SQL
+}
+
+cmd_reply() {
+  local id="${1:?usage: fleet reply <id> <msg>}"; shift
+  local msg="${*:?usage: fleet reply <id> <msg>}"
+  local sender; sender=$(_resolve_sender)
+  local nonce; nonce=$(_uuid)
+  _psql -tA -v id="$id" -v sender="$sender" -v nonce="$nonce" -v msg="$msg" <<'SQL'
+WITH src AS (
+  SELECT correlation_id, sender, recipient FROM agent_messages WHERE id = :'id'::bigint
+)
+INSERT INTO agent_messages
+  (correlation_id, parent_id, sender, recipient, task_type, payload, nonce)
+SELECT src.correlation_id, :'id'::bigint, :'sender', src.sender, 'reply',
+       jsonb_build_object('text', :'msg'), :'nonce'
+  FROM src
+RETURNING id, correlation_id, sender, recipient, status;
+SQL
+}
+
+cmd_tail() {
+  local agent="${1:-}"; local n="${2:-20}"
+  # Validate n is numeric
+  case "$n" in (*[!0-9]*|'') n=20;; esac
+  if [ -z "$agent" ]; then
+    _psql -v n="$n" <<'SQL'
+\pset border 2
+SELECT id, sender, recipient, task_type, status,
+       to_char(issued_at, 'MM-DD HH24:MI:SS') AS t,
+       left(payload->>'text', 60) AS preview
+  FROM agent_messages
+ ORDER BY id DESC
+ LIMIT :'n'::int;
+SQL
+  else
+    _psql -v agent="$agent" -v n="$n" <<'SQL'
+\pset border 2
+SELECT id, sender, recipient, task_type, status,
+       to_char(issued_at, 'MM-DD HH24:MI:SS') AS t,
+       left(payload->>'text', 60) AS preview
+  FROM agent_messages
+ WHERE recipient = :'agent' OR sender = :'agent'
+ ORDER BY id DESC
+ LIMIT :'n'::int;
+SQL
+  fi
+}
+
+# ----- dispatch -----
+
+CMD="${1:-list}"
+shift || true
+case "$CMD" in
+  list)      cmd_list "$@" ;;
+  status)    cmd_status "$@" ;;
+  ping)      cmd_ping "$@" ;;
+  broadcast) cmd_broadcast "$@" ;;
+  exec)      cmd_exec "$@" ;;
+  send)      cmd_send "$@" ;;
+  inbox)     cmd_inbox "$@" ;;
+  ack)       cmd_ack "$@" ;;
+  start)     cmd_start "$@" ;;
+  progress)  cmd_progress "$@" ;;
+  block)     cmd_block "$@" ;;
+  done)      cmd_done "$@" ;;
+  fail)      cmd_fail "$@" ;;
+  cancel)    cmd_cancel "$@" ;;
+  reply)     cmd_reply "$@" ;;
+  tail)      cmd_tail "$@" ;;
+  help|-h|--help)
+    sed -n '2,30p' "$0" ; exit 0 ;;
+  *)
+    echo "unknown: $CMD (try: fleet help)" >&2 ; exit 2 ;;
+esac

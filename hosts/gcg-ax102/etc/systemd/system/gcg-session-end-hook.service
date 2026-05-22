@@ -1,0 +1,16 @@
+[Unit]
+Description=GCG Session End Hook — Extracts lessons from agent conversations
+After=network.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/opt/gcg/shared/credentials/session_end_hook.env
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/session_end_hook.py
+Restart=always
+RestartSec=30s
+StandardOutput=append:/opt/gcg/shared/logs/session_end_hook.log
+StandardError=append:/opt/gcg/shared/logs/session_end_hook.log
+
+[Install]
+WantedBy=multi-user.target

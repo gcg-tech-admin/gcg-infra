@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly GCG inbox janitor
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Unit=gcg-inbox-janitor.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

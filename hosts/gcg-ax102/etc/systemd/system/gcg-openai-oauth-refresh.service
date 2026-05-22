@@ -1,0 +1,7 @@
+[Unit]
+Description=Refresh OpenAI OAuth Token
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/gcg-openai-oauth-refresh.sh

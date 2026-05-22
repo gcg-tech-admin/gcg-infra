@@ -1,0 +1,92 @@
+#!/bin/bash
+# gcg-inbox-janitor — periodic maintenance for the agent_messages table.
+#   1. ALERT on stuck acked rows: status=acked, acked_at older than 1h, done_at NULL.
+#      Reports count + per-recipient breakdown to stderr + journal.
+#   2. RETENTION: delete done rows older than 30 days.
+#   3. METRICS: print current size + status histogram (low-noise, for journal).
+#
+# Run hourly via gcg-inbox-janitor.timer.
+# Uses gcg_admin so it can DELETE (per-agent roles can't, gcg_fleet can't).
+
+set -euo pipefail
+
+VPWD=$(/opt/gcg/shared/scripts/vault_read.sh) || { echo "janitor: vault read failed" >&2; exit 1; }
+PGCONN="host=95.217.114.49 port=5432 user=gcg_admin dbname=gcg_intelligence sslmode=require"
+
+# 1a. Stuck delivered (poller delivered but agent never acknowledged within 1h)
+STUCK_DEL=$(PGPASSWORD="$VPWD" psql "$PGCONN" -tA -F $'\t' <<'SQL'
+SELECT count(*),
+       COALESCE(string_agg(format('%s:%s', recipient, c), ', '), '')
+  FROM (
+    SELECT recipient, count(*) AS c FROM agent_messages
+     WHERE status IN ('delivered','acked')
+       AND acked_at < NOW() - INTERVAL '1 hour'
+     GROUP BY recipient ORDER BY 2 DESC
+  ) t;
+SQL
+)
+IFS=$'\t' read -r COUNT BREAKDOWN <<< "$STUCK_DEL"
+if [ "${COUNT:-0}" -gt 0 ]; then
+  echo "$(date -u +%FT%TZ) gcg-inbox-janitor STUCK_DELIVERED count=$COUNT breakdown=$BREAKDOWN" >&2
+else
+  echo "$(date -u +%FT%TZ) gcg-inbox-janitor stuck_delivered=0" >&2
+fi
+
+# 1b. Stuck in_progress (claimed but not finished within 6h — likely a crash or forgot)
+STUCK_PROG=$(PGPASSWORD="$VPWD" psql "$PGCONN" -tA -F $'\t' <<'SQL'
+SELECT count(*),
+       COALESCE(string_agg(format('%s:%s', recipient, c), ', '), '')
+  FROM (
+    SELECT recipient, count(*) AS c FROM agent_messages
+     WHERE status = 'in_progress'
+       AND started_at < NOW() - INTERVAL '6 hours'
+     GROUP BY recipient ORDER BY 2 DESC
+  ) t;
+SQL
+)
+IFS=$'\t' read -r COUNT BREAKDOWN <<< "$STUCK_PROG"
+if [ "${COUNT:-0}" -gt 0 ]; then
+  echo "$(date -u +%FT%TZ) gcg-inbox-janitor STUCK_IN_PROGRESS count=$COUNT breakdown=$BREAKDOWN" >&2
+fi
+
+# 1c. Any blocked (escalate immediately — agent needs intervention)
+BLOCKED=$(PGPASSWORD="$VPWD" psql "$PGCONN" -tA -F $'\t' <<'SQL'
+SELECT count(*),
+       COALESCE(string_agg(format('%s/#%s', recipient, id), ', '), '')
+  FROM (
+    SELECT id, recipient FROM agent_messages
+     WHERE status = 'blocked'
+     ORDER BY blocked_at DESC LIMIT 50
+  ) t;
+SQL
+)
+IFS=$'\t' read -r COUNT BREAKDOWN <<< "$BLOCKED"
+if [ "${COUNT:-0}" -gt 0 ]; then
+  echo "$(date -u +%FT%TZ) gcg-inbox-janitor BLOCKED count=$COUNT items=$BREAKDOWN" >&2
+fi
+
+# 2. Retention: delete done > 30 days
+DELETED=$(PGPASSWORD="$VPWD" psql "$PGCONN" -tA <<'SQL'
+WITH d AS (
+  DELETE FROM agent_messages
+   WHERE status = 'done' AND done_at < NOW() - INTERVAL '30 days'
+  RETURNING id
+)
+SELECT count(*) FROM d;
+SQL
+)
+echo "$(date -u +%FT%TZ) gcg-inbox-janitor retention_deleted=${DELETED:-0}" >&2
+
+# 3. Status histogram (one line per status)
+HIST=$(PGPASSWORD="$VPWD" psql "$PGCONN" -tA -F ':' -c \
+  "SELECT status, count(*) FROM agent_messages GROUP BY status ORDER BY status;")
+while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  echo "$(date -u +%FT%TZ) gcg-inbox-janitor status=$line" >&2
+done <<< "$HIST"
+
+# 4. Total row count + table bytes (for trend monitoring)
+SIZE=$(PGPASSWORD="$VPWD" psql "$PGCONN" -tA -F '|' -c \
+  "SELECT (SELECT count(*) FROM agent_messages), pg_total_relation_size('agent_messages');")
+IFS='|' read -r TOTAL BYTES <<< "$SIZE"
+echo "$(date -u +%FT%TZ) gcg-inbox-janitor total_rows=${TOTAL} table_bytes=${BYTES}" >&2

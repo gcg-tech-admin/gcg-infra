@@ -1,0 +1,52 @@
+#!/bin/bash
+# gcg-manifest-emit — write /run/openclaw-<agent>/manifest.json
+# Best-effort. Never exits non-zero (bootstrap callers depend on this).
+# Reads the agent runtime env + cred files and emits a structured manifest
+# describing what is provisioned for the agent. Source of truth for self-introspection.
+set +e
+AGENT="${1:?agent name required}"
+RUNTIME_DIR="/run/openclaw-${AGENT}"
+ENV_FILE="$RUNTIME_DIR/env"
+MANIFEST="$RUNTIME_DIR/manifest.json"
+[ -d "$RUNTIME_DIR" ] || { echo "gcg-manifest-emit: $AGENT no runtime dir" >&2; exit 0; }
+[ -r "$ENV_FILE" ]   || { echo "gcg-manifest-emit: $AGENT no env"        >&2; exit 0; }
+
+# DB role: gcg_<agent> if per-agent pwd exists, else gcg_admin
+PER_AGENT_PWD="/opt/gcg/shared/credentials/db/gcg_${AGENT}.pwd"
+DB_ROLE="gcg_admin"
+[ -r "$PER_AGENT_PWD" ] && [ ! -L "$PER_AGENT_PWD" ] && DB_ROLE="gcg_${AGENT}"
+[ -L "$PER_AGENT_PWD" ] && DB_ROLE="gcg_admin (symlinked)"
+
+HAS_GOOGLE_SA="false"
+[ -r "$RUNTIME_DIR/google-sa.json" ] && HAS_GOOGLE_SA="true"
+
+HAS_AUTH_PROFILE="false"
+ls "$RUNTIME_DIR"/auth-profiles-*.json >/dev/null 2>&1 && HAS_AUTH_PROFILE="true"
+
+python3 - "$AGENT" "$ENV_FILE" "$DB_ROLE" "$HAS_GOOGLE_SA" "$HAS_AUTH_PROFILE" "$MANIFEST" <<"PY"
+import json, sys, datetime, re, os
+agent, env_file, db_role, has_gsa, has_auth, manifest = sys.argv[1:7]
+env_keys = []
+with open(env_file) as f:
+    for line in f:
+        m = re.match(r"^([A-Z][A-Z0-9_]*)=", line)
+        if m: env_keys.append(m.group(1))
+data = {
+    "agent": agent,
+    "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "env_file": env_file,
+    "env_keys": sorted(set(env_keys)),
+    "cred_files": {
+        "google_sa": has_gsa == "true",
+        "anthropic_auth_profile": has_auth == "true",
+    },
+    "db_role": db_role,
+    "bootstrap_script": "/opt/gcg/shared/bin/gcg-secret-bootstrap.sh",
+    "schema_version": 1,
+}
+with open(manifest, "w") as f:
+    f.write(json.dumps(data, indent=2))
+os.chmod(manifest, 0o600)
+PY
+echo "gcg-manifest-emit: $AGENT manifest written"
+exit 0

@@ -1,0 +1,26 @@
+#!/bin/bash
+# gcg-whoami — show what creds and capabilities the agent has provisioned
+# Usage: gcg-whoami <agent>
+AGENT="${1:-${AGENT}}"
+[ -z "$AGENT" ] && { echo "usage: gcg-whoami <agent>" >&2; exit 1; }
+MANIFEST="/run/openclaw-${AGENT}/manifest.json"
+if [ ! -r "$MANIFEST" ]; then
+  echo "no manifest at $MANIFEST" >&2
+  echo "to backfill (if env exists): gcg-manifest-emit $AGENT" >&2
+  exit 2
+fi
+python3 - "$MANIFEST" <<"PY"
+import json, sys
+m = json.load(open(sys.argv[1]))
+print("=== " + m["agent"] + " ===")
+print("generated:  " + m["generated_at"])
+print("db_role:    " + m["db_role"])
+print("env_file:   " + m["env_file"])
+print("env_keys (" + str(len(m["env_keys"])) + "):")
+for k in m["env_keys"]:
+    print("  - " + k)
+print("cred_files:")
+for k, v in m["cred_files"].items():
+    print("  " + k + ": " + str(v))
+print("source:     " + m["bootstrap_script"])
+PY

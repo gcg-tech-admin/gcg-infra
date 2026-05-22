@@ -1,0 +1,19 @@
+[Unit]
+Description=GCG Conversation Extractor Service (port 19971)
+After=network.target gcg-postgres.service
+Wants=gcg-postgres.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gcg/shared/gcg_tools
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/gcg_tools/conversation_extractor.py
+Restart=always
+RestartSec=10
+Environment=EXTRACTOR_PORT=19971
+Environment=AGENT_NAME=talos
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-conversation-extractor
+
+[Install]
+WantedBy=multi-user.target

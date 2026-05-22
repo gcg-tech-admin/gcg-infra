@@ -1,0 +1,16 @@
+[Unit]
+Description=GCG Dispatch Queue Drainer (dispatch_queue @ AX42 → task.md @ AX102)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/dispatch_drainer.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/gcg-dispatch-drainer.log
+StandardError=append:/var/log/gcg-dispatch-drainer.log
+
+[Install]
+WantedBy=multi-user.target

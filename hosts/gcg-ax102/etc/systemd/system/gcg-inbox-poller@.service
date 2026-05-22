@@ -1,0 +1,30 @@
+[Unit]
+Description=GCG inbox poller for agent %i
+After=network-online.target
+Wants=network-online.target
+# Don't block agent startup; the poller is best-effort delivery
+PartOf=openclaw-%i.service
+
+[Service]
+Type=simple
+# Tight bash loop: poll, sleep, repeat. Keeps memory and complexity near zero.
+ExecStart=/bin/bash -c 'while true; do /opt/gcg/shared/bin/gcg-inbox-poll %i || true; sleep 5; done'
+Restart=always
+RestartSec=3
+Nice=10
+# Resource caps — poller should never compete with the agent runtime
+MemoryMax=64M
+CPUQuota=10%
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/gcg/openclaw-%i/workspace
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

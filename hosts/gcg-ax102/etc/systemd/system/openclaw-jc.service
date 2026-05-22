@@ -1,0 +1,28 @@
+[Unit]
+Description=OpenClaw Agent - Jc - Corporate Structuring Advisor - French Market
+After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-jc
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+EnvironmentFile=-/opt/gcg/openclaw-jc/.env
+Environment=FLEET_AGENT_NAME=jc
+Environment=HOOK_AGENT_ID=jc
+Environment=NODE_OPTIONS=--max-old-space-size=3072
+Environment=NODE_ENV=production
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-jc/state
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-jc/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/bin/sh -c 'sleep 2; for pid in $(lsof -t -i:20301 2>/dev/null); do if [ "$pid" != "$$" ]; then kill -9 "$pid" 2>/dev/null; fi; done'
+MemoryHigh=10G
+MemoryMax=4G
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

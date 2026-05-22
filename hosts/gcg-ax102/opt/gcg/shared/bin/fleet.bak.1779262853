@@ -1,0 +1,46 @@
+#!/bin/bash
+# Minimal fleet CLI — wraps common ops across openclaw services.
+# Usage:
+#   fleet list                — list agents + status
+#   fleet ping <agent> <msg>  — drop a NOTICE.md in agents workspace
+#   fleet broadcast <msg>     — drop NOTICE.md in all agents
+#   fleet exec <agent> <cmd>  — run command as that agent (uses agent shell ctx)
+#   fleet status <agent>      — service status of one agent
+set -euo pipefail
+CMD="${1:-list}"
+shift || true
+case "$CMD" in
+  list)
+    systemctl list-units 'openclaw-*.service' --no-legend --plain | awk '{print $1, $4}'
+    ;;
+  ping)
+    AGENT="${1:?usage: fleet ping <agent> <msg>}"; shift
+    MSG="${*:?usage: fleet ping <agent> <msg>}"
+    WS="/opt/gcg/openclaw-${AGENT}/workspace"
+    [ ! -d "$WS" ] && { echo "no workspace for $AGENT"; exit 1; }
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    echo "## NOTICE from cowork — $ts" > "$WS/NOTICE.md"
+    echo "$MSG" >> "$WS/NOTICE.md"
+    echo "delivered to $WS/NOTICE.md"
+    ;;
+  broadcast)
+    MSG="${*:?usage: fleet broadcast <msg>}"
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    for ws in /opt/gcg/openclaw-*/workspace; do
+      echo "## NOTICE from cowork — $ts" > "$ws/NOTICE.md"
+      echo "$MSG" >> "$ws/NOTICE.md"
+    done
+    echo "delivered to $(ls -d /opt/gcg/openclaw-*/workspace | wc -l) agents"
+    ;;
+  status)
+    AGENT="${1:?usage: fleet status <agent>}"; 
+    systemctl status "openclaw-${AGENT}.service" --no-pager -l | head -20
+    ;;
+  exec)
+    AGENT="${1:?usage: fleet exec <agent> <cmd>}"; shift
+    cd "/opt/gcg/openclaw-${AGENT}/workspace" && "$@"
+    ;;
+  *)
+    echo "unknown: $CMD"; exit 2
+    ;;
+esac

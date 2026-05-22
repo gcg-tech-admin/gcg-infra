@@ -1,0 +1,48 @@
+#!/bin/bash
+set -euo pipefail
+
+if [ -n "${CREDENTIALS_DIRECTORY:-}" ] && [ -f "$CREDENTIALS_DIRECTORY/openai-codex-auth" ]; then
+    AUTH_JSON=$(cat "$CREDENTIALS_DIRECTORY/openai-codex-auth")
+else
+    AUTH_JSON=$(systemd-creds decrypt /etc/credstore.encrypted/openai-codex-auth -)
+fi
+
+REFRESH_TOKEN=$(echo "$AUTH_JSON" | jq -r '.tokens.refresh_token')
+
+if [ -z "$REFRESH_TOKEN" ] || [ "$REFRESH_TOKEN" = "null" ]; then
+    echo "Error: Could not extract refresh_token" >&2
+    exit 1
+fi
+
+echo "Refreshing token..."
+RESPONSE=$(curl -s -X POST https://auth.openai.com/oauth/token \
+    -H "Content-Type: application/json" \
+    -d "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"$REFRESH_TOKEN\",\"client_id\":\"app_EMoamEEZ73f0CkXaXp7hrann\"}")
+
+ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
+if [ -n "$ERROR" ]; then
+    echo "Failed to get new access token. Response:" >&2
+    echo "$RESPONSE" >&2
+    exit 1
+fi
+
+NEW_ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+NEW_REFRESH_TOKEN=$(echo "$RESPONSE" | jq -r '.refresh_token // empty')
+
+if [ -z "$NEW_ACCESS_TOKEN" ] || [ "$NEW_ACCESS_TOKEN" = "null" ]; then
+    echo "Missing access_token in response. Response:" >&2
+    echo "$RESPONSE" >&2
+    exit 1
+fi
+
+UPDATED_JSON=$(echo "$AUTH_JSON" | jq \
+    --arg at "$NEW_ACCESS_TOKEN" \
+    --arg rt "${NEW_REFRESH_TOKEN:-$REFRESH_TOKEN}" \
+    --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    '.tokens.access_token = $at | .tokens.refresh_token = $rt | .last_refresh = $time')
+
+echo "$UPDATED_JSON" | systemd-creds encrypt - /etc/credstore.encrypted/openai-codex-auth.tmp
+mv /etc/credstore.encrypted/openai-codex-auth.tmp /etc/credstore.encrypted/openai-codex-auth
+chmod 644 /etc/credstore.encrypted/openai-codex-auth
+
+echo "Successfully refreshed and stored new OpenAI OAuth token."

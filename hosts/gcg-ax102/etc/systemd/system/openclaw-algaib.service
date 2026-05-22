@@ -1,0 +1,29 @@
+[Unit]
+StartLimitBurst=5
+StartLimitIntervalSec=300
+Description=OpenClaw Agent - Al-Gaib - Legal Corpus Coordinator
+After=network.target
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=algaib
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-algaib
+EnvironmentFile=/opt/gcg/openclaw-algaib/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-algaib/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-algaib/state
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-algaib/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+MemoryMax=3G
+MemoryHigh=2G
+Restart=always
+RestartSec=15
+StandardOutput=append:/opt/gcg/openclaw-algaib/logs/algaib.log
+StandardError=append:/opt/gcg/openclaw-algaib/logs/algaib.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run GCG deep audit every 4h
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=4h
+Persistent=true
+Unit=gcg-deep-audit.service
+
+[Install]
+WantedBy=timers.target

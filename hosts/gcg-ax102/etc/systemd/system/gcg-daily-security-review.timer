@@ -1,0 +1,16 @@
+[Unit]
+Description=GCG Daily LLM Security Review Timer (02:00 UTC = 06:00 Dubai)
+Documentation=https://github.com/gcg-internal/fleet-ops
+
+[Timer]
+# 02:00 UTC daily. Dubai is UTC+4, so this is 06:00 local.
+# deep_audit_v2.timer fires at 22:30 UTC (02:30 Dubai next morning) —
+# so this review runs 3.5h after the last audit of the day, with a full
+# 24h window of accumulated audit data.
+OnCalendar=*-*-* 02:00:00 UTC
+RandomizedDelaySec=300
+Persistent=true
+# Persistent=true means if the system was off at 02:00, it fires on next boot.
+
+[Install]
+WantedBy=timers.target

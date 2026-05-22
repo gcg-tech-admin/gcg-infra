@@ -1,0 +1,13 @@
+[Unit]
+Description=GCG borg backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/gcg-borg-backup.sh
+LoadCredentialEncrypted=borg-passphrase:/etc/credstore.encrypted/borg-passphrase
+LoadCredentialEncrypted=borg-key:/etc/credstore.encrypted/borg-key
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h

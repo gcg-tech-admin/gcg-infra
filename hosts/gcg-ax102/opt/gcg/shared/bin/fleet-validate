@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""fleet-validate — diff FLEET.yaml against live state, report drift.
+
+Read-only. Exit 0 if green, non-zero if drift detected.
+
+Usage:
+  fleet-validate                     # validate all agents
+  fleet-validate <agent>             # validate one agent
+  fleet-validate --json              # machine-readable output
+  fleet-validate --fleet <path>      # alternate FLEET.yaml path
+"""
+import argparse, json, sys, os, glob, hashlib, re
+from pathlib import Path
+
+DEFAULT_FLEET = "/opt/gcg/shared/FLEET.yaml"
+
+def load_yaml(path):
+    """Load yaml — tolerant of multi-doc streams (FLEET.yaml v2.0 had ---)."""
+    try:
+        import yaml
+    except ImportError:
+        from ruamel.yaml import YAML
+        y = YAML(typ="safe", pure=True)
+        with open(path) as f:
+            merged = {}
+            try:
+                for doc in y.load_all(f):
+                    if isinstance(doc, dict):
+                        merged.update(doc)
+            except Exception:
+                pass
+            return merged
+    merged = {}
+    with open(path) as f:
+        try:
+            for doc in yaml.safe_load_all(f):
+                if isinstance(doc, dict):
+                    merged.update(doc)
+        except Exception as e:
+            sys.stderr.write(f"warn: yaml parse: {e}\n")
+    return merged
+
+def sha12(s):
+    return hashlib.sha256((s or "").encode()).hexdigest()[:12]
+
+def load_live(name):
+    """Read live state for one agent."""
+    out = {}
+    ocj = f"/opt/gcg/openclaw-{name}/openclaw.json"
+    mfp = f"/run/openclaw-{name}/manifest.json"
+    if os.path.exists(ocj):
+        try:
+            d = json.load(open(ocj))
+            defaults = d.get("agents", {}).get("defaults", {})
+            model = defaults.get("model", {})
+            gw = d.get("gateway", {})
+            hooks = d.get("hooks", {})
+            tg = d.get("channels", {}).get("telegram", {})
+            gw_raw = gw.get("auth", {}).get("token", "") or ""
+            hooks_raw = hooks.get("token", "") or ""
+            _tg_bt = tg.get("botToken", "")
+            tg_raw = "" if isinstance(_tg_bt, dict) else (_tg_bt or "")  # env-ref dict = not plaintext
+            out["openclaw_json"] = {
+                "model_primary": model.get("primary"),
+                "model_fallbacks": model.get("fallbacks", []),
+                "workspace": defaults.get("workspace"),
+                "gateway_port": gw.get("port"),
+                # Only set sha when token has content — avoids sha12("")==e3b0c44298fc false-positive
+                "gateway_token_sha": sha12(gw_raw) if gw_raw else None,
+                "hooks_token_sha": sha12(hooks_raw) if hooks_raw else None,
+                "gateway_token_empty": (gw_raw == ""),
+                "hooks_token_empty": (hooks_raw == ""),
+                "telegram_enabled": tg.get("enabled", False),
+                "telegram_bot_id": tg_raw.split(":")[0] if ":" in tg_raw else None,
+                "telegram_bot_plaintext": bool(tg_raw) and not tg_raw.startswith("${"),
+                "agents_list_count": len(d.get("agents", {}).get("list", [])),
+                "auth_profiles": list(d.get("auth", {}).get("profiles", {}).keys()),
+            }
+        except Exception as e:
+            out["openclaw_json_error"] = str(e)
+    else:
+        out["openclaw_json_missing"] = True
+    if os.path.exists(mfp):
+        try:
+            out["manifest"] = json.load(open(mfp))
+        except Exception as e:
+            out["manifest_error"] = str(e)
+    else:
+        out["manifest_missing"] = True
+    return out
+
+def validate_agent(name, declared, live, banned_models=None):
+    """Return list of drift findings for one agent."""
+    findings = []
+    banned_models = banned_models or []
+    if not declared:
+        findings.append(("WARN", "no FLEET.yaml entry"))
+        return findings
+
+    # crash constraint — both tokens must be non-empty AND equal to fire
+    o = live.get("openclaw_json") or {}
+    gw_empty = o.get("gateway_token_empty", False)
+    hk_empty = o.get("hooks_token_empty", False)
+    if not gw_empty and not hk_empty and o.get("gateway_token_sha") == o.get("hooks_token_sha"):
+        findings.append(("FATAL", "hooks.token == gateway.auth.token (crash loop risk)"))
+
+    # openclaw_json missing
+    if live.get("openclaw_json_missing"):
+        findings.append(("ERROR", "openclaw.json missing"))
+    if live.get("manifest_missing"):
+        # critical agent + missing manifest is FATAL (likely down)
+        sev = "FATAL" if declared.get("critical") else "WARN"
+        findings.append((sev, "manifest.json missing (agent not running or bootstrap pre-manifest)"))
+
+    # model drift
+    if o.get("model_primary") and declared.get("model_primary"):
+        if o["model_primary"] != declared["model_primary"]:
+            findings.append(("DRIFT", f"model_primary declared={declared['model_primary']} live={o['model_primary']}"))
+
+    # port drift
+    if o.get("gateway_port") and declared.get("port"):
+        if o["gateway_port"] != declared["port"]:
+            findings.append(("DRIFT", f"port declared={declared['port']} live={o['gateway_port']}"))
+
+    # gateway_token_sha drift
+    if o.get("gateway_token_sha") and declared.get("gateway_token_sha"):
+        if o["gateway_token_sha"] != declared["gateway_token_sha"]:
+            findings.append(("DRIFT", f"gateway_token rotated since FLEET.yaml (declared sha={declared['gateway_token_sha']} live sha={o['gateway_token_sha']})"))
+
+    # db_role check
+    m = live.get("manifest") or {}
+    if m.get("db_role") and declared.get("db_role"):
+        if m["db_role"] != declared["db_role"]:
+            findings.append(("DRIFT", f"db_role declared={declared['db_role']} live={m['db_role']}"))
+
+    # keys check
+    declared_keys = set(declared.get("keys") or [])
+    live_env = set(m.get("env_keys") or [])
+    canonical = set()
+    if "ANTHROPIC_API_KEY" in live_env: canonical.add("anthropic")
+    if "DEEPSEEK_API_KEY" in live_env: canonical.add("deepseek")
+    if "MOONSHOT_API_KEY" in live_env: canonical.add("moonshot")
+    if "GEMINI_API_KEY" in live_env: canonical.add("gemini")
+    if "OPENAI_OAUTH_TOKEN" in live_env: canonical.add("openai_oauth")
+    if declared_keys and declared_keys != canonical:
+        missing = declared_keys - canonical
+        extra = canonical - declared_keys
+        if missing:
+            findings.append(("DRIFT", f"keys missing in live: {sorted(missing)}"))
+        if extra:
+            findings.append(("INFO", f"keys live has extras: {sorted(extra)}"))
+
+    # google_sa check
+    if declared.get("google_sa") is not None and m.get("cred_files"):
+        live_gsa = bool(m.get("cred_files", {}).get("google_sa"))
+        if bool(declared.get("google_sa")) != live_gsa:
+            findings.append(("DRIFT", f"google_sa declared={declared.get('google_sa')} live={live_gsa}"))
+
+    # hooks_token drift
+    if o.get("hooks_token_sha") and declared.get("hooks_token_sha"):
+        if o["hooks_token_sha"] != declared["hooks_token_sha"]:
+            findings.append(("DRIFT", f"hooks_token rotated (declared sha={declared['hooks_token_sha']} live={o['hooks_token_sha']})"))
+
+    # telegram_bot_id drift
+    if o.get("telegram_bot_id") and declared.get("telegram_bot_id"):
+        if str(o["telegram_bot_id"]) != str(declared["telegram_bot_id"]):
+            findings.append(("DRIFT", f"telegram_bot_id declared={declared['telegram_bot_id']} live={o['telegram_bot_id']}"))
+
+    # plaintext bot token (zero-plaintext mandate)
+    if o.get("telegram_bot_plaintext"):
+        findings.append(("WARN", "telegram botToken is plaintext in openclaw.json (zero-plaintext violation, task #87)"))
+
+    # banned model checks
+    primary = o.get("model_primary")
+    fallbacks = o.get("model_fallbacks", []) or []
+    for banned in banned_models:
+        if primary == banned or (banned.endswith("/*") and primary and primary.startswith(banned[:-1])):
+            findings.append(("FATAL", f"model_primary {primary} is on banned list"))
+        for fb in fallbacks:
+            if fb == banned or (banned.endswith("/*") and fb.startswith(banned[:-1])):
+                findings.append(("WARN", f"banned model in fallbacks: {fb} (FLEET-WIDE policy; configs need scrub)"))
+
+    # provider->keys cross-check (env var OR auth profile must satisfy provider)
+    if primary:
+        provider = primary.split("/")[0]
+        declared_keys = set(declared.get("keys") or [])
+        live_profiles = o.get("auth_profiles", []) or []
+        # OAuth/api_key via auth-profiles also satisfies the provider
+        profile_providers = {p.split(":", 1)[0] for p in live_profiles}
+        provider_key_map = {
+            "anthropic": "anthropic",
+            "moonshot": "moonshot",
+            "deepseek": "deepseek",
+            "google": "gemini",
+            "openai-codex": "openai_oauth",
+            "openai": "openai_oauth",
+            "amazon-bedrock": "anthropic",
+        }
+        required = provider_key_map.get(provider)
+        if required and required not in declared_keys and provider not in profile_providers:
+            findings.append(("ERROR", f"model_primary={primary} requires key '{required}' or auth-profile '{provider}:*' — neither found"))
+
+    return findings
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("agent", nargs="?", help="specific agent to validate (omit = all)")
+    ap.add_argument("--fleet", default=DEFAULT_FLEET)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    fleet = load_yaml(args.fleet)
+    fleet_agents = fleet.get("agents", {}) or {}
+    # pull banned models from policy (strip inline comments)
+    banned_models = []
+    mp = fleet.get("model_policy", {}) or {}
+    for item in (mp.get("banned") or []):
+        clean = re.split(r"\s*#", str(item), 1)[0].strip()
+        if clean:
+            banned_models.append(clean)
+
+    # discover live agents
+    live_agents = sorted([p.split("openclaw-")[-1] for p in glob.glob("/opt/gcg/openclaw-*") if os.path.isdir(p) and not p.endswith(".bak")])
+
+    if args.agent:
+        targets = [args.agent]
+    else:
+        targets = sorted(set(list(fleet_agents.keys()) + live_agents))
+
+    results = {}
+    summary = {"total": 0, "green": 0, "drift": 0, "error": 0, "fatal": 0}
+    for name in targets:
+        decl = fleet_agents.get(name)
+        live = load_live(name)
+        findings = validate_agent(name, decl, live, banned_models)
+        # also check: in FLEET but not live, or in live but not FLEET
+        if not decl:
+            findings.insert(0, ("WARN", "in live but missing from FLEET.yaml"))
+        if name in fleet_agents and name not in live_agents:
+            findings.insert(0, ("ERROR", "in FLEET.yaml but not live"))
+        results[name] = findings
+        summary["total"] += 1
+        if not findings:
+            summary["green"] += 1
+        elif any(f[0] == "FATAL" for f in findings):
+            summary["fatal"] += 1
+        elif any(f[0] == "ERROR" for f in findings):
+            summary["error"] += 1
+        else:
+            summary["drift"] += 1
+
+    # recompute summary buckets: WARN is non-blocking, DRIFT is informational
+    summary = {"total": 0, "green": 0, "warn": 0, "drift": 0, "error": 0, "fatal": 0}
+    for name, f in results.items():
+        summary["total"] += 1
+        if not f:
+            summary["green"] += 1; continue
+        sevs = {x[0] for x in f}
+        if "FATAL" in sevs:   summary["fatal"] += 1
+        elif "ERROR" in sevs: summary["error"] += 1
+        elif "DRIFT" in sevs: summary["drift"] += 1
+        elif "WARN" in sevs:  summary["warn"] += 1
+        else:                 summary["green"] += 1
+
+    sev_rank = {"FATAL": 4, "ERROR": 3, "DRIFT": 2, "WARN": 1, "INFO": 0}
+    if args.json:
+        print(json.dumps({"summary": summary, "results": {k: [list(t) for t in v] for k, v in results.items()}}, indent=2))
+    else:
+        for name in sorted(results.keys()):
+            f = results[name]
+            if not f:
+                print(f"  [GREEN] {name}")
+            else:
+                # use highest severity for the line tag
+                worst = max(f, key=lambda x: sev_rank.get(x[0], 0))
+                print(f"  [{worst[0]}] {name}")
+                for sev, msg in f:
+                    print(f"          {sev}: {msg}")
+        print(f"\nsummary: {summary}")
+
+    exit_code = 0
+    if summary["fatal"]: exit_code = 3
+    elif summary["error"]: exit_code = 2
+    elif summary["drift"]: exit_code = 1
+    sys.exit(exit_code)
+
+if __name__ == "__main__":
+    main()

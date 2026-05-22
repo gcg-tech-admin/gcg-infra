@@ -1,0 +1,30 @@
+[Unit]
+StartLimitBurst=5
+StartLimitIntervalSec=300
+Description=OpenClaw Agent - Nik (Personal EA)
+After=network.target docker.service
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=nik
+Environment=HOOK_AGENT_ID=nik
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-nik
+EnvironmentFile=/opt/gcg/openclaw-nik/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-nik/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-nik/state
+Environment=NODE_OPTIONS=--max-old-space-size=3072
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-nik/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+MemoryMax=4G
+MemoryHigh=10G
+Restart=always
+RestartSec=15
+StandardOutput=append:/opt/gcg/openclaw-nik/logs/gateway.log
+StandardError=append:/opt/gcg/openclaw-nik/logs/gateway.log
+
+[Install]
+WantedBy=multi-user.target

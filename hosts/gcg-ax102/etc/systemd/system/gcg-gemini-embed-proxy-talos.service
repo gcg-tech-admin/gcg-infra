@@ -1,0 +1,16 @@
+[Unit]
+Description=GCG Gemini Embedding Proxy — talos
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Environment=AGENT_NAME=talos
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/gemini_embed_proxy.py --port 18080
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/gcg/shared/logs/gemini_embed_proxy_talos.log
+StandardError=append:/opt/gcg/shared/logs/gemini_embed_proxy_talos.log
+
+[Install]
+WantedBy=multi-user.target

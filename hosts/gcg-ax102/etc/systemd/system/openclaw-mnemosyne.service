@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenClaw Agent - Mnemosyne (Memory Guardian)
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-mnemosyne
+ExecStart=/usr/bin/openclaw gateway
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+EnvironmentFile=/opt/gcg/openclaw-mnemosyne/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-mnemosyne/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-mnemosyne/state
+Environment=NODE_OPTIONS=--max-old-space-size=3072
+Restart=always
+RestartSec=15
+MemoryMax=4G
+MemoryHigh=10G
+
+[Install]
+WantedBy=multi-user.target

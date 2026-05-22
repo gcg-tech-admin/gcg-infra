@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# /opt/gcg/shared/bin/memory — GCG Memory CLI dispatcher
+# Rebuilt 2026-05-20. No plaintext secrets. Reads env only.
+# Usage: memory <recall|capture|research|--help> [args...]
+
+set -euo pipefail
+
+PYTHON=/opt/gcg/shared/venv/bin/python3
+RECALL_V3=/opt/gcg/shared/gcg_tools/recall_v3.py
+EMBED_V2=/opt/gcg/shared/gcg_tools/embed_v2.py
+GOOGLE_KEY_FILE=/opt/gcg/shared/credentials/google_ai_api_key.txt
+SCRIPT_VERSION="2026-05-20"
+
+# ── Help ───────────────────────────────────────────────────────────────────────
+_help_main() {
+  cat <<EOF
+memory $SCRIPT_VERSION -- GCG memory CLI
+
+Subcommands:
+  recall   "<query>"   Query memory (hybrid vector+graph)
+  capture  "<text>"    Write a memory to pgvector
+  research "<query>"   Broad recall (higher top-k, all tiers)
+
+recall flags:
+  --agent <name>    Agent context (auto-sources /run/openclaw-<name>/env)
+  --top-k N         Number of results (default: 10)
+  --json            Output JSON
+  --tier0-only      Tier-0 namespace only
+
+capture flags:
+  --agent <name>       Agent name (default: unknown)
+  --source-type X      Source type (default: conversation)
+  --text "<text>"      Alias for positional input
+  --memory-type X      Memory type (lesson/fact/knowledge/decision/etc.)
+  --importance X       low/normal/high/critical (default: normal)
+  --scope X            agent_private/shared_fleet (default: agent_private)
+
+research flags:
+  Same as recall. Defaults: --top-k 20, all tiers.
+EOF
+}
+
+_help_recall() {
+  cat <<EOF
+memory recall "<query>" [--agent <name>] [--top-k N] [--json] [--tier0-only]
+EOF
+}
+
+_help_capture() {
+  cat <<EOF
+memory capture "<text>" [--agent <name>] [--source-type X] [--memory-type X] [--importance X] [--scope X]
+EOF
+}
+
+_help_research() {
+  cat <<EOF
+memory research "<query>" [--agent <name>] [--top-k N] [--json]
+EOF
+}
+
+# ── Env loader ─────────────────────────────────────────────────────────────────
+# Source agent env with auto-export, then bridge key aliases.
+_maybe_source_agent_env() {
+  local agent="${1:-}"
+  if [[ -n "$agent" && -f "/run/openclaw-${agent}/env" ]]; then
+    set +u
+    set -a  # auto-export everything from source
+    # shellcheck disable=SC1090
+    source "/run/openclaw-${agent}/env"
+    set +a
+    set -u
+  fi
+  # Bridge GEMINI_API_KEY / GOOGLE_API_KEY → GOOGLE_AI_API_KEY (used by embed_v2.py)
+  # Always prefer GEMINI_API_KEY or GOOGLE_API_KEY (both start with AIzaSy)
+  # over a stale GOOGLE_AI_API_KEY from the parent shell.
+  if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+    export GOOGLE_AI_API_KEY="$GEMINI_API_KEY"
+  elif [[ -n "${GOOGLE_API_KEY:-}" ]]; then
+    export GOOGLE_AI_API_KEY="$GOOGLE_API_KEY"
+  elif [[ -f "$GOOGLE_KEY_FILE" ]]; then
+    export GOOGLE_AI_API_KEY="$(cat "$GOOGLE_KEY_FILE")"
+  fi
+  # Ensure key vars are exported (handles case where parent shell sourced without export)
+  for _v in GCG_DB_HOST GCG_DB_PORT GCG_DB_NAME GCG_DB_USER GCG_DB_PASSWORD \
+            GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_AI_API_KEY; do
+    if [[ -n "${!_v:-}" ]]; then export "$_v"; fi
+  done
+}
+
+# ── Preflight checks ──────────────────────────────────────────────────────────
+_preflight() {
+  local agent="${1:-}"
+  _maybe_source_agent_env "$agent"
+
+  local missing=()
+  [[ -z "${GCG_DB_PASSWORD:-}" ]] && missing+=("GCG_DB_PASSWORD")
+  if [[ -z "${GOOGLE_AI_API_KEY:-}${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}" ]]; then
+    missing+=("GEMINI_API_KEY / GOOGLE_AI_API_KEY")
+  fi
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "ERROR: Missing required env vars: ${missing[*]}" >&2
+    if [[ -n "$agent" ]]; then
+      echo "  Tried sourcing /run/openclaw-${agent}/env" >&2
+    else
+      echo "  Tip: pass --agent <name> to auto-source env" >&2
+    fi
+    exit 1
+  fi
+}
+
+# ── DB reachability ────────────────────────────────────────────────────────────
+_check_db() {
+  local host="${GCG_DB_HOST:-10.0.0.2}"
+  local port="${GCG_DB_PORT:-5432}"
+  local user="${GCG_DB_USER:-gcg_admin}"
+  local dbname="${GCG_DB_NAME:-gcg_intelligence}"
+
+  if ! pg_isready -h "$host" -p "$port" -U "$user" -d "$dbname" -t 2 >/dev/null 2>&1; then
+    echo "ERROR: DB unreachable at ${host}:${port} (pg_isready timeout)" >&2
+    exit 1
+  fi
+}
+
+# ── Parse memory IDs from JSON output ─────────────────────────────────────────
+# Extracts numeric IDs from "source" fields formatted as "memories:<id>".
+# Returns a Postgres array literal like {123,456,789} or {} on failure.
+_parse_memory_ids() {
+  local json_output="${1:-}"
+  if [[ -z "$json_output" ]]; then echo "{}"; return; fi
+  local ids
+  ids=$(python3 -c "
+import json, sys, re
+try:
+    results = json.loads(sys.argv[1])
+    ids = []
+    for r in results:
+        src = r.get('source', '')
+        m = re.match(r'memories:(\d+)', src)
+        if m:
+            ids.append(m.group(1))
+    print(','.join(ids))
+except Exception:
+    print('')
+" "$json_output" 2>/dev/null || echo "")
+  if [[ -z "$ids" ]]; then
+    echo "{}"
+  else
+    echo "{${ids}}"
+  fi
+}
+
+# ── Human-readable formatter ───────────────────────────────────────────────────
+# Converts JSON recall output to readable text (used when --json not requested).
+_format_recall_human() {
+  local json_output="${1:-}"
+  if [[ -z "$json_output" ]]; then return; fi
+  python3 -c "
+import json, sys
+
+try:
+    results = json.loads(sys.argv[1])
+except Exception:
+    print(sys.argv[1])
+    sys.exit(0)
+
+if not results:
+    print('(no results)')
+    sys.exit(0)
+
+for i, r in enumerate(results, 1):
+    source = r.get('source') or r.get('entity_path') or ''
+    conf = r.get('confidence', 0)
+    tier = r.get('tier', '?')
+    agent = r.get('agent_name', '')
+    text = (r.get('text') or '').strip()
+    conf_pct = f'{conf*100:.1f}%' if isinstance(conf, float) else '?'
+    label = source.split('/')[-1] if source else 'memory'
+    print(f'[{i}] {label} ({conf_pct}) [{tier}]{\" agent:\"+agent if agent else \"\"}')
+    if source:
+        print(f'    source: {source}')
+    # Print text with indent, wrapping long lines
+    for line in text.split('\n')[:8]:
+        print(f'    {line}')
+    print()
+" "$json_output" 2>/dev/null || echo "$json_output"
+}
+
+# ── Audit log ─────────────────────────────────────────────────────────────────
+# Writes to memory_recall_log (for recall/research) or memory_write_log (for capture).
+# Never blocks the actual command on failure — audit insert failure is a soft warn.
+_audit_recall() {
+  local agent="${1:-unknown}" query="${2:-}" exit_code="${3:-0}" memory_ids_literal
+  memory_ids_literal="${4:-}"
+  [[ -z "$memory_ids_literal" ]] && memory_ids_literal="{}"
+  local query_trunc="${query:0:500}"
+  local host="${GCG_DB_HOST:-10.0.0.2}" port="${GCG_DB_PORT:-5432}"
+  local user="${GCG_DB_USER:-gcg_admin}" dbname="${GCG_DB_NAME:-gcg_intelligence}"
+
+  PGPASSWORD="${GCG_DB_PASSWORD}" psql \
+    -h "$host" -p "$port" -U "$user" -d "$dbname" \
+    -c "INSERT INTO public.memory_recall_log (agent_name, query, memory_ids, metadata)
+        VALUES (
+          '${agent//\'/\'\'}',
+          \$mq\$${query_trunc}\$mq\$,
+          '${memory_ids_literal}'::bigint[],
+          jsonb_build_object(
+            'caller', '$(id -un 2>/dev/null || echo unknown)',
+            'subcmd', 'recall',
+            'exit_code', ${exit_code},
+            'cli_version', '${SCRIPT_VERSION}'
+          )
+        )" \
+    >/dev/null 2>&1 \
+    || echo "WARN: audit log insert failed (memory_recall_log)" >&2
+}
+
+_audit_capture() {
+  local agent="${1:-unknown}" input_trunc="${2:-}" exit_code="${3:-0}"
+  local host="${GCG_DB_HOST:-10.0.0.2}" port="${GCG_DB_PORT:-5432}"
+  local user="${GCG_DB_USER:-gcg_admin}" dbname="${GCG_DB_NAME:-gcg_intelligence}"
+
+  PGPASSWORD="${GCG_DB_PASSWORD}" psql \
+    -h "$host" -p "$port" -U "$user" -d "$dbname" \
+    -c "INSERT INTO public.memory_write_log (agent_id, action, metadata)
+        VALUES (
+          '${agent//\'/\'\'}',
+          'create',
+          jsonb_build_object(
+            'caller', '$(id -un 2>/dev/null || echo unknown)',
+            'subcmd', 'capture',
+            'input_preview', \$mq\$${input_trunc}\$mq\$,
+            'exit_code', ${exit_code},
+            'cli_version', '${SCRIPT_VERSION}'
+          )
+        )" \
+    >/dev/null 2>&1 \
+    || echo "WARN: audit log insert failed (memory_write_log)" >&2
+}
+
+# ── Subcommand: recall ─────────────────────────────────────────────────────────
+cmd_recall() {
+  local query="" agent="" top_k=10 json_flag="" tier0_flag=""
+  local extra_args=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)              _help_recall; exit 0 ;;
+      --agent)                agent="$2"; shift 2 ;;
+      --agent=*)              agent="${1#--agent=}"; shift ;;
+      --top-k|--top_k)        top_k="$2"; shift 2 ;;
+      --top-k=*|--top_k=*)    top_k="${1#*=}"; shift ;;
+      --json)                 json_flag="--json"; shift ;;
+      --tier0-only)           tier0_flag="--tier0-only"; shift ;;
+      -*)                     extra_args+=("$1"); shift ;;
+      *)
+        if [[ -z "$query" ]]; then query="$1"; shift
+        else extra_args+=("$1"); shift; fi
+        ;;
+    esac
+  done
+
+  if [[ -z "$query" ]]; then
+    echo "ERROR: recall requires a query string" >&2; _help_recall; exit 1
+  fi
+
+  _preflight "$agent"
+  _check_db
+
+  # Always run in JSON mode internally to capture memory IDs for audit log.
+  local exit_code=0
+  local json_output=""
+  json_output=$($PYTHON "$RECALL_V3" "$query" --top_k "$top_k" --json \
+    ${tier0_flag:+"$tier0_flag"} \
+    "${extra_args[@]+"${extra_args[@]}"}" 2>/dev/null) || exit_code=$?
+
+  # Parse memory IDs for the audit log
+  local memory_ids_literal="{}"
+  if [[ $exit_code -eq 0 && -n "$json_output" ]]; then
+    memory_ids_literal=$(_parse_memory_ids "$json_output")
+  fi
+
+  # Emit output: JSON if requested, else human-readable
+  if [[ -n "$json_flag" ]]; then
+    echo "$json_output"
+  else
+    _format_recall_human "$json_output"
+  fi
+
+  _audit_recall "$agent" "$query" "$exit_code" "$memory_ids_literal"
+  exit $exit_code
+}
+
+# ── Subcommand: capture ────────────────────────────────────────────────────────
+cmd_capture() {
+  local input="" agent="unknown" source_type="conversation"
+  local memory_type="" importance="normal" scope="agent_private"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)                   _help_capture; exit 0 ;;
+      --agent)                     agent="$2"; shift 2 ;;
+      --agent=*)                   agent="${1#--agent=}"; shift ;;
+      --text)                      input="$2"; shift 2 ;;
+      --text=*)                    input="${1#--text=}"; shift ;;
+      --source-type|--source_type) source_type="$2"; shift 2 ;;
+      --source-type=*|--source_type=*) source_type="${1#*=}"; shift ;;
+      --memory-type|--memory_type) memory_type="$2"; shift 2 ;;
+      --memory-type=*|--memory_type=*) memory_type="${1#*=}"; shift ;;
+      --importance)                importance="$2"; shift 2 ;;
+      --importance=*)              importance="${1#--importance=}"; shift ;;
+      --scope)                     scope="$2"; shift 2 ;;
+      --scope=*)                   scope="${1#--scope=}"; shift ;;
+      *)
+        if [[ -z "$input" ]]; then input="$1"; shift
+        else echo "ERROR: unexpected arg: $1" >&2; exit 1; fi
+        ;;
+    esac
+  done
+
+  if [[ -z "$input" ]]; then
+    echo "ERROR: capture requires an input string" >&2; _help_capture; exit 1
+  fi
+
+  # Normalize scope: accept legacy names
+  case "$scope" in
+    shared|internal) scope="shared_fleet" ;;
+    agent|personal)  scope="agent_private" ;;
+  esac
+
+  _preflight "$agent"
+  _check_db
+
+  local input_trunc="${input:0:500}"
+  local exit_code=0
+
+  # Pass text via base64 to avoid quoting/encoding issues with multi-line content
+  local input_b64
+  input_b64=$(echo -n "$input" | base64 -w0)
+  local source_type_b64
+  source_type_b64=$(echo -n "$source_type" | base64 -w0)
+  local agent_b64
+  agent_b64=$(echo -n "$agent" | base64 -w0)
+  local scope_b64
+  scope_b64=$(echo -n "$scope" | base64 -w0)
+  local importance_b64
+  importance_b64=$(echo -n "$importance" | base64 -w0)
+  local memory_type_b64=""
+  if [[ -n "$memory_type" ]]; then
+    memory_type_b64=$(echo -n "$memory_type" | base64 -w0)
+  fi
+
+  PYTHON_SCRIPT=$(cat <<'PYSCRIPT'
+import sys, os, base64
+for p in ("/opt/gcg/shared/gcg_tools", "/opt/gcg/shared"):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+from embed_v2 import embed_text
+
+input_text = base64.b64decode(sys.argv[1]).decode("utf-8")
+src_type = base64.b64decode(sys.argv[2]).decode("utf-8")
+ag = base64.b64decode(sys.argv[3]).decode("utf-8")
+sc = base64.b64decode(sys.argv[4]).decode("utf-8")
+imp = base64.b64decode(sys.argv[5]).decode("utf-8")
+mt = sys.argv[6]
+if mt:
+    mt = base64.b64decode(mt).decode("utf-8")
+else:
+    mt = None
+
+rows = embed_text(
+    text=input_text,
+    source_path="memory-cli-capture",
+    source_type=src_type,
+    agent_name=ag,
+    scope_type=sc,
+    importance=imp,
+    memory_type=mt,
+)
+print(f"[capture] {rows} row(s) written to memories (agent={ag}, source_type={src_type})")
+PYSCRIPT
+)
+
+  $PYTHON -c "$PYTHON_SCRIPT" "$input_b64" "$source_type_b64" "$agent_b64" "$scope_b64" "$importance_b64" "$memory_type_b64" || exit_code=$?
+
+  _audit_capture "$agent" "$input_trunc" "$exit_code"
+  exit $exit_code
+}
+
+# ── Subcommand: research ───────────────────────────────────────────────────────
+# recall_v3 has no research mode — route to recall with wider top-k + all tiers.
+cmd_research() {
+  local query="" agent="" top_k=20 json_flag=""
+  local extra_args=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)              _help_research; exit 0 ;;
+      --agent)                agent="$2"; shift 2 ;;
+      --agent=*)              agent="${1#--agent=}"; shift ;;
+      --top-k|--top_k)        top_k="$2"; shift 2 ;;
+      --top-k=*|--top_k=*)    top_k="${1#*=}"; shift ;;
+      --json)                 json_flag="--json"; shift ;;
+      -*)                     extra_args+=("$1"); shift ;;
+      *)
+        if [[ -z "$query" ]]; then query="$1"; shift
+        else extra_args+=("$1"); shift; fi
+        ;;
+    esac
+  done
+
+  if [[ -z "$query" ]]; then
+    echo "ERROR: research requires a query string" >&2; _help_research; exit 1
+  fi
+
+  _preflight "$agent"
+  _check_db
+
+  # Always run in JSON mode internally to capture memory IDs for audit log.
+  # No research mode in recall_v3 — use recall with --all-tiers and wider top-k.
+  local exit_code=0
+  local json_output=""
+  json_output=$($PYTHON "$RECALL_V3" "$query" --top_k "$top_k" --all-tiers --json \
+    "${extra_args[@]+"${extra_args[@]}"}" 2>/dev/null) || exit_code=$?
+
+  # Parse memory IDs for the audit log
+  local memory_ids_literal="{}"
+  if [[ $exit_code -eq 0 && -n "$json_output" ]]; then
+    memory_ids_literal=$(_parse_memory_ids "$json_output")
+  fi
+
+  # Emit output: JSON if requested, else human-readable
+  if [[ -n "$json_flag" ]]; then
+    echo "$json_output"
+  else
+    _format_recall_human "$json_output"
+  fi
+
+  _audit_recall "$agent" "$query" "$exit_code" "$memory_ids_literal"
+  exit $exit_code
+}
+
+# ── Dispatch ───────────────────────────────────────────────────────────────────
+if [[ $# -eq 0 ]]; then
+  _help_main; exit 0
+fi
+
+case "$1" in
+  recall)            shift; cmd_recall "$@" ;;
+  capture)           shift; cmd_capture "$@" ;;
+  research)          shift; cmd_research "$@" ;;
+  --help|-h|help)    _help_main; exit 0 ;;
+  *)
+    echo "ERROR: unknown subcommand '$1'" >&2
+    echo "Run: memory --help" >&2
+    exit 1
+    ;;
+esac

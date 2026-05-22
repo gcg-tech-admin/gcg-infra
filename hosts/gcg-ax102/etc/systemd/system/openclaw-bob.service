@@ -1,0 +1,32 @@
+[Unit]
+Description=OpenClaw Agent - bob
+After=network.target docker.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=bob
+Environment=HOOK_AGENT_ID=bob
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-bob
+EnvironmentFile=/opt/gcg/openclaw-bob/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-bob/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-bob/state
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+# Kill lingering Chrome relay port from previous run before restart
+ExecStartPre=/bin/bash -c 'fuser -k 19453/tcp 2>/dev/null || true'
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-bob/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+MemoryMax=3G
+MemoryHigh=4G
+Restart=always
+RestartSec=20
+StandardOutput=append:/opt/gcg/logs/openclaw-bob/gateway.log
+StandardError=append:/opt/gcg/logs/openclaw-bob/gateway.log
+
+[Install]
+WantedBy=multi-user.target

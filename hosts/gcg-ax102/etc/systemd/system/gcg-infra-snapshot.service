@@ -1,0 +1,8 @@
+[Unit]
+Description=GCG infra snapshot to git
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/gcg-infra-snapshot.sh
+TimeoutStartSec=15min
+Nice=10

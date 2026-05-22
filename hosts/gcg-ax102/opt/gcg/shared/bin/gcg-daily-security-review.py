@@ -1,0 +1,514 @@
+#!/opt/gcg/shared/venv/bin/python3
+"""
+gcg-daily-security-review.py — LLM-driven daily security review.
+
+Collects inputs from deep_audit logs + system state, sends to DeepSeek V4 Flash,
+writes a Markdown report, optionally alerts on SECURITY ALERT sections.
+
+Usage (called by gcg-daily-security-review.sh):
+    python3 gcg-daily-security-review.py
+
+Env vars consumed:
+    DEEPSEEK_API_KEY — required, injected by bootstrap from 1Password
+    REPORT_DATE      — YYYYMMDD, defaults to today UTC
+    GCG_DB_HOST, GCG_DB_PORT, GCG_DB_NAME, GCG_DB_USER, GCG_DB_PASSWORD — for audit_log
+"""
+
+import glob
+import json
+import logging
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# ── Config ──────────────────────────────────────────────────────────────────
+
+REPORT_DIR = Path("/var/log/gcg")
+ALERT_DIR  = Path("/var/log/gcg/security-alerts")
+LOG_FILE   = "/var/log/gcg/security-review-runner.log"
+AUDIT_LOG_DIR = Path("/var/log/gcg-audit")
+
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_MODEL   = "deepseek/deepseek-v4-flash"
+# Direct DeepSeek endpoint model name. Fleet uses "deepseek-v4-flash" as a routing alias;
+# the direct API accepts "deepseek-chat" (V3/flash) or env override DEEPSEEK_MODEL_ID.
+DEEPSEEK_MODEL_ID = os.environ.get("DEEPSEEK_MODEL_ID", "deepseek-chat")
+
+MAX_INPUT_BYTES  = 48 * 1024   # 48 KB hard cap on LLM input
+MAX_TOKENS_OUT   = 2000
+ROTATE_KEEP_DAYS = 30
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, mode="a"), logging.StreamHandler()],
+)
+log = logging.getLogger(__name__)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def run(cmd, timeout=30):
+    """Run shell command, return stdout string (truncated to 8KB). Never raises."""
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout
+        )
+        out = result.stdout.strip()
+        if len(out) > 8192:
+            out = out[:8192] + "\n... [truncated]"
+        return out or "(no output)"
+    except subprocess.TimeoutExpired:
+        return "(command timed out)"
+    except Exception as e:
+        return f"(error: {e})"
+
+
+def read_file_tail(path, max_bytes=4096):
+    """Read last max_bytes of a file. Returns string."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            start = max(0, size - max_bytes)
+            f.seek(start)
+            raw = f.read()
+            return raw.decode("utf-8", errors="replace").strip()
+    except FileNotFoundError:
+        return "(file not found)"
+    except Exception as e:
+        return f"(read error: {e})"
+
+
+def collect_audit_logs(since_hours=24):
+    """Collect alert lines from deep_audit JSON log files in the last since_hours."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    lines = []
+
+    if not AUDIT_LOG_DIR.exists():
+        return "(audit log dir /var/log/gcg-audit not found)"
+
+    for jf in sorted(AUDIT_LOG_DIR.glob("*.json")):
+        try:
+            mtime = datetime.fromtimestamp(jf.stat().st_mtime, tz=timezone.utc)
+            if mtime < cutoff - timedelta(hours=2):  # skip files too old
+                continue
+            with open(jf) as f:
+                data = json.load(f)
+            # deep_audit_v2 writes: {"ts": ..., "host": ..., "alert_count": N, "alerts": [...]}
+            alerts = data.get("alerts", [])
+            if alerts:
+                for a in alerts:
+                    lines.append(f"[{data.get('ts', '?')}] {data.get('host', '?')}: {a}")
+            elif data.get("alert_count", 0) == 0:
+                lines.append(f"[{data.get('ts', '?')}] {data.get('host', '?')}: clean (0 alerts)")
+        except Exception as e:
+            lines.append(f"(error reading {jf}: {e})")
+
+    # Also parse text-format audit files if JSON not found
+    for tf in sorted(AUDIT_LOG_DIR.glob("*.txt")):
+        try:
+            mtime = datetime.fromtimestamp(tf.stat().st_mtime, tz=timezone.utc)
+            if mtime < cutoff:
+                continue
+            with open(tf) as f:
+                for line in f:
+                    if line.startswith("ALERT:"):
+                        lines.append(line.strip())
+        except Exception as e:
+            lines.append(f"(error reading {tf}: {e})")
+
+    if not lines:
+        return "(no audit log entries found in last 24h)"
+    # Dedupe while preserving order
+    seen = set()
+    deduped = []
+    for l in lines:
+        if l not in seen:
+            seen.add(l)
+            deduped.append(l)
+    return "\n".join(deduped[:200])  # cap at 200 lines
+
+
+def collect_failed_logins():
+    """Summarise failed SSH logins from auth.log in last 24h."""
+    raw = run("grep 'Failed password' /var/log/auth.log 2>/dev/null | tail -100")
+    if raw.startswith("("):
+        # try journalctl
+        raw = run("journalctl -u ssh --since '24 hours ago' --no-pager 2>/dev/null | grep -i failed | tail -50")
+    # Count by IP
+    ips: dict[str, int] = {}
+    for line in raw.splitlines():
+        m = re.search(r"from ([\d\.a-fA-F:]+)", line)
+        if m:
+            ip = m.group(1)
+            ips[ip] = ips.get(ip, 0) + 1
+    if not ips:
+        return raw[:2000] or "(no failed logins found)"
+    summary = "Failed login count by source IP (last 24h):\n"
+    for ip, count in sorted(ips.items(), key=lambda x: -x[1])[:30]:
+        summary += f"  {ip}: {count}\n"
+    return summary
+
+
+def build_prompt(inputs_summary: str) -> str:
+    """Build the system + user prompt for DeepSeek."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    system = (
+        "You are a senior Linux security engineer reviewing a daily automated security digest "
+        "from a hardened Ubuntu 24.04 fleet (two servers: AX102 at 77.42.7.80 and AX42 at 95.217.114.49). "
+        "The fleet runs 29 OpenClaw AI agent processes managed by systemd. "
+        "The fleet recently recovered from a Kinsing malware incident (2026-05-18). "
+        "Your job: analyse the collected inputs and identify security concerns.\n\n"
+        "Response format — always output exactly these sections:\n"
+        "## INPUTS SUMMARY\n"
+        "(2-3 sentence summary of what data was collected and the overall posture)\n\n"
+        "## DEEPSEEK ANALYSIS\n"
+        "(Detailed findings — unusual patterns, IOCs, config risks, persistence vectors. "
+        "Be specific: include timestamps, process names, IPs if present in the data.)\n\n"
+        "## ALERTS (if any)\n"
+        "(List any SECURITY ALERT items — one per line, starting with 'SECURITY ALERT:'. "
+        "If nothing critical found, write 'None.')\n\n"
+        "## RECOMMENDATIONS\n"
+        "(Prioritised action items, max 5, numbered.)\n\n"
+        "Rules:\n"
+        "- Flag SECURITY ALERT only for genuine threats (new persistence, active brute force, "
+        "unexpected processes, config regressions, IOC indicators). Do NOT alert on known-normal entries.\n"
+        "- Keep total response under 2000 tokens.\n"
+        "- Do not echo raw log data back — summarise and analyse only."
+    )
+    user = (
+        f"Daily security digest — {today}\n\n"
+        f"{inputs_summary}"
+    )
+    return system, user
+
+
+# ── LLM Call ────────────────────────────────────────────────────────────────
+
+def call_deepseek(system: str, user: str, api_key: str) -> tuple[str | None, dict]:
+    """Call DeepSeek V4 Flash. Returns (response_text_or_None, usage_dict)."""
+    payload = json.dumps({
+        "model": DEEPSEEK_MODEL_ID,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": MAX_TOKENS_OUT,
+        "temperature": 0.2,
+    }).encode()
+
+    req = urllib.request.Request(
+        DEEPSEEK_API_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read())
+        choices = data.get("choices", [])
+        if not choices:
+            return None, {}
+        content = choices[0].get("message", {}).get("content", "")
+        usage = data.get("usage", {})
+        return content, usage
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()[:300]
+        log.error("DeepSeek HTTP %d: %s", e.code, body)
+        return None, {}
+    except urllib.error.URLError as e:
+        log.error("DeepSeek unreachable: %s", e.reason)
+        return None, {}
+    except Exception as e:
+        log.error("DeepSeek call error: %s", e)
+        return None, {}
+
+
+# ── DB Audit Log ─────────────────────────────────────────────────────────────
+
+def write_audit_log(date_str: str, alert_count: int, usage: dict, report_path: str):
+    """Write one row to public.audit_log. Read-only on everything else."""
+    db_host = os.environ.get("GCG_DB_HOST", "95.217.114.49")
+    db_port = os.environ.get("GCG_DB_PORT", "5432")
+    db_name = os.environ.get("GCG_DB_NAME", "gcg_intelligence")
+    db_user = os.environ.get("GCG_DB_USER", "gcg_admin")
+    db_pass = os.environ.get("GCG_DB_PASSWORD") or os.environ.get("PGPASSWORD", "")
+
+    if not db_pass:
+        log.warning("DB password not set — skipping audit_log write")
+        return
+
+    try:
+        sys.path.insert(0, "/opt/gcg/shared/gcg_tools")
+        import psycopg2
+import os
+        conn = psycopg2.connect(host=os.environ.get("GCG_DB_HOST","95.217.114.49"), port=5432, dbname="gcg_intelligence", user=os.environ.get("GCG_DB_USER","gcg_admin"), password=os.environ["GCG_DB_PASSWORD"], sslmode="require")
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO public.audit_log
+                (action, table_name, new_value, created_at)
+            VALUES
+                (%s, %s, %s, NOW())
+        """, (
+            "security_review_daily",
+            report_path,
+            json.dumps({
+                "date": date_str,
+                "alert_count": alert_count,
+                "tokens_in": usage.get("prompt_tokens", 0),
+                "tokens_out": usage.get("completion_tokens", 0),
+                "model": DEEPSEEK_MODEL,
+            }),
+        ))
+        conn.commit()
+        conn.close()
+        log.info("audit_log row written (action=security_review_daily)")
+    except Exception as e:
+        log.error("audit_log write failed: %s", e)
+
+
+# ── Report Rotation ───────────────────────────────────────────────────────────
+
+def rotate_old_reports():
+    """Delete security review reports older than ROTATE_KEEP_DAYS."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=ROTATE_KEEP_DAYS)
+    for f in REPORT_DIR.glob("security-review-*.md"):
+        try:
+            mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+            if mtime < cutoff:
+                f.unlink()
+                log.info("Rotated old report: %s", f)
+        except Exception as e:
+            log.warning("Rotation error for %s: %s", f, e)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    date_str = os.environ.get("REPORT_DATE") or datetime.now(timezone.utc).strftime("%Y%m%d")
+    report_path = REPORT_DIR / f"security-review-{date_str}.md"
+
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    ALERT_DIR.mkdir(parents=True, exist_ok=True)
+
+    log.info("=== GCG daily security review — %s ===", date_str)
+
+    # ── Collect inputs ────────────────────────────────────────────────────────
+    log.info("Collecting inputs...")
+
+    audit_logs = collect_audit_logs(24)
+
+    journal_warns = run(
+        "journalctl --since '24 hours ago' --no-pager -p warning..err 2>/dev/null | tail -100"
+    )
+
+    failed_logins = collect_failed_logins()
+
+    fw_state = run("iptables -L INPUT -n -v --line-numbers 2>/dev/null | head -60")
+
+    docker_ps = run("docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null || echo '(docker not running)'")
+
+    systemctl_failed = run("systemctl --failed --no-legend 2>/dev/null | head -20")
+
+    who_all = run("who --all 2>/dev/null | head -20")
+    last_50 = run("last -n 50 2>/dev/null | head -60")
+
+    # Recent openclaw agent restarts (signals for crashes)
+    agent_restarts = run(
+        "journalctl --since '24 hours ago' --no-pager -u 'openclaw-*' 2>/dev/null "
+        "| grep -iE 'restart|killed|OOM|segfault|exit' | tail -30"
+    )
+
+    # File system changes in sensitive paths (mtime < 24h)
+    recent_fs = run(
+        "find /etc /usr/local/sbin /opt/gcg/shared/bin -newer /proc/1 -type f -ls 2>/dev/null | head -30"
+    )
+
+    inputs_summary = f"""### deep_audit_v2 alerts (last 24h)
+{audit_logs}
+
+### journalctl warnings/errors (last 24h, top 100)
+{journal_warns[:3000]}
+
+### failed SSH logins (last 24h)
+{failed_logins}
+
+### current iptables INPUT chain
+{fw_state}
+
+### docker containers
+{docker_ps}
+
+### systemctl failed units
+{systemctl_failed or '(none)'}
+
+### who --all (current sessions)
+{who_all}
+
+### last 50 logins
+{last_50[:2000]}
+
+### openclaw agent restarts/crashes (last 24h)
+{agent_restarts or '(none)'}
+
+### recently modified files in /etc /usr/local/sbin /opt/gcg/shared/bin
+{recent_fs or '(none)'}
+"""
+
+    # Cap input at MAX_INPUT_BYTES
+    if len(inputs_summary.encode()) > MAX_INPUT_BYTES:
+        inputs_summary = inputs_summary.encode()[:MAX_INPUT_BYTES].decode("utf-8", errors="replace")
+        inputs_summary += "\n... [INPUT TRUNCATED AT 48KB]\n"
+
+    log.info("Input size: %d bytes", len(inputs_summary.encode()))
+
+    # ── LLM call ─────────────────────────────────────────────────────────────
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    llm_response = None
+    usage = {}
+
+    if not api_key:
+        log.error("DEEPSEEK_API_KEY not set — skipping LLM analysis")
+        llm_response = "(LLM analysis skipped — DEEPSEEK_API_KEY not available)"
+    else:
+        log.info("Calling DeepSeek V4 Flash...")
+        system_prompt, user_prompt = build_prompt(inputs_summary)
+        llm_response, usage = call_deepseek(system_prompt, user_prompt, api_key)
+        if llm_response:
+            log.info(
+                "DeepSeek response received: %d chars, tokens in=%s out=%s",
+                len(llm_response),
+                usage.get("prompt_tokens", "?"),
+                usage.get("completion_tokens", "?"),
+            )
+        else:
+            log.error("DeepSeek returned no response — using fallback message")
+            llm_response = "(LLM analysis unavailable — DeepSeek API did not respond)"
+
+    # ── Parse alerts ──────────────────────────────────────────────────────────
+    security_alerts = []
+    if llm_response:
+        for line in llm_response.splitlines():
+            if "SECURITY ALERT:" in line:
+                security_alerts.append(line.strip())
+
+    alert_count = len(security_alerts)
+    log.info("Security alerts found: %d", alert_count)
+
+    # ── Write report ──────────────────────────────────────────────────────────
+    ts_now = datetime.now(timezone.utc).isoformat()
+    token_info = (
+        f"prompt_tokens={usage.get('prompt_tokens', 'n/a')}, "
+        f"completion_tokens={usage.get('completion_tokens', 'n/a')}"
+    ) if usage else "n/a"
+
+    report_lines = [
+        f"# GCG Daily Security Review — {date_str}",
+        f"",
+        f"**Generated:** {ts_now}  ",
+        f"**Host:** {run('hostname')}  ",
+        f"**Model:** {DEEPSEEK_MODEL}  ",
+        f"**Token usage:** {token_info}  ",
+        f"**Alerts:** {alert_count}",
+        f"",
+        f"---",
+        f"",
+        f"## INPUTS SUMMARY",
+        f"",
+        f"Data collected from: deep_audit_v2 logs, journalctl warnings/errors, failed login summary, ",
+        f"iptables state, docker containers, systemctl failed units, active sessions, login history,",
+        f"openclaw agent crashes, recent filesystem changes in sensitive paths.",
+        f"",
+        f"Input size: {len(inputs_summary.encode())} bytes",
+        f"",
+        f"---",
+        f"",
+    ]
+
+    if llm_response:
+        report_lines.append(llm_response)
+    else:
+        report_lines += [
+            "## DEEPSEEK ANALYSIS",
+            "",
+            "(LLM analysis not available)",
+            "",
+            "## ALERTS (if any)",
+            "",
+            "None.",
+            "",
+            "## RECOMMENDATIONS",
+            "",
+            "1. Verify DeepSeek API key is correctly provisioned.",
+        ]
+
+    report_lines += [
+        "",
+        "---",
+        "",
+        "## RAW INPUTS",
+        "",
+        "<details><summary>Click to expand raw collected inputs</summary>",
+        "",
+        "```",
+        inputs_summary,
+        "```",
+        "",
+        "</details>",
+    ]
+
+    report_text = "\n".join(report_lines)
+
+    with open(report_path, "w") as f:
+        f.write(report_text)
+    log.info("Report written: %s (%d bytes)", report_path, len(report_text))
+
+    # ── Write alert file if needed ────────────────────────────────────────────
+    if alert_count > 0:
+        alert_file = ALERT_DIR / f"alert-{date_str}.txt"
+        with open(alert_file, "w") as f:
+            f.write(f"GCG Security Alerts — {date_str}\n")
+            f.write(f"Generated: {ts_now}\n\n")
+            for a in security_alerts:
+                f.write(a + "\n")
+        log.warning("SECURITY ALERTS written to %s", alert_file)
+
+        # Also wake Daen via fleet CLI if available
+        fleet_bin = "/opt/gcg/shared/bin/fleet"
+        if Path(fleet_bin).exists():
+            alert_msg = (
+                f"DAILY SECURITY REVIEW ALERT ({date_str}): "
+                f"{alert_count} alert(s) flagged. "
+                f"See {report_path}"
+            )
+            try:
+                subprocess.run(
+                    [fleet_bin, "wake", "daen", alert_msg],
+                    timeout=10, capture_output=True,
+                )
+                log.info("Daen alerted via fleet CLI")
+            except Exception as e:
+                log.warning("fleet wake daen failed: %s", e)
+
+    # ── DB audit_log ──────────────────────────────────────────────────────────
+    write_audit_log(date_str, alert_count, usage, str(report_path))
+
+    # ── Rotate old reports ────────────────────────────────────────────────────
+    rotate_old_reports()
+
+    log.info("=== security review complete — alerts=%d ===", alert_count)
+    return 0 if alert_count == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

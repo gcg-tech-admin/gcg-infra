@@ -1,0 +1,14 @@
+[Unit]
+Description=GCG Asana Outcome Signal Webhook
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/asana_outcome_webhook.py
+Restart=on-failure
+RestartSec=5s
+StandardOutput=append:/opt/gcg/shared/logs/asana_outcome_webhook.log
+StandardError=append:/opt/gcg/shared/logs/asana_outcome_webhook.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+#!/bin/bash
+set -e
+[ -z "$CREDENTIALS_DIRECTORY" ] && { echo "ERROR: needs systemd LoadCredentialEncrypted="; exit 2; }
+export BORG_PASSPHRASE=$(cat "$CREDENTIALS_DIRECTORY/borg-passphrase")
+export BORG_RSH="ssh -i /root/.ssh/storagebox_borg -p 23 -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15"
+REPO="ssh://u547533@u547533.your-storagebox.de/./gcg-borg-2026-05-18"
+
+STAMP=$(date -u +%Y%m%dT%H%M%S)
+HN=$(hostname -s)
+
+echo "[$(date -u +%FT%TZ)] borg create $HN-$STAMP"
+borg create --stats --compression zstd,6 --exclude-caches \
+  --exclude "/opt/gcg/openclaw-*/state" \
+  --exclude "/opt/gcg/openclaw-*/npm" \
+  --exclude "/opt/gcg/openclaw-*/node_modules" \
+  --exclude "/run" --exclude "/tmp" --exclude "/var/cache" \
+  "$REPO::${HN}-${STAMP}" \
+  /opt/gcg /etc/credstore.encrypted /etc/credstore.holding /etc/systemd/system/openclaw-*.service /etc/systemd/system/openclaw-*.service.d /root/.ssh/storagebox_borg.pub 2>&1 | tail -10
+
+echo "[$(date -u +%FT%TZ)] prune"
+borg prune --keep-daily 7 --keep-weekly 4 --keep-monthly 12 "$REPO" 2>&1 | tail -5
+echo "[$(date -u +%FT%TZ)] DONE"

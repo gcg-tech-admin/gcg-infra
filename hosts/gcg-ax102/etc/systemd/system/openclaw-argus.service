@@ -1,0 +1,26 @@
+[Unit]
+Description=OpenClaw Agent - Argus (Email Triage)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-argus
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-argus/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=argus
+Environment=HOOK_AGENT_ID=argus
+EnvironmentFile=/opt/gcg/openclaw-argus/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-argus/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-argus/state
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+Restart=always
+RestartSec=15
+MemoryMax=3G
+MemoryHigh=2G
+
+[Install]
+WantedBy=multi-user.target

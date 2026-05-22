@@ -1,0 +1,29 @@
+[Unit]
+Description=OpenClaw Agent - malik
+After=network.target docker.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=malik
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-malik
+EnvironmentFile=/opt/gcg/openclaw-malik/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-malik/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-malik/state
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-malik/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+MemoryMax=3G
+MemoryHigh=768M
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/gcg/logs/openclaw-malik/gateway.log
+StandardError=append:/opt/gcg/logs/openclaw-malik/gateway.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+[Unit]
+Description=OpenClaw Agent - talos
+After=network.target docker.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=talos
+Environment=HOOK_AGENT_ID=talos
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-talos
+EnvironmentFile=/opt/gcg/openclaw-talos/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-talos/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-talos/state
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStartPre=/bin/sh -c 'rm -f /opt/gcg/openclaw-talos/state/.openclaw/agents/*/sessions/*.jsonl.lock'
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-talos/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+MemoryMax=3G
+MemoryHigh=3G
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/gcg/logs/openclaw-talos/gateway.log
+StandardError=append:/opt/gcg/logs/openclaw-talos/gateway.log
+
+[Install]
+WantedBy=multi-user.target

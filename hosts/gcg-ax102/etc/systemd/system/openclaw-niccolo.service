@@ -1,0 +1,26 @@
+[Unit]
+StartLimitBurst=5
+StartLimitIntervalSec=300
+Description=OpenClaw Agent - Niccolò - Strategic Advisor
+After=network.target
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Type=simple
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-niccolo/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+WorkingDirectory=/opt/gcg/openclaw-niccolo
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-niccolo/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-niccolo/state
+Environment=FLEET_AGENT_NAME=niccolo
+EnvironmentFile=/opt/gcg/openclaw-niccolo/.env
+Restart=always
+RestartSec=5
+MemoryHigh=1.5G
+MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target

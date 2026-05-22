@@ -1,0 +1,133 @@
+#!/bin/bash
+# fleet-promote — atomically promote a draft FLEET.yaml to canonical.
+# Archives previous, runs validator strict, posts inbox notifications.
+#
+# Usage:
+#   fleet-promote <draft-path>          # promote to /opt/gcg/shared/FLEET.yaml
+#   fleet-promote <draft> --target X    # promote to X
+#   fleet-promote <draft> --dry-run     # validate + show plan, no writes
+#   fleet-promote <draft> --no-notify   # skip inbox broadcast
+#
+# Safety:
+#   - validator must pass (no FATAL, no ERROR) — DRIFT allowed
+#   - target backed up to .bak.$(date +%s) + archived under _archived/
+#   - atomic rename (os.replace equivalent via mv on same FS)
+#   - inbox notification to daen + audit row
+
+set -euo pipefail
+
+TARGET_DEFAULT="/opt/gcg/shared/FLEET.yaml"
+ARCHIVE_DIR="/opt/gcg/shared/_archived/fleet"
+CHANGELOG="/opt/gcg/shared/_archived/fleet/CHANGELOG.txt"
+VALIDATOR="/opt/gcg/shared/bin/fleet-validate"
+FLEET_CLI="/opt/gcg/shared/bin/fleet"
+
+usage() {
+  sed -n '2,15p' "$0" | sed 's/^# \?//'
+  exit "${1:-1}"
+}
+
+DRAFT=""
+TARGET="$TARGET_DEFAULT"
+DRY_RUN=0
+NO_NOTIFY=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --target)    TARGET="$2"; shift 2 ;;
+    --dry-run)   DRY_RUN=1; shift ;;
+    --no-notify) NO_NOTIFY=1; shift ;;
+    -h|--help)   usage 0 ;;
+    -*)          echo "unknown flag: $1" >&2; usage ;;
+    *)           [ -z "$DRAFT" ] && DRAFT="$1" || { echo "extra arg: $1" >&2; usage; }; shift ;;
+  esac
+done
+
+[ -z "$DRAFT" ] && { echo "fleet-promote: draft path required" >&2; usage; }
+[ -r "$DRAFT" ] || { echo "fleet-promote: cannot read $DRAFT" >&2; exit 2; }
+
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+EPOCH=$(date +%s)
+
+echo "=== fleet-promote ==="
+echo "draft:  $DRAFT"
+echo "target: $TARGET"
+echo "ts:     $TS"
+echo
+
+# 1. validate draft strictly
+echo "--- validating draft ---"
+set +e
+"$VALIDATOR" --fleet "$DRAFT" --json > /tmp/fleet-promote-validate-$EPOCH.json
+RC=$?
+set -e
+SUMMARY=$(python3 -c "import json; d=json.load(open('/tmp/fleet-promote-validate-$EPOCH.json')); s=d['summary']; print(f\"total={s['total']} green={s['green']} drift={s['drift']} error={s['error']} fatal={s['fatal']}\")")
+echo "validator: $SUMMARY (rc=$RC)"
+if [ "$RC" -ge 2 ]; then
+  echo "ABORT: validator reported ERROR or FATAL — fix before promoting" >&2
+  echo "full report: /tmp/fleet-promote-validate-$EPOCH.json" >&2
+  exit 3
+fi
+
+# 2. show plan
+if [ -r "$TARGET" ]; then
+  PREV_VERSION=$(grep -m1 "^version:" "$TARGET" | sed 's/version: *//; s/"//g' || echo "unknown")
+else
+  PREV_VERSION="(none)"
+fi
+NEW_VERSION=$(grep -m1 "^version:" "$DRAFT" | sed 's/version: *//; s/"//g' || echo "unknown")
+echo
+echo "--- plan ---"
+echo "current target version: $PREV_VERSION"
+echo "draft version:          $NEW_VERSION"
+if [ "$DRY_RUN" = "1" ]; then
+  echo
+  echo "DRY-RUN: not promoting"
+  exit 0
+fi
+
+# 3. archive previous
+mkdir -p "$ARCHIVE_DIR"
+if [ -r "$TARGET" ]; then
+  BAK="${TARGET}.bak.${EPOCH}"
+  ARCHIVE="$ARCHIVE_DIR/FLEET.yaml.v${PREV_VERSION}.${TS}"
+  cp -a "$TARGET" "$BAK"
+  cp -a "$TARGET" "$ARCHIVE"
+  echo "archived: $BAK"
+  echo "archived: $ARCHIVE"
+fi
+
+# 4. atomic replace (mv on same FS is atomic)
+TMP="${TARGET}.promote.tmp"
+cp -a "$DRAFT" "$TMP"
+mv -f "$TMP" "$TARGET"
+echo "promoted: $DRAFT -> $TARGET"
+
+# 5. changelog entry
+mkdir -p "$(dirname "$CHANGELOG")"
+{
+  echo "$TS  promote v${PREV_VERSION} -> v${NEW_VERSION}  draft=$DRAFT  validator=\"$SUMMARY\"  by=${USER:-unknown}"
+} >> "$CHANGELOG"
+echo "changelog: $CHANGELOG"
+
+# 6. inbox notification
+if [ "$NO_NOTIFY" = "0" ] && [ -x "$FLEET_CLI" ]; then
+  echo
+  echo "--- notify ---"
+  MSG="FLEET.yaml promoted v${PREV_VERSION} -> v${NEW_VERSION} at ${TS}. Validator: ${SUMMARY}. Please reload your declared-state cache."
+  # Try broadcast first (lands for all enabled pollers)
+  if FLEET_SENDER=cowork "$FLEET_CLI" broadcast "$MSG" 2>/dev/null; then
+    echo "broadcast sent"
+  else
+    # Fallback: send to daen as the orchestrator
+    FLEET_SENDER=cowork "$FLEET_CLI" send --type fleet-event --priority 2 daen "$MSG" || true
+    echo "sent to daen"
+  fi
+  # Audit row
+  FLEET_SENDER=cowork "$FLEET_CLI" send --type audit --priority 9 daen \
+    "AUDIT fleet-promote v${PREV_VERSION}->v${NEW_VERSION} draft=$DRAFT ts=$TS validator=\"$SUMMARY\"" 2>/dev/null || true
+fi
+
+echo
+echo "=== promote complete ==="
+echo "rollback: fleet-rollback ${TARGET}"

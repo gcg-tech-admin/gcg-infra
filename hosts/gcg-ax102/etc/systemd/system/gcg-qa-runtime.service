@@ -1,0 +1,30 @@
+[Unit]
+Description=GCG QA Loop — Runtime Verifier Service
+After=network.target
+Documentation=https://gcg-hetzner/opt/gcg/shared/docs/architecture/QA_LOOP_ARCHITECTURE.md
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+User=root
+WorkingDirectory=/opt/gcg/shared/gcg_tools
+ExecStart=/opt/gcg/shared/venv/bin/python3 -m qa_verifier runtime
+Environment=PYTHONPATH=/opt/gcg/shared/gcg_tools
+MemoryMax=2G
+CPUQuota=60%
+# RuntimeMaxSec removed — this is a persistent daemon, not a one-shot job.
+# Was causing NRestarts churn (~every 5 min kill → restart). Fixed 2026-04-22.
+# Use WatchdogSec if health-checking is needed in future.
+# Watchdog disabled — the runtime verifier uses subprocess timeouts
+# internally. External watchdog was causing ABRT dumps on slow imports.
+# RuntimeMaxSec=300 provides a safety net without core dumps.
+RuntimeMaxSec=300
+PrivateTmp=true
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-qa-runtime
+
+[Install]
+WantedBy=multi-user.target

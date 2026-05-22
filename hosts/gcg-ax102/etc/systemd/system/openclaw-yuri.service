@@ -1,0 +1,30 @@
+[Unit]
+StartLimitBurst=5
+StartLimitIntervalSec=300
+Description=OpenClaw Agent - Yuri (GCG Trader)
+After=network.target docker.service
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=yuri
+Environment=HOOK_AGENT_ID=yuri
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-yuri
+EnvironmentFile=/opt/gcg/openclaw-yuri/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-yuri/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-yuri/state
+Environment=NODE_OPTIONS=--max-old-space-size=2048
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-yuri/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+MemoryMax=3G
+MemoryHigh=2G
+Restart=always
+RestartSec=15
+StandardOutput=append:/opt/gcg/openclaw-yuri/logs/gateway.log
+StandardError=append:/opt/gcg/openclaw-yuri/logs/gateway.log
+
+[Install]
+WantedBy=multi-user.target

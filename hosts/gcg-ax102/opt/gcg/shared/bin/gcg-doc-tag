@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""
+gcg-doc-tag — backfill frontmatter (bucket, tags, status) on docs that lack it.
+
+Reads each .md file, infers:
+  - bucket: from current directory + filename hints (same logic as gcg-doc-sort)
+  - tags:   from filename + first 2000 chars of content, classified via Kimi K2.6 (Moonshot API)
+  - title:  from first H1 in body, or filename
+  - status: BINDING by default; DRAFT if "draft" or "wip" in filename
+  - effective: from filename date prefix (if present) else file mtime
+
+Writes a YAML frontmatter block at the top of each file. Idempotent: skips files that
+already have a `bucket:` field.
+
+Tag vocabulary: per DOC_ONTOLOGY_CANONICAL §6.2/§6.3 (domains + sub-domains).
+
+Default: --dry-run. Pass --apply to write.
+
+Usage:
+    gcg-doc-tag --only research            # dry-run on research/
+    gcg-doc-tag --only research --apply    # apply
+    gcg-doc-tag --apply                    # ALL untagged docs
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from datetime import datetime
+
+DOCS_ROOT = Path("/opt/gcg/shared/docs")
+HANDOFFS_ROOT = Path("/opt/gcg/shared/handoffs")
+
+# Per DOC_ONTOLOGY_CANONICAL §6.2 + §6.3
+DOMAIN_TAGS = {
+    "infrastructure", "security", "compliance", "client", "finance", "operations",
+    "architecture", "agent-fleet", "legal", "marketing", "sales", "product",
+    "process", "incident", "vendor", "hr", "dubai", "uae"
+}
+SUBDOMAIN_TAGS = {
+    "postgresql", "docker", "ssh", "backup", "api", "auth", "embedding", "freezone",
+    "license", "visa", "quote", "invoice", "cron", "monitoring", "migration",
+    "incident-response", "post-mortem", "decision", "standards", "messaging",
+    "hooks", "lifecycle", "redteam", "research", "rollback", "council"
+}
+ALL_TAGS = DOMAIN_TAGS | SUBDOMAIN_TAGS
+
+# Bucket inference (same map as gcg-doc-sort)
+SUBDIR_MAP = {
+    "architecture": "architecture", "reference": "reference",
+    "compliance": "reference", "council": "architecture", "decisions": "architecture",
+    "fleet": "architecture", "guides": "reference", "playbooks": "reference",
+    "proposals": "architecture", "research": "reference", "rollback_refs": "reference",
+    "runbooks": "reference", "sops": "reference", "strategies": "architecture",
+    "reviews": "reviews",
+}
+
+DATE_PREFIX = re.compile(r"^(\d{4}-\d{2}-\d{2})[-_](.+)\.md$")
+FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+H1_RE = re.compile(r"^#\s+(.+?)$", re.MULTILINE)
+
+CLASSIFY_PROMPT = """You are tagging a GCG documentation file. Output exactly one JSON object with one key "tags" whose value is an array of 2-4 lowercase tags chosen from this vocabulary:
+
+Domain tags (pick ONE as the first tag): infrastructure, security, compliance, client, finance, operations, architecture, agent-fleet, legal, marketing, sales, product, process, incident, vendor, hr, dubai, uae
+
+Sub-domain tags (pick 1-3): postgresql, docker, ssh, backup, api, auth, embedding, freezone, license, visa, quote, invoice, cron, monitoring, migration, incident-response, post-mortem, decision, standards, messaging, hooks, lifecycle, redteam, research, rollback, council
+
+Rules:
+- The first tag MUST be a domain tag
+- Use lowercase, hyphenated multi-word
+- Minimum 2 tags, maximum 4
+- Pick from the vocabulary; do not invent new tags
+
+Filename: {filename}
+Current directory: {directory}
+
+First 2000 chars of content:
+{content}
+
+Output JSON only, no prose."""
+
+
+def has_frontmatter(text: str):
+    return FRONTMATTER_RE.match(text) is not None
+
+
+def extract_h1(text: str):
+    m = H1_RE.search(text)
+    return m.group(1).strip() if m else None
+
+
+def infer_bucket(path: Path):
+    try:
+        rel = path.relative_to(DOCS_ROOT)
+    except ValueError:
+        if path.is_relative_to(HANDOFFS_ROOT):
+            return "handoffs"
+        return None
+    if len(rel.parts) < 2:
+        return None
+    return SUBDIR_MAP.get(rel.parts[0])
+
+
+def infer_date(path: Path):
+    m = DATE_PREFIX.match(path.name)
+    if m:
+        return m.group(1)
+    return datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+
+
+DEFAULT_LLM_BASE_URL = os.environ.get("LLM_BASE_URL") or os.environ.get("MOONSHOT_BASE_URL") or "https://api.deepseek.com/v1"
+DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL") or os.environ.get("MOONSHOT_MODEL") or "deepseek-v4-flash"
+
+
+def call_classifier(prompt: str, api_key: str, timeout=30):
+    """Synchronous classification call. Returns list of tags or None on failure."""
+    import urllib.request, urllib.error
+    body = json.dumps({
+        "model": DEFAULT_LLM_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        # max_tokens generous: reasoning models can consume 100-300 tokens of internal thinking
+        # before emitting the JSON answer. 800 leaves room for both.
+        "max_tokens": 800,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{DEFAULT_LLM_BASE_URL.rstrip('/')}/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        print(f"  WARN: API HTTP {e.code} — {e.reason}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"  WARN: API error — {e}", file=sys.stderr)
+        return None
+
+    try:
+        msg = resp["choices"][0]["message"]
+    except (KeyError, IndexError):
+        return None
+    # Try content first; fall back to reasoning_content (some reasoning models emit JSON there)
+    content = (msg.get("content") or "").strip()
+    if not content:
+        content = (msg.get("reasoning_content") or "").strip()
+    if not content:
+        return None
+    # Extract JSON (search for outermost {...})
+    m = re.search(r"\{[^{}]*\"tags\"[^{}]*\}", content, re.DOTALL)
+    if not m:
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+    tags = obj.get("tags", [])
+    if not isinstance(tags, list):
+        return None
+    tags = [t.lower().strip() for t in tags if isinstance(t, str)]
+    tags = [t for t in tags if t in ALL_TAGS]
+    if len(tags) < 2:
+        return None
+    return tags[:4]
+
+
+def write_frontmatter(path: Path, fm: dict):
+    """Prepend frontmatter to file. Caller checks idempotency."""
+    body = path.read_text(encoding="utf-8", errors="replace")
+    lines = ["---"]
+    # Preferred field order
+    for k in ("title", "bucket", "tags", "status", "effective", "supersedes", "version", "owner"):
+        if k in fm:
+            v = fm[k]
+            if isinstance(v, list):
+                lines.append(f'{k}: [{", ".join(repr(t) for t in v)}]')
+            else:
+                lines.append(f'{k}: {v!r}' if " " in str(v) or ":" in str(v) else f'{k}: {v}')
+    lines.append("---")
+    lines.append("")
+    new_body = "\n".join(lines) + "\n" + body
+    path.write_text(new_body, encoding="utf-8")
+
+
+def get_api_key():
+    # Match batch_ontology_migrator priority: DEEPSEEK first (it's the default model), then MOONSHOT
+    for envvar in ("DEEPSEEK_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY"):
+        if os.environ.get(envvar):
+            return os.environ[envvar]
+    # Try reading from a running agent's env
+    keys = ("DEEPSEEK_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY")
+    for envfile in ["/run/openclaw-nik/env", "/run/openclaw-mnemosyne/env", "/run/openclaw-daen/env"]:
+        if os.path.isfile(envfile):
+            try:
+                with open(envfile) as f:
+                    for line in f:
+                        for k in keys:
+                            if line.startswith(f"{k}="):
+                                return line.split("=", 1)[1].strip()
+            except Exception:
+                continue
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--only", help="Only process this subdir under docs/")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--sleep", type=float, default=0.5, help="Delay between API calls (sec)")
+    args = ap.parse_args()
+
+    api_key = get_api_key()
+    if not api_key:
+        print("FATAL: no MOONSHOT_API_KEY / KIMI_API_KEY found in env or /run/openclaw-*/env", file=sys.stderr)
+        sys.exit(2)
+
+    roots = []
+    if args.only:
+        only_path = DOCS_ROOT / args.only
+        if not only_path.is_dir():
+            print(f"FATAL: --only target does not exist: {only_path}", file=sys.stderr)
+            sys.exit(2)
+        roots.append(only_path)
+    else:
+        roots = [DOCS_ROOT, HANDOFFS_ROOT]
+
+    if not args.apply:
+        print("=== DRY RUN — no frontmatter written. Pass --apply to commit. ===\n")
+
+    candidates = []
+    for root in roots:
+        for r, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "_archived"]
+            for f in files:
+                if not f.endswith(".md"):
+                    continue
+                p = Path(r) / f
+                try:
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                except Exception as e:
+                    print(f"  skip {p}: {e}", file=sys.stderr)
+                    continue
+                if has_frontmatter(text):
+                    continue  # already tagged
+                candidates.append((p, text))
+                if args.limit and len(candidates) >= args.limit:
+                    break
+            if args.limit and len(candidates) >= args.limit:
+                break
+        if args.limit and len(candidates) >= args.limit:
+            break
+
+    print(f"Found {len(candidates)} docs without frontmatter\n")
+
+    tagged = 0
+    failed = 0
+    for i, (p, text) in enumerate(candidates):
+        rel = str(p)
+        bucket = infer_bucket(p) or "reference"
+        date = infer_date(p)
+        title = extract_h1(text) or p.stem.replace("-", " ").replace("_", " ")
+        snippet = text[:2000]
+
+        prompt = CLASSIFY_PROMPT.format(
+            filename=p.name,
+            directory=str(p.parent),
+            content=snippet
+        )
+        tags = call_classifier(prompt, api_key)
+        if not tags:
+            failed += 1
+            print(f"  [{i+1}/{len(candidates)}] FAIL classify: {rel}")
+            time.sleep(args.sleep)
+            continue
+
+        fm = {
+            "title": title,
+            "bucket": bucket,
+            "tags": tags,
+            "status": "BINDING",
+            "effective": date,
+        }
+        print(f"  [{i+1}/{len(candidates)}] {rel}\n      → bucket={bucket} tags={tags}")
+        if args.apply:
+            try:
+                write_frontmatter(p, fm)
+                tagged += 1
+            except Exception as e:
+                failed += 1
+                print(f"      WRITE FAILED: {e}", file=sys.stderr)
+        else:
+            tagged += 1
+
+        time.sleep(args.sleep)
+
+    print(f"\n=== Summary ===")
+    print(f"  candidates: {len(candidates)}")
+    print(f"  tagged:     {tagged}")
+    print(f"  failed:     {failed}")
+    if args.apply:
+        print("\nDone. Run knowledge_maintenance.py to refresh KNOWLEDGE_INDEX.")
+
+
+if __name__ == "__main__":
+    main()

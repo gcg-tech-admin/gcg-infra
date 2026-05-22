@@ -1,0 +1,109 @@
+#!/bin/bash
+# fleet-rollback — restore previous FLEET.yaml from latest .bak.* snapshot.
+#
+# Usage:
+#   fleet-rollback                          # rollback /opt/gcg/shared/FLEET.yaml to latest .bak.*
+#   fleet-rollback <target>                 # rollback specified target
+#   fleet-rollback <target> --snapshot N    # use specific .bak.N
+#   fleet-rollback --list                   # show available snapshots
+#   fleet-rollback --dry-run                # show plan, no changes
+
+set -euo pipefail
+
+TARGET_DEFAULT="/opt/gcg/shared/FLEET.yaml"
+ARCHIVE_DIR="/opt/gcg/shared/_archived/fleet"
+CHANGELOG="/opt/gcg/shared/_archived/fleet/CHANGELOG.txt"
+FLEET_CLI="/opt/gcg/shared/bin/fleet"
+
+usage() {
+  sed -n '2,11p' "$0" | sed 's/^# \?//'
+  exit "${1:-1}"
+}
+
+TARGET=""
+SNAPSHOT=""
+DRY_RUN=0
+LIST=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --snapshot) SNAPSHOT="$2"; shift 2 ;;
+    --list)     LIST=1; shift ;;
+    --dry-run)  DRY_RUN=1; shift ;;
+    -h|--help)  usage 0 ;;
+    -*)         echo "unknown flag: $1" >&2; usage ;;
+    *)          [ -z "$TARGET" ] && TARGET="$1" || { echo "extra arg: $1" >&2; usage; }; shift ;;
+  esac
+done
+
+[ -z "$TARGET" ] && TARGET="$TARGET_DEFAULT"
+
+# enumerate snapshots
+mapfile -t SNAPS < <(ls -t "${TARGET}".bak.* 2>/dev/null || true)
+
+if [ "$LIST" = "1" ]; then
+  if [ "${#SNAPS[@]}" -eq 0 ]; then
+    echo "no snapshots for $TARGET"
+    exit 0
+  fi
+  echo "snapshots (newest first):"
+  for s in "${SNAPS[@]}"; do
+    ts_epoch=$(echo "$s" | sed -E 's/.*\.bak\.([0-9]+).*/\1/')
+    ts_human=$(date -u -d "@$ts_epoch" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "?")
+    ver=$(grep -m1 "^version:" "$s" 2>/dev/null | sed 's/version: *//; s/"//g' || echo "?")
+    echo "  $s  ($ts_human, v$ver)"
+  done
+  exit 0
+fi
+
+[ "${#SNAPS[@]}" -eq 0 ] && { echo "fleet-rollback: no .bak.* snapshots for $TARGET" >&2; exit 2; }
+
+if [ -n "$SNAPSHOT" ]; then
+  SOURCE="${TARGET}.bak.${SNAPSHOT}"
+else
+  SOURCE="${SNAPS[0]}"  # latest
+fi
+[ -r "$SOURCE" ] || { echo "fleet-rollback: cannot read $SOURCE" >&2; exit 3; }
+
+TS=$(date -u +%Y%m%dT%H%M%SZ)
+EPOCH=$(date +%s)
+CUR_VERSION=$(grep -m1 "^version:" "$TARGET" 2>/dev/null | sed 's/version: *//; s/"//g' || echo "unknown")
+ROLLBACK_VERSION=$(grep -m1 "^version:" "$SOURCE" | sed 's/version: *//; s/"//g' || echo "unknown")
+
+echo "=== fleet-rollback ==="
+echo "target:   $TARGET"
+echo "current:  v${CUR_VERSION}"
+echo "rollback: $SOURCE (v${ROLLBACK_VERSION})"
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo
+  echo "DRY-RUN: not rolling back"
+  exit 0
+fi
+
+# preserve the now-aborted state as .bak.aborted.<ts> before clobbering
+PRE_ROLLBACK="${TARGET}.bak.aborted.${EPOCH}"
+cp -a "$TARGET" "$PRE_ROLLBACK"
+echo "snapshot-aborted: $PRE_ROLLBACK"
+
+# atomic replace
+TMP="${TARGET}.rollback.tmp"
+cp -a "$SOURCE" "$TMP"
+mv -f "$TMP" "$TARGET"
+echo "restored: $TARGET (from $SOURCE)"
+
+# changelog
+mkdir -p "$(dirname "$CHANGELOG")"
+echo "$TS  rollback v${CUR_VERSION} -> v${ROLLBACK_VERSION}  source=$SOURCE  aborted_state=$PRE_ROLLBACK  by=${USER:-unknown}" >> "$CHANGELOG"
+
+# notify
+if [ -x "$FLEET_CLI" ]; then
+  MSG="FLEET.yaml ROLLBACK v${CUR_VERSION} -> v${ROLLBACK_VERSION} at ${TS}. Aborted state preserved at $PRE_ROLLBACK."
+  FLEET_SENDER=cowork "$FLEET_CLI" broadcast "$MSG" 2>/dev/null || \
+    FLEET_SENDER=cowork "$FLEET_CLI" send --type fleet-event --priority 1 daen "$MSG" 2>/dev/null || true
+  FLEET_SENDER=cowork "$FLEET_CLI" send --type audit --priority 9 daen \
+    "AUDIT fleet-rollback v${CUR_VERSION}->v${ROLLBACK_VERSION} source=$SOURCE ts=$TS" 2>/dev/null || true
+fi
+
+echo
+echo "=== rollback complete ==="
