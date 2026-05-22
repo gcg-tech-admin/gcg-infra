@@ -1,0 +1,16 @@
+# Never commit plaintext secrets
+**/*.key
+**/*.pem
+**/id_*
+!**/id_*.pub
+**/storagebox_*
+!**/storagebox_*.pub
+**/.env
+**/.env.*
+!.env.example
+**/runtime.env
+**/db-password
+**/auth-profiles.json
+**/credentials/
+**/*token*
+!**/*.token.encrypted
