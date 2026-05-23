@@ -251,7 +251,6 @@ def write_audit_log(date_str: str, alert_count: int, usage: dict, report_path: s
     try:
         sys.path.insert(0, "/opt/gcg/shared/gcg_tools")
         import psycopg2
-import os
         conn = psycopg2.connect(host=os.environ.get("GCG_DB_HOST","95.217.114.49"), port=5432, dbname="gcg_intelligence", user=os.environ.get("GCG_DB_USER","gcg_admin"), password=os.environ["GCG_DB_PASSWORD"], sslmode="require")
         cur = conn.cursor()
         cur.execute("""

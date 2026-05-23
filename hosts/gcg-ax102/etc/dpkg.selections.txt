@@ -403,6 +403,7 @@ libitm1:amd64					install
 libjack-jackd2-0:amd64				install
 libjansson4:amd64				install
 libjbig0:amd64					install
+libjemalloc2:amd64				install
 libjpeg-turbo8:amd64				install
 libjpeg8:amd64					install
 libjq1:amd64					install
@@ -437,6 +438,7 @@ liblvm2cmd2.03:amd64				install
 liblwp-mediatypes-perl				install
 liblwp-protocol-https-perl			install
 liblz4-1:amd64					install
+liblzf1:amd64					install
 liblzma5:amd64					install
 liblzo2-2:amd64					install
 libmagic-mgc					install
@@ -937,6 +939,8 @@ qt5-gtk-platformtheme:amd64			install
 qttranslations5-l10n				install
 qtwayland5:amd64				install
 readline-common					install
+redis-server					install
+redis-tools					install
 rpcsvc-proto					install
 rsync						install
 rsyslog						install

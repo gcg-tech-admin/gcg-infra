@@ -1,0 +1,23 @@
+[Unit]
+Description=GCG Memory Recall Daemon
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+ExecStart=/bin/bash -c '  KEY=$(cat /opt/gcg/shared/credentials/google_ai_api_key.txt 2>/dev/null);   if [ -z "$KEY" ]; then     source /run/openclaw-nik/env 2>/dev/null || true;     KEY=${GEMINI_API_KEY:-${GOOGLE_AI_API_KEY:-}};   fi;   export GOOGLE_AI_API_KEY="$KEY";   export GCG_DB_HOST="10.0.0.2";   export GCG_DB_PORT="5432";   export GCG_DB_NAME="gcg_intelligence";   exec /opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/gcg_tools/recall_daemon.py'
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-recall-daemon
+
+TimeoutStopSec=10
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

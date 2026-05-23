@@ -10,8 +10,6 @@ RECALL_V3=/opt/gcg/shared/gcg_tools/recall_v3.py
 EMBED_V2=/opt/gcg/shared/gcg_tools/embed_v2.py
 GOOGLE_KEY_FILE=/opt/gcg/shared/credentials/google_ai_api_key.txt
 SCRIPT_VERSION="2026-05-20"
-RECALL_SOCK=/run/gcg-recall.sock
-RECALL_DAEMON_TIMEOUT=5
 
 # ── Help ───────────────────────────────────────────────────────────────────────
 _help_main() {
@@ -267,58 +265,12 @@ cmd_recall() {
     echo "ERROR: recall requires a query string" >&2; _help_recall; exit 1
   fi
 
+  _preflight "$agent"
+  _check_db
+
   # Always run in JSON mode internally to capture memory IDs for audit log.
   local exit_code=0
   local json_output=""
-
-  # ── Daemon fast path (opt-in via GCG_RECALL_DAEMON=1) ───────────────────────
-  # Runs BEFORE _preflight/_check_db — skips Python startup entirely on socket hit.
-  # Only active for --tier0-only (pgvector path). Falls back to recall_v3 on any failure.
-  if [[ "${GCG_RECALL_DAEMON:-0}" == "1" && -n "$tier0_flag" && -S "$RECALL_SOCK" ]]; then
-    # Single python3 socket call: avoids nc timeout + two separate python3 spawns.
-    local json_output_daemon=""
-    json_output_daemon=$($PYTHON - "$agent" "$query" "$top_k" "$RECALL_SOCK" "$RECALL_DAEMON_TIMEOUT" 2>/dev/null <<'PYCLIENT'
-import sys, socket, json
-
-agent, query, top_k, sock_path, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], float(sys.argv[5])
-req = json.dumps({"agent": agent, "query": query, "top_k": top_k}).encode(); req += bytes([10])
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(timeout)
-try:
-    s.connect(sock_path)
-    s.sendall(req)
-    s.shutdown(socket.SHUT_WR)
-    data = b""
-    while True:
-        chunk = s.recv(65536)
-        if not chunk:
-            break
-        data += chunk
-    s.close()
-    d = json.loads(data)
-    if "results" in d:
-        print(json.dumps(d["results"]))
-    else:
-        sys.exit(1)
-except Exception:
-    sys.exit(1)
-PYCLIENT
-) || true
-    if [[ -n "$json_output_daemon" ]]; then
-      # Daemon already wrote memory_recall_log — no _audit_recall here (avoids double-write)
-      if [[ -n "$json_flag" ]]; then
-        echo "$json_output_daemon"
-      else
-        _format_recall_human "$json_output_daemon"
-      fi
-      exit 0
-    fi
-    # Daemon error or socket stale — fall through to recall_v3
-  fi
-
-  # ── Standard path: shell out to recall_v3.py ────────────────────────────────
-  _preflight "$agent"
-  _check_db
   json_output=$($PYTHON "$RECALL_V3" "$query" --top_k "$top_k" --json \
     ${tier0_flag:+"$tier0_flag"} \
     "${extra_args[@]+"${extra_args[@]}"}" 2>/dev/null) || exit_code=$?
