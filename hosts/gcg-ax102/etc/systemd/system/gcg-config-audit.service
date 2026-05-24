@@ -1,0 +1,20 @@
+[Unit]
+Description=GCG OpenClaw Config Write Audit Daemon (Layer 4 protection)
+Documentation=https://github.com/Gcg-tech/gcg-platform
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/gcg/shared/bin/openclaw-config-audit.py
+Restart=always
+RestartSec=5
+User=root
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — this daemon should NOT be restartable by agents
+# (it runs as root with no agent cwd, so self-write detection won't misfire)
+
+[Install]
+WantedBy=multi-user.target

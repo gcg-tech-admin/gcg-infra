@@ -1,0 +1,888 @@
+#!/usr/bin/env python3
+"""
+provision-integrations.py — Tier 5/9/10/11 wiring for OpenClaw fleet agents.
+
+Usage:
+  provision-integrations.py <name> [--capabilities <yaml|json|@path>] [--dry-run] [--force]
+
+Tiers covered:
+  5  — fleet inbox: /fleet hook mapping in hooks.mappings +
+         inbox-auto-inject in hooks.internal.entries +
+         gcg-inbox-poller@<name>.service enablement
+  9  — FLEET.yaml agents.<name> block + AGENTS.md canonical inject
+  10 — Asana vault placeholder entry (if api_scopes includes "asana") +
+         DWD impersonation allowlist upsert
+  11 — Capability validation (skills, DWD/Gmail, MCP servers, API scopes)
+
+Does NOT touch: model routing, memory hooks, systemd unit/service, tokens
+(all owned by provision-base or provision-memory).
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+# ─── constants ────────────────────────────────────────────────────────────────
+
+FLEET_YAML         = "/opt/gcg/shared/FLEET.yaml"
+SHARED_BIN         = "/opt/gcg/shared/bin"
+SHARED_SKILLS      = "/opt/gcg/shared/skills"
+MCP_REGISTRY_DIR   = "/opt/gcg/shared/mcp-servers"
+ASANA_VAULT        = "/opt/gcg/shared/secrets/asana.enc"
+ASANA_VAULT_KEY    = "/opt/gcg/shared/secrets/.vault_key"
+AUDIT_LOG          = "/var/log/gcg-provision/integrations.log"
+AGENT_DIR_TMPL     = "/opt/gcg/openclaw-{name}"
+OPENCLAW_JSON_TMPL = "/opt/gcg/openclaw-{name}/openclaw.json"
+INBOX_POLLER_TMPL  = "gcg-inbox-poller@{name}.service"
+
+# Key written by this script into FLEET.yaml agent block
+LAST_PROVISIONED_KEY = "last_provisioned_integrations"
+
+CRITICAL_6 = {"daen", "talos", "marcus", "mnemosyne", "vulcan", "nik"}
+
+# Peter's Telegram ID (from canonical marcus config)
+PETER_TELEGRAM_ID = "418059105"
+
+# Known fleet skills
+KNOWN_SKILLS = {
+    "gcg-rotate-pat", "gcg-sales-engine", "cowork-plugin-management",
+    "pdf", "docx", "xlsx", "pptx", "canvas-design",
+    "google-sheets", "setup-cowork", "consolidate-memory",
+}
+
+# Known API scopes → credential reference
+KNOWN_API_SCOPES: dict[str, str] = {
+    "asana":      "op://GCG Agent Fleet/asana-gcg-shared/credential",
+    "slack":      "env:SLACK_BOT_TOKEN",
+    "telegram":   "env:TELEGRAM_BOT_TOKEN",
+    "heyreach":   "op://GCG Agent Fleet/heyreach-api-key/credential",
+    "ghl":        "op://GCG Agent Fleet/ghl-oauth/credential",
+    "cloudflare": "op://GCG Agent Fleet/cloudflared-personal-token/credential",
+    "hetzner":    "op://GCG Agent Fleet/hetzner-robot/credential",
+    "sentry":     "op://GCG Agent Fleet/sentry-dsn/credential",
+    "stripe":     "op://GCG Agent Fleet/gcg-stripe-prod/credential",
+    "resend":     "op://GCG Agent Fleet/gcg-resend-prod/credential",
+    "xero":       "op://GCG Agent Fleet/gcg-xero-prod/credential",
+    "twilio":     "op://GCG Agent Fleet/gcg-twilio-prod/credential",
+    "whatsapp":   "op://GCG Agent Fleet/whatsapp-business/credential",
+    "fathom":     "op://GCG Agent Fleet/fathom-api/credential",
+    "perplexity": "op://GCG Agent Fleet/perplexity-api/credential",
+    "semrush":    "op://GCG Agent Fleet/semrush-api/credential",
+    "github":     "op://GCG Agent Fleet/github-pat/credential",
+    "drive":      "env:GOOGLE_APPLICATION_CREDENTIALS",
+    "calendar":   "env:GOOGLE_APPLICATION_CREDENTIALS",
+    "sheets":     "env:GOOGLE_APPLICATION_CREDENTIALS",
+}
+
+# ─── yaml shim ────────────────────────────────────────────────────────────────
+
+def _yaml_load(text: str) -> Any:
+    try:
+        import yaml
+        return yaml.safe_load(text)
+    except ImportError:
+        return json.loads(text)
+
+
+def _yaml_dump(obj: Any) -> str:
+    try:
+        import yaml
+        return yaml.dump(obj, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    except ImportError:
+        return json.dumps(obj, indent=2)
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ─── fleet yaml helpers ───────────────────────────────────────────────────────
+
+def _load_fleet() -> dict[str, Any]:
+    with open(FLEET_YAML) as f:
+        return _yaml_load(f.read())
+
+
+def _save_fleet(data: dict[str, Any], *, dry_run: bool) -> str | None:
+    if dry_run:
+        return None
+    bak = f"{FLEET_YAML}.bak.{int(time.time())}"
+    subprocess.run(["cp", "-a", FLEET_YAML, bak], check=True)
+    with open(FLEET_YAML, "w") as f:
+        f.write(_yaml_dump(data))
+    return bak
+
+
+def _load_openclaw_json(name: str) -> dict[str, Any] | None:
+    path = OPENCLAW_JSON_TMPL.format(name=name)
+    if not Path(path).exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _save_openclaw_json(name: str, data: dict[str, Any], *, dry_run: bool) -> str | None:
+    path = OPENCLAW_JSON_TMPL.format(name=name)
+    if dry_run:
+        return None
+    bak = f"{path}.bak.{int(time.time())}"
+    subprocess.run(["cp", "-a", path, bak], check=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    return bak
+
+
+# ─── audit log ────────────────────────────────────────────────────────────────
+
+def _audit(entry: dict[str, Any]) -> None:
+    try:
+        Path(AUDIT_LOG).parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({"ts": _now_iso(), **entry}) + "\n")
+    except Exception as e:
+        print(f"  [warn] audit log write failed: {e}", file=sys.stderr)
+
+
+# ─── capability parsing ───────────────────────────────────────────────────────
+
+DEFAULT_CAPABILITIES: dict[str, Any] = {
+    "skills_allowed":      [],
+    "gmail_impersonation": [],
+    "dwd_enabled":         False,
+    "broker_allowed":      False,
+    "api_scopes":          [],
+    "mcp_servers":         [],
+    "custom_tools":        [],
+}
+
+
+def parse_capabilities(raw: str) -> dict[str, Any]:
+    """Parse --capabilities: inline JSON/YAML or @path to file."""
+    if raw.startswith("@"):
+        text = Path(raw[1:]).read_text()
+    else:
+        text = raw
+    data = _yaml_load(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"capabilities must be a mapping, got {type(data).__name__}")
+    caps = {**DEFAULT_CAPABILITIES, **data}
+    for k in ("skills_allowed", "gmail_impersonation", "api_scopes", "mcp_servers", "custom_tools"):
+        if caps.get(k) is None:
+            caps[k] = []
+        elif isinstance(caps[k], str):
+            caps[k] = [caps[k]]
+    return caps
+
+
+# ─── Tier 5: fleet inbox wiring ───────────────────────────────────────────────
+#
+# Two components (canonical from marcus):
+#   A) hooks.mappings — the /fleet webhook path mapping (external trigger)
+#   B) hooks.internal.entries["inbox-auto-inject"] — internal hook entry
+#
+# The gcg-inbox-poller@<name>.service is a separate systemd unit that
+# polls agent_messages and fires the /fleet hook for each pending row.
+
+# Canonical /fleet webhook mapping (from marcus)
+FLEET_HOOK_MAPPING = {
+    "match":                      {"path": "fleet"},
+    "action":                     "agent",
+    "wakeMode":                   "now",
+    "name":                       "Fleet",
+    "messageTemplate":            "{{message}}",
+    "deliver":                    True,
+    "allowUnsafeExternalContent": True,
+    "channel":                    "telegram",
+    "to":                         PETER_TELEGRAM_ID,
+}
+
+# Canonical internal hook entry (from marcus)
+INBOX_AUTO_INJECT_ENTRY = {
+    "enabled": True,
+    "env": {},  # HOOK_AGENT_ID injected dynamically per-agent
+}
+
+
+def _has_fleet_mapping(mappings: list[dict]) -> bool:
+    return any(
+        (isinstance(m.get("match"), dict) and m["match"].get("path") == "fleet")
+        or m.get("name") == "Fleet"
+        for m in mappings
+    )
+
+
+def _has_inbox_auto_inject(internal_entries: dict) -> bool:
+    return "inbox-auto-inject" in internal_entries
+
+
+def tier5_wire_inbox(
+    name: str,
+    cfg: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> tuple[list[str], list[str]]:
+    """
+    Wire fleet inbox components into openclaw.json.
+    Returns (changes, notes) — both are lists of human-readable strings.
+    """
+    changes: list[str] = []
+    notes:   list[str] = []
+    modified = False
+
+    # A) hooks.mappings — /fleet webhook path
+    hooks = cfg.setdefault("hooks", {})
+    mappings: list[dict] = hooks.setdefault("mappings", [])
+    if _has_fleet_mapping(mappings):
+        notes.append("fleet webhook mapping: already present")
+    else:
+        if not dry_run:
+            mappings.append(copy.deepcopy(FLEET_HOOK_MAPPING))
+            modified = True
+        changes.append("hooks.mappings: added /fleet webhook mapping")
+
+    # B) hooks.internal.entries["inbox-auto-inject"]
+    internal = hooks.setdefault("internal", {})
+    entries: dict = internal.setdefault("entries", {})
+    if _has_inbox_auto_inject(entries):
+        notes.append("inbox-auto-inject internal entry: already present")
+    else:
+        entry = copy.deepcopy(INBOX_AUTO_INJECT_ENTRY)
+        entry["env"]["HOOK_AGENT_ID"] = name
+        if not dry_run:
+            entries["inbox-auto-inject"] = entry
+            modified = True
+        changes.append("hooks.internal.entries: added inbox-auto-inject")
+
+    # Persist if modified
+    if modified:
+        bak = _save_openclaw_json(name, cfg, dry_run=False)
+        changes.append(f"openclaw.json saved (backup: {bak})")
+
+    return changes, notes
+
+
+def tier5_enable_inbox_poller(
+    name: str,
+    *,
+    dry_run: bool,
+) -> tuple[list[str], list[str]]:
+    """
+    Enable + start gcg-inbox-poller@<name>.service if not already running.
+    Returns (changes, notes).
+    """
+    changes: list[str] = []
+    notes:   list[str] = []
+    unit = INBOX_POLLER_TMPL.format(name=name)
+
+    # Check if already active
+    rc, out, err = _run(["systemctl", "is-active", unit])
+    if rc == 0 and out.strip() == "active":
+        notes.append(f"inbox poller {unit}: already active")
+        return changes, notes
+
+    # Check if the template unit exists
+    rc2, out2, _ = _run(["systemctl", "cat", "gcg-inbox-poller@.service"])
+    if rc2 != 0:
+        notes.append(f"inbox poller template gcg-inbox-poller@.service not found — skipping enable")
+        return changes, notes
+
+    if dry_run:
+        changes.append(f"[dry-run] would enable+start {unit}")
+        return changes, notes
+
+    rc3, _, err3 = _run(["systemctl", "enable", "--now", unit])
+    if rc3 == 0:
+        changes.append(f"enabled+started {unit}")
+    else:
+        notes.append(f"WARNING: failed to enable {unit}: {err3[:80]}")
+
+    return changes, notes
+
+
+# ─── Tier 9: FLEET.yaml + AGENTS.md ──────────────────────────────────────────
+
+AGENTS_MD_BEGIN = "<!-- gcg:begin -->"
+AGENTS_MD_END   = "<!-- gcg:end -->"
+
+
+def _token_sha12(cfg: dict | None, *field_path: str) -> str:
+    if not cfg:
+        return "unknown"
+    node: Any = cfg
+    for k in field_path:
+        if isinstance(node, dict):
+            node = node.get(k)
+        else:
+            return "unknown"
+    if not isinstance(node, str):
+        return "unknown"
+    return hashlib.sha256(node.encode()).hexdigest()[:12]
+
+
+def _build_agents_md_block(name: str, fleet_agent: dict[str, Any]) -> str:
+    """Canonical ## GCG Fleet block, wrapped in idempotent begin/end markers."""
+    tier      = fleet_agent.get("tier", "?")
+    role      = fleet_agent.get("role", "unknown")
+    model     = fleet_agent.get("model", {})
+    primary   = model.get("primary", "unknown") if isinstance(model, dict) else str(model)
+    fallbacks = model.get("fallbacks", []) if isinstance(model, dict) else []
+    caps      = fleet_agent.get("capabilities", {})
+    skills    = caps.get("skills_allowed", [])
+    scopes    = caps.get("api_scopes", [])
+    dwd       = caps.get("dwd_enabled", False)
+    broker    = caps.get("broker_allowed", False)
+    gmail     = caps.get("gmail_impersonation", [])
+    mcps      = caps.get("mcp_servers", [])
+    ts        = fleet_agent.get(LAST_PROVISIONED_KEY, "?")
+
+    lines = [
+        AGENTS_MD_BEGIN,
+        "",
+        "## GCG Fleet",
+        "",
+        f"**Agent:** {name}  |  **Tier:** {tier}  |  **Role:** {role}",
+        "",
+        "### Model loadout",
+        f"- Primary: `{primary}`",
+    ]
+    if fallbacks:
+        lines.append(f"- Fallbacks: {', '.join(f'`{fb}`' for fb in fallbacks)}")
+    lines += [
+        "",
+        "### Capabilities",
+        f"- Skills: {', '.join(skills) if skills else 'fleet default (all)'}",
+        f"- API scopes: {', '.join(scopes) if scopes else 'none'}",
+        f"- DWD enabled: {dwd}",
+        f"- Broker allowed: {broker}",
+        f"- Gmail impersonation: {', '.join(gmail) if gmail else 'none'}",
+        f"- MCP servers: {', '.join(mcps) if mcps else 'none'}",
+        "",
+        "### Infrastructure",
+        "- Runtime host: AX102 (77.42.7.80)",
+        f"- Service: `openclaw-{name}.service`",
+        f"- Config: `/opt/gcg/openclaw-{name}/openclaw.json`",
+        f"- Logs: `/opt/gcg/openclaw-{name}/logs/gateway.log`",
+        f"- DB role: `gcg_{name}` on AX42 (95.217.114.49)",
+        f"- Recall config: `/opt/gcg/shared/gcg_tools/config/{name}.yaml`",
+        "",
+        f"*Last provisioned (integrations): {ts}*",
+        "",
+        AGENTS_MD_END,
+    ]
+    return "\n".join(lines)
+
+
+def tier9_update_fleet_yaml(
+    name: str,
+    fleet: dict[str, Any],
+    caps: dict[str, Any],
+    cfg: dict[str, Any] | None,
+    *,
+    dry_run: bool,
+) -> tuple[list[str], list[str]]:
+    changes: list[str] = []
+    notes:   list[str] = []
+
+    agents   = fleet.setdefault("agents", {})
+    existing = copy.deepcopy(agents.get(name) or {})
+    updated  = copy.deepcopy(existing)
+
+    # Write only our fields; preserve tier/role/model owned by provision-base
+    updated["capabilities"]       = caps
+    updated[LAST_PROVISIONED_KEY] = _now_iso()
+    updated.setdefault("token_shas", {})
+    updated["token_shas"]["gateway"] = _token_sha12(cfg, "gateway", "auth", "token")
+    updated["token_shas"]["hooks"]   = _token_sha12(cfg, "hooks", "token")
+
+    if updated == existing:
+        notes.append("FLEET.yaml already up-to-date")
+        return changes, notes
+
+    if dry_run:
+        changes.append(f"[dry-run] would update FLEET.yaml agents.{name}")
+        return changes, notes
+
+    agents[name] = updated
+    bak = _save_fleet(fleet, dry_run=False)
+    changes.append(f"updated FLEET.yaml agents.{name} (backup: {bak})")
+    return changes, notes
+
+
+def tier9_inject_agents_md(
+    name: str,
+    fleet_agent: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> tuple[list[str], list[str]]:
+    changes: list[str] = []
+    notes:   list[str] = []
+
+    agents_md_path = Path(AGENT_DIR_TMPL.format(name=name)) / "workspace" / "AGENTS.md"
+    block = _build_agents_md_block(name, fleet_agent)
+
+    if not agents_md_path.exists():
+        if dry_run:
+            changes.append(f"[dry-run] would create {agents_md_path} with canonical GCG Fleet block")
+        else:
+            agents_md_path.parent.mkdir(parents=True, exist_ok=True)
+            agents_md_path.write_text(block + "\n")
+            changes.append(f"created {agents_md_path} with canonical GCG Fleet block")
+        return changes, notes
+
+    original = agents_md_path.read_text()
+
+    if AGENTS_MD_BEGIN in original and AGENTS_MD_END in original:
+        before = original[:original.index(AGENTS_MD_BEGIN)]
+        after  = original[original.index(AGENTS_MD_END) + len(AGENTS_MD_END):]
+        new_content = before + block + after
+    else:
+        new_content = block + "\n\n" + original
+
+    if new_content == original:
+        notes.append("AGENTS.md canonical block already current")
+        return changes, notes
+
+    if dry_run:
+        changes.append(f"[dry-run] would rewrite canonical block in {agents_md_path}")
+        return changes, notes
+
+    bak = f"{agents_md_path}.bak.{int(time.time())}"
+    subprocess.run(["cp", "-a", str(agents_md_path), bak], check=True)
+    agents_md_path.write_text(new_content)
+    changes.append(f"rewrote AGENTS.md canonical block (backup: {bak})")
+    return changes, notes
+
+
+# ─── Tier 10: Asana vault ─────────────────────────────────────────────────────
+
+def tier10_seed_asana_vault(
+    name: str,
+    *,
+    dry_run: bool,
+) -> tuple[list[str], list[str]]:
+    """
+    Register agent in asana.enc with placeholder entries.
+    Uses existing Fernet(vault_key) pattern — no new crypto introduced.
+    Real PAT seeded later by gcg-rotate-pat skill (requires Mac Mini SOCKS tunnel).
+    """
+    changes: list[str] = []
+    notes:   list[str] = []
+
+    vault_path = Path(ASANA_VAULT)
+    key_path   = Path(ASANA_VAULT_KEY)
+
+    if not vault_path.exists():
+        notes.append(f"vault not found at {ASANA_VAULT} — skipping")
+        return changes, notes
+    if not key_path.exists():
+        notes.append(f"vault key not found at {ASANA_VAULT_KEY} — skipping")
+        return changes, notes
+
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError:
+        notes.append("cryptography package not installed — skipping (pip install cryptography)")
+        return changes, notes
+
+    fernet = Fernet(key_path.read_bytes().strip())
+    encrypted = vault_path.read_bytes()
+
+    try:
+        plain = fernet.decrypt(encrypted).decode()
+    except Exception as e:
+        notes.append(f"vault decrypt failed: {e}")
+        return changes, notes
+
+    # Parse key=value store
+    entries: dict[str, str] = {}
+    for line in plain.splitlines():
+        line = line.strip()
+        if "=" in line and not line.startswith("#"):
+            k, _, v = line.partition("=")
+            entries[k.strip()] = v.strip()
+
+    pat_key    = f"pat:{name}"
+    state_key  = f"state:{name}"
+    seeded_key = f"state:{name}:seeded_at"
+    minted_key = f"pat:{name}:minted_at"
+
+    if pat_key in entries:
+        notes.append(f"vault entry '{pat_key}' already exists — gcg-rotate-pat will overwrite when seeding")
+        return changes, notes
+
+    if dry_run:
+        changes.append(f"[dry-run] would add: {pat_key}=SEED, {state_key}=pending, {seeded_key}/minted_key timestamps")
+        return changes, notes
+
+    now = _now_iso()
+    entries[pat_key]    = "SEED"
+    entries[state_key]  = "pending"
+    entries[seeded_key] = now
+    entries[minted_key] = ""
+
+    new_plain = "\n".join(f"{k}={v}" for k, v in entries.items()) + "\n"
+    vault_path.write_bytes(fernet.encrypt(new_plain.encode()))
+    changes.append(f"added vault entries: {pat_key}=SEED (gcg-rotate-pat seeds the real PAT)")
+    return changes, notes
+
+
+# ─── Tier 10: DWD impersonation allowlist ─────────────────────────────────────
+
+def _psql(sql: str, timeout: int = 15) -> tuple[int, str, str]:
+    """Run a psql command against the fleet DB (AX42)."""
+    DB_HOST = "95.217.114.49"
+    DB_USER = "gcg_admin"
+    DB_NAME = "gcg_intelligence"
+    conn    = f"host={DB_HOST} dbname={DB_NAME} user={DB_USER} sslmode=require"
+    cmd = ["psql", conn, "-c", sql]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def tier10_upsert_dwd_allowlist(
+    name: str,
+    gmail_impersonation: list[str],
+    *,
+    dry_run: bool,
+    force: bool,
+) -> tuple[list[str], list[str]]:
+    changes: list[str] = []
+    notes:   list[str] = []
+
+    if not gmail_impersonation:
+        return changes, notes
+
+    for email in gmail_impersonation:
+        # Check current state
+        safe_email = email.replace("'", "''")
+        safe_name  = name.replace("'", "''")
+        check_sql = (
+            f"SELECT id FROM public.agent_impersonation_allowed "
+            f"WHERE agent_id='{safe_name}' AND email='{safe_email}' AND revoked_at IS NULL;"
+        )
+        rc, out, err = _psql(check_sql)
+        # If psql itself failed (no DB access from this host), note it and skip
+        if rc != 0 and "could not connect" in err.lower():
+            notes.append(f"DB unreachable — cannot verify/insert DWD for {email} (do manually)")
+            continue
+
+        if rc == 0 and "0 rows" not in out and "(" in out:
+            notes.append(f"DWD {email}: already present")
+            continue
+
+        if not force and not dry_run:
+            ans = input(f"  Insert DWD allowlist: {name} -> {email}? [y/N] ").strip().lower()
+            if ans != "y":
+                notes.append(f"DWD {email}: skipped by user")
+                continue
+
+        if dry_run:
+            changes.append(f"[dry-run] would INSERT agent_impersonation_allowed ({name}, {email})")
+            continue
+
+        insert_sql = (
+            f"INSERT INTO public.agent_impersonation_allowed (agent_id, email) "
+            f"VALUES ('{safe_name}', '{safe_email}') "
+            f"ON CONFLICT (agent_id, email) DO UPDATE SET revoked_at = NULL;"
+        )
+        rc2, out2, err2 = _psql(insert_sql)
+        if rc2 == 0:
+            changes.append(f"DWD allowlist: inserted ({name}, {email})")
+        else:
+            notes.append(f"DWD allowlist INSERT FAILED ({name}, {email}): {err2[:100]}")
+
+    return changes, notes
+
+
+# ─── Tier 11: Capability validation ───────────────────────────────────────────
+
+def tier11_validate_capabilities(
+    name: str,
+    caps: dict[str, Any],
+) -> list[tuple[str, str, str]]:
+    """
+    Validate declared capabilities before mutations.
+    Returns list of (level, check_name, message) where level is INFO | WARN | ERROR.
+    """
+    results: list[tuple[str, str, str]] = []
+
+    # Skills
+    for skill in (caps.get("skills_allowed") or []):
+        skill_path = Path(SHARED_SKILLS) / skill / "SKILL.md"
+        if skill_path.exists():
+            results.append(("INFO",  f"skill:{skill}", "OK"))
+        else:
+            results.append(("ERROR", f"skill:{skill}", f"SKILL.md not found at {skill_path}"))
+
+    # MCP servers — warn only (may be embedded in openclaw.json rather than registry file)
+    mcp_registry = Path(MCP_REGISTRY_DIR)
+    for mcp in (caps.get("mcp_servers") or []):
+        found = (
+            (mcp_registry / f"{mcp}.json").exists()
+            or (mcp_registry / f"{mcp}.yaml").exists()
+            or (mcp_registry / mcp / "config.json").exists()
+        )
+        if found:
+            results.append(("INFO",  f"mcp:{mcp}", "found in registry"))
+        else:
+            results.append(("WARN",  f"mcp:{mcp}", f"no file under {MCP_REGISTRY_DIR}/ — may be embedded in openclaw.json"))
+
+    # API scopes
+    for scope in (caps.get("api_scopes") or []):
+        if scope in KNOWN_API_SCOPES:
+            results.append(("INFO",  f"api_scope:{scope}", f"cred: {KNOWN_API_SCOPES[scope]}"))
+        else:
+            results.append(("WARN",  f"api_scope:{scope}", "no credential path mapped — verify manually"))
+
+    # DWD + gmail consistency
+    dwd   = caps.get("dwd_enabled", False)
+    gmail = caps.get("gmail_impersonation") or []
+    if gmail and not dwd:
+        results.append(("WARN",  "dwd_check", "gmail_impersonation declared but dwd_enabled=false"))
+    if dwd and not gmail:
+        results.append(("INFO",  "dwd_check", "DWD enabled; no gmail_impersonation entries declared"))
+
+    # Asana scope
+    if "asana" in (caps.get("api_scopes") or []):
+        results.append(("INFO",  "asana_vault", "asana in api_scopes → vault entry will be seeded"))
+
+    return results
+
+
+# ─── MCP registry discovery ───────────────────────────────────────────────────
+
+def discover_mcp_registry() -> list[str]:
+    registry = Path(MCP_REGISTRY_DIR)
+    if not registry.exists():
+        return []
+    names: set[str] = set()
+    for p in registry.iterdir():
+        if p.suffix in (".json", ".yaml"):
+            names.add(p.stem)
+        elif p.is_dir() and (p / "config.json").exists():
+            names.add(p.name)
+    return sorted(names)
+
+
+# ─── subprocess helper ────────────────────────────────────────────────────────
+
+def _run(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except Exception as e:
+        return 1, "", str(e)
+
+
+# ─── QA runner ────────────────────────────────────────────────────────────────
+
+def run_qa(name: str) -> int:
+    qa_bin = Path(SHARED_BIN) / "gcg-agent-qa"
+    if not qa_bin.exists():
+        print(f"  [warn] gcg-agent-qa not found at {qa_bin}", file=sys.stderr)
+        return 0
+    rc, _, _ = _run([str(qa_bin), name, "--check", "--no-color"], timeout=60)
+    return rc
+
+
+# ─── print helpers ────────────────────────────────────────────────────────────
+
+def _section(title: str) -> None:
+    print(f"\n── {title} ──")
+
+
+def _line(symbol: str, msg: str) -> None:
+    print(f"  {symbol}  {msg}")
+
+
+# ─── main orchestration ───────────────────────────────────────────────────────
+
+def provision(
+    name: str,
+    caps: dict[str, Any],
+    *,
+    dry_run: bool,
+    force: bool,
+) -> int:
+    print(f"\n{'='*70}")
+    print(f"provision-integrations  agent={name}  dry_run={dry_run}  force={force}")
+    print(f"{'='*70}")
+
+    # Critical-6 guard
+    if name in CRITICAL_6 and not force:
+        print(f"\n[ERROR] {name} is a critical-6 agent. Pass --force to proceed.")
+        return 1
+
+    all_changes: list[str] = []
+    all_notes:   list[str] = []
+    fatal = False
+
+    # Load live state
+    cfg = _load_openclaw_json(name)
+    if cfg is None:
+        if not dry_run:
+            print(f"\n[ERROR] openclaw.json not found — run provision-base first.")
+            return 1
+        cfg = {}  # work with empty stub in dry-run
+
+    fleet = _load_fleet()
+
+    # ── Tier 11: validate capabilities BEFORE mutations ───────────────────────
+    _section("Tier 11: Capability validation")
+    val = tier11_validate_capabilities(name, caps)
+    for level, check, msg in val:
+        icon = "OK" if level == "INFO" else ("!!" if level == "WARN" else "XX")
+        _line(f"[{icon}]", f"{check}: {msg}")
+        if level == "ERROR":
+            fatal = True
+
+    if fatal and not force:
+        print("\n[ERROR] Validation failed. Fix errors above or pass --force to override.")
+        return 1
+
+    # ── Tier 5: Fleet inbox ───────────────────────────────────────────────────
+    _section("Tier 5: Fleet inbox hook wiring")
+    ch5, n5 = tier5_wire_inbox(name, cfg, dry_run=dry_run)
+    for c in ch5:
+        _line("CHANGED", c)
+        all_changes.append(f"tier5: {c}")
+    for n in n5:
+        _line("ok", n)
+        all_notes.append(n)
+
+    _section("Tier 5: Inbox poller service")
+    ch5p, n5p = tier5_enable_inbox_poller(name, dry_run=dry_run)
+    for c in ch5p:
+        _line("CHANGED", c)
+        all_changes.append(f"tier5_poller: {c}")
+    for n in n5p:
+        _line("ok", n)
+
+    # ── Tier 9: FLEET.yaml ────────────────────────────────────────────────────
+    _section("Tier 9: FLEET.yaml update")
+    fleet_fresh = _load_fleet()  # fresh read after potential tier5 saves
+    ch9f, n9f = tier9_update_fleet_yaml(name, fleet_fresh, caps, cfg, dry_run=dry_run)
+    for c in ch9f:
+        _line("CHANGED", c)
+        all_changes.append(f"tier9_fleet: {c}")
+    for n in n9f:
+        _line("ok", n)
+
+    _section("Tier 9: AGENTS.md canonical inject")
+    fleet_agent = fleet_fresh.get("agents", {}).get(name, {})
+    fleet_agent["capabilities"] = caps  # ensure current caps even if fleet write was dry-run
+    ch9m, n9m = tier9_inject_agents_md(name, fleet_agent, dry_run=dry_run)
+    for c in ch9m:
+        _line("CHANGED", c)
+        all_changes.append(f"tier9_agents_md: {c}")
+    for n in n9m:
+        _line("ok", n)
+
+    # ── Tier 10: Asana vault ──────────────────────────────────────────────────
+    scopes = caps.get("api_scopes") or []
+    if "asana" in scopes:
+        _section("Tier 10: Asana vault entry")
+        ch10a, n10a = tier10_seed_asana_vault(name, dry_run=dry_run)
+        for c in ch10a:
+            _line("CHANGED", c)
+            all_changes.append(f"tier10_asana: {c}")
+        for n in n10a:
+            _line("ok", n)
+    else:
+        _section("Tier 10: Asana vault — SKIP (asana not in api_scopes)")
+
+    # ── Tier 10: DWD allowlist ────────────────────────────────────────────────
+    gmail = caps.get("gmail_impersonation") or []
+    if gmail:
+        _section("Tier 10: DWD impersonation allowlist")
+        ch10d, n10d = tier10_upsert_dwd_allowlist(name, gmail, dry_run=dry_run, force=force)
+        for c in ch10d:
+            _line("CHANGED", c)
+            all_changes.append(f"tier10_dwd: {c}")
+        for n in n10d:
+            _line("ok", n)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print(f"\n{'─'*70}")
+    print(f"Changes: {len(all_changes)}  (dry_run={dry_run})")
+    for c in all_changes:
+        print(f"  + {c}")
+
+    # ── Audit ─────────────────────────────────────────────────────────────────
+    _audit({
+        "agent":   name,
+        "dry_run": dry_run,
+        "force":   force,
+        "changes": all_changes,
+        "notes":   all_notes,
+        "caps":    caps,
+    })
+
+    # ── Final QA ──────────────────────────────────────────────────────────────
+    if not dry_run and not fatal:
+        _section(f"Final QA: gcg-agent-qa {name} --check --no-color")
+        qa_rc = run_qa(name)
+        print(f"  QA exit={qa_rc}  {'PASS' if qa_rc == 0 else 'NEEDS REVIEW'}")
+
+    print()
+    return 0
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="provision-integrations",
+        description="Tier 5/9/10/11 integration wiring for OpenClaw fleet agents.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  provision-integrations nova --dry-run\n"
+            "  provision-integrations nova --capabilities '{\"api_scopes\":[\"slack\",\"asana\"]}'\n"
+            "  provision-integrations nova --capabilities @/tmp/nova-caps.yaml\n"
+            "  provision-integrations nik --force\n"
+        ),
+    )
+    p.add_argument("name", help="agent name")
+    p.add_argument("--capabilities", metavar="YAML|JSON|@PATH",
+                   help="capability declaration (inline YAML/JSON or @path)")
+    p.add_argument("--dry-run", action="store_true", help="plan only — no mutations")
+    p.add_argument("--force",   action="store_true",
+                   help="required for critical-6; overrides validation errors")
+    args = p.parse_args()
+
+    name = args.name.lower().strip()
+
+    if args.capabilities:
+        try:
+            caps = parse_capabilities(args.capabilities)
+        except Exception as e:
+            print(f"[ERROR] --capabilities parse failed: {e}", file=sys.stderr)
+            return 2
+    else:
+        caps = copy.deepcopy(DEFAULT_CAPABILITIES)
+
+    # Show MCP registry discovery
+    known_mcps = discover_mcp_registry()
+    if known_mcps:
+        print(f"[info] MCP registry ({MCP_REGISTRY_DIR}): {', '.join(known_mcps)}")
+    else:
+        print(f"[info] MCP registry ({MCP_REGISTRY_DIR}): empty or not found")
+
+    return provision(name, caps, dry_run=args.dry_run, force=args.force)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

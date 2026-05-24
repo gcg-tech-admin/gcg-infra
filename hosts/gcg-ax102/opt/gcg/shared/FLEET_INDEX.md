@@ -3,6 +3,17 @@
 ---
 
 
+## UPDATE LOG — 2026-05-23
+
+### DeepSeek Provider Block Fix (fleet-wide)
+27/29 agents were missing the `deepseek` provider block in `models.providers`, causing all `deepseek/deepseek-v4-pro:high` (and `deepseek-v4-flash`) calls to fail with `FailoverError: Unknown model` and silently fall back to kimi-k2.6. Fixed fleet-wide 2026-05-23. Provider block added to all affected agents: `baseUrl: https://api.deepseek.com/v1`, `apiKey: env:DEEPSEEK_API_KEY`, `api: openai-completions`. talos and vulcan already had the block (2/29 exceptions).
+
+## UPDATE LOG — 2026-05-23 (correction detector timer fix)
+
+### Correction detector timer — systemd OnUnitActiveSec trap resolved
+`gcg-correction-detector.service` existed without a `.timer` for months — correction scan never fired. Fixed 2026-05-23: `gcg-correction-detector.timer` installed with `OnCalendar=hourly`. Root cause was a systemd scheduling trap: `oneshot` service + `RemainAfterExit=yes` + timer `OnUnitActiveSec` = timer never re-fires after first activation. **See Ops Gotchas §OG-1 below.**
+Canonical: Memory CANONICAL §19 (Correction Detector).
+
 ## UPDATE LOG — 2026-05-21 (doc + memory ontologies)
 
 ### Canonical taxonomies are now BINDING fleet-wide
@@ -91,3 +102,19 @@ conn = get_connection(admin=True)
 
 ## MEMORY & KNOWLEDGE How memory works (pgvector, scopes, write rules): → `/opt/gcg/shared/docs/architecture/MEMORY_CANONICAL.md` How to query the knowledge base: → `/opt/gcg/shared/skills/gcg-kb-query/SKILL.md` How to write structured memories: → `/opt/gcg/shared/docs/sops/STRUCTURED_MEMORY_SOP.md` What's indexed in pgvector: → `/opt/gcg/shared/docs/KNOWLEDGE_INDEX.md` 
 ### ⚠️ Embedding Provider Gotcha (READ BEFORE TOUCHING MEMORY CONFIG) OpenClaw uses inconsistent provider naming and the schema does n
+
+---
+
+## OPS GOTCHAS
+
+Known systemd/infra traps that have caused real incidents. Read before touching timers or services.
+
+### OG-1 — systemd: oneshot + RemainAfterExit + OnUnitActiveSec = timer never re-fires
+
+**Trap:** A `Type=oneshot` service with `RemainAfterExit=yes` transitions to `active (exited)` after its first run and stays there. A timer using `OnUnitActiveSec=` only re-fires when the unit transitions from inactive → active. Since the unit stays `active (exited)` forever, the timer never re-fires.
+
+**Symptom:** Service runs once (at boot or manual start), never again. `systemctl status` shows "active (exited)" indefinitely. No error, no alert.
+
+**Fix:** Use `OnCalendar=` (e.g. `OnCalendar=hourly`) in the timer, NOT `OnUnitActiveSec=`. Remove `RemainAfterExit=yes` from the service if the timer needs periodic execution.
+
+**Origin:** `gcg-correction-detector.timer` missing for months; correction scanning silently inactive 2026-05-23.

@@ -6,6 +6,7 @@ After=network.target docker.service
 Type=simple
 User=root
 WorkingDirectory=/opt/gcg/openclaw-mnemosyne
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-mnemosyne/openclaw.json
 ExecStart=/usr/bin/openclaw gateway
 EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
 EnvironmentFile=-/opt/gcg/shared/.env.global

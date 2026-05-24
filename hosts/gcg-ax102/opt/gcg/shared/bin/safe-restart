@@ -1,0 +1,277 @@
+#!/bin/bash
+# /opt/gcg/shared/bin/safe-restart
+#
+# Critical-6 restart guard — Layer 2 (recommended restart entry-point)
+#
+# Usage:
+#   safe-restart <agent>                            # refuses critical-6
+#   safe-restart <agent> --force-critical6          # allows critical-6 (Peter only); handles lock dance
+#   safe-restart <agent> --force-critical6-if-needed  # auto-detect; safe for scripts with variable agent
+#   safe-restart <agent> --stop                     # stop agent; same critical-6 guard
+#   safe-restart <agent> --dry-run                  # print what would happen, no action
+#   safe-restart <agent> --force-critical6 --dry-run
+#
+# Pre-flight: checks gateway.log for "config reload skipped (invalid config)"
+#   in the last 5 min. Refuses restart if found (bad config = immediate crash-loop).
+#
+# Post-restart: waits 10s, checks systemctl is-active, exits 2 if unhealthy.
+#   Skipped when --stop is used.
+#
+# Critical-6 lock (Layer 3 — kernel-level):
+#   Each critical-6 agent has a drop-in at
+#   /etc/systemd/system/openclaw-<agent>.service.d/critical6-lock.conf
+#   with RefuseManualStop=yes. When --force-critical6 is used, this script
+#   moves the drop-in aside, daemon-reloads, restarts, restores it — all wrapped
+#   in trap so a mid-flight crash still restores the lock.
+#
+# Log: /var/log/gcg-critical6-guard.log
+
+set -euo pipefail
+
+GUARD_LOG="/var/log/gcg-critical6-guard.log"
+REAL_SYSTEMCTL="/bin/systemctl"
+GUARDED_SYSTEMCTL="/usr/local/sbin/systemctl-guarded"
+GCG_ROOT="/opt/gcg"
+CRITICAL6="daen talos marcus mnemosyne vulcan nik"
+INVALID_CONFIG_PATTERN="config reload skipped (invalid config)"
+LOCK_FILENAME="critical6-lock.conf"
+
+# ── Arg parsing ───────────────────────────────────────────────────────────────
+AGENT=""
+FORCE_CRITICAL6=0
+FORCE_CRITICAL6_IF_NEEDED=0
+DRY_RUN=0
+STOP_MODE=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --force-critical6)           FORCE_CRITICAL6=1 ;;
+    --force-critical6-if-needed) FORCE_CRITICAL6_IF_NEEDED=1 ;;
+    --stop)                      STOP_MODE=1 ;;
+    --dry-run)                   DRY_RUN=1 ;;
+    --*)
+      echo "safe-restart: unknown flag '$arg'" >&2
+      echo "Usage: safe-restart <agent> [--force-critical6] [--force-critical6-if-needed] [--stop] [--dry-run]" >&2
+      exit 1
+      ;;
+    *)
+      if [[ -z "$AGENT" ]]; then
+        AGENT="${arg%.service}"
+        AGENT="${AGENT#openclaw-}"
+      else
+        echo "safe-restart: unexpected argument '$arg'" >&2
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$AGENT" ]]; then
+  echo "Usage: safe-restart <agent> [--force-critical6] [--force-critical6-if-needed] [--stop] [--dry-run]" >&2
+  echo "  Agents: $(ls -d /opt/gcg/openclaw-*/ 2>/dev/null | sed 's|.*/openclaw-||;s|/||' | tr '\n' ' ')" >&2
+  exit 1
+fi
+
+SERVICE="openclaw-${AGENT}.service"
+LOG_FILE="${GCG_ROOT}/openclaw-${AGENT}/logs/gateway.log"
+DROPIN_DIR="/etc/systemd/system/openclaw-${AGENT}.service.d"
+LOCK_FILE="${DROPIN_DIR}/${LOCK_FILENAME}"
+LOCK_BACKUP="${LOCK_FILE}.disabled.tmp"
+TS=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+VERB="restart"
+[[ $STOP_MODE -eq 1 ]] && VERB="stop"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+is_critical() {
+  for c in $CRITICAL6; do
+    [[ "$AGENT" == "$c" ]] && return 0
+  done
+  return 1
+}
+
+lock_present() {
+  [[ -f "$LOCK_FILE" ]]
+}
+
+# --force-critical6-if-needed: auto-promote if agent is critical-6
+if [[ $FORCE_CRITICAL6_IF_NEEDED -eq 1 ]] && is_critical; then
+  FORCE_CRITICAL6=1
+  echo "[safe-restart] --force-critical6-if-needed: '${AGENT}' IS critical-6 — applying --force-critical6 automatically"
+  printf '%s CRITICAL6-AUTO-ESCALATION unit=%s caller_pid=%d source=safe-restart flag=force-critical6-if-needed\n' \
+    "$TS" "$SERVICE" "$$" >> "$GUARD_LOG" 2>/dev/null || true
+fi
+
+log_guard() {
+  local status="$1"
+  local ppid_name
+  ppid_name=$(ps -o comm= -p "$PPID" 2>/dev/null || echo "unknown")
+  printf '%s %s verb=%s unit=%s caller_pid=%d caller_parent=%s source=safe-restart dry_run=%d\n' \
+    "$TS" "$status" "$VERB" "$SERVICE" "$$" "$ppid_name" "$DRY_RUN" \
+    >> "$GUARD_LOG" 2>/dev/null || true
+}
+
+# ── Check agent directory exists ──────────────────────────────────────────────
+if [[ ! -d "${GCG_ROOT}/openclaw-${AGENT}" ]]; then
+  echo "safe-restart: agent '${AGENT}' not found (no directory at ${GCG_ROOT}/openclaw-${AGENT})" >&2
+  exit 1
+fi
+
+echo "[safe-restart] agent=${AGENT} verb=${VERB} dry_run=${DRY_RUN} force_critical6=${FORCE_CRITICAL6}"
+
+# ── Critical-6 check ──────────────────────────────────────────────────────────
+if is_critical; then
+  if [[ $FORCE_CRITICAL6 -eq 0 ]]; then
+    log_guard "BLOCKED"
+    echo "" >&2
+    echo "BLOCKED: '${AGENT}' is a critical-6 agent." >&2
+    echo "  Critical-6: ${CRITICAL6}" >&2
+    echo "  These agents must not be restarted without explicit Peter approval." >&2
+    echo "  Incident reference: 2026-05-23 Nik went down 102s across 4 crash cycles." >&2
+    echo "" >&2
+    echo "  To proceed:" >&2
+    echo "    safe-restart ${AGENT} --force-critical6" >&2
+    echo "  Or for automated scripts with variable agent names:" >&2
+    echo "    safe-restart ${AGENT} --force-critical6-if-needed" >&2
+    exit 1
+  else
+    echo "[safe-restart] WARNING: forcing ${VERB} of critical-6 agent '${AGENT}'"
+    log_guard "ALLOWED-OVERRIDE"
+  fi
+fi
+
+# ── Pre-flight: config validity check (skip for --stop) ───────────────────────
+if [[ $STOP_MODE -eq 0 ]]; then
+  echo "[safe-restart] pre-flight: checking for invalid config errors in last 5 min..."
+
+  SINCE_TS=$(date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%S' 2>/dev/null \
+    || date -u -v-5M '+%Y-%m-%dT%H:%M:%S' 2>/dev/null \
+    || echo "")
+
+  INVALID_HITS=""
+  if [[ -f "$LOG_FILE" ]]; then
+    if [[ -n "$SINCE_TS" ]]; then
+      INVALID_HITS=$(awk -v since="$SINCE_TS" '
+        $0 >= since && /config reload skipped \(invalid config\)/ { found++ }
+        END { print found+0 }
+      ' "$LOG_FILE" 2>/dev/null || echo "0")
+    else
+      INVALID_HITS=$(tail -200 "$LOG_FILE" | grep -c "${INVALID_CONFIG_PATTERN}" 2>/dev/null || echo "0")
+    fi
+  else
+    echo "[safe-restart] WARNING: no log file at $LOG_FILE — skipping config check"
+    INVALID_HITS=0
+  fi
+
+  if [[ "$INVALID_HITS" -gt 0 ]]; then
+    log_guard "BLOCKED-INVALID-CONFIG"
+    echo "" >&2
+    echo "BLOCKED: pre-flight failed for '${AGENT}'." >&2
+    echo "  Found ${INVALID_HITS} occurrence(s) of '${INVALID_CONFIG_PATTERN}'" >&2
+    echo "  in ${LOG_FILE} within the last 5 minutes." >&2
+    echo "" >&2
+    echo "  A restart with an invalid config will immediately crash-loop." >&2
+    echo "  Fix the config first:" >&2
+    echo "    python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-${AGENT}/openclaw.json" >&2
+    echo "  Then retry: safe-restart ${AGENT}" >&2
+    exit 1
+  fi
+
+  echo "[safe-restart] pre-flight: OK (no invalid config hits)"
+fi
+
+# ── Dry-run exit ──────────────────────────────────────────────────────────────
+if [[ $DRY_RUN -eq 1 ]]; then
+  log_guard "DRY-RUN"
+  echo "[safe-restart] DRY-RUN: would execute:"
+  if [[ $STOP_MODE -eq 1 ]]; then
+    echo "  ${REAL_SYSTEMCTL} stop ${SERVICE}"
+  elif is_critical && [[ -f "$LOCK_FILE" ]]; then
+    echo "  1. detect lock at ${LOCK_FILE} — present"
+    echo "  2. mv ${LOCK_FILE} ${LOCK_BACKUP}  (trap registered to restore on any exit)"
+    echo "  3. systemctl daemon-reload"
+    echo "  4. GCG_CRITICAL6_OVERRIDE=1 ${GUARDED_SYSTEMCTL} restart ${SERVICE}"
+    echo "  5. mv ${LOCK_BACKUP} ${LOCK_FILE}  (restore lock)"
+    echo "  6. systemctl daemon-reload"
+    echo "  7. wait 10s then check systemctl is-active ${SERVICE}"
+  elif is_critical; then
+    echo "  (lock not present — skip lock dance)"
+    echo "  GCG_CRITICAL6_OVERRIDE=1 ${GUARDED_SYSTEMCTL} restart ${SERVICE}"
+    echo "  wait 10s then check systemctl is-active ${SERVICE}"
+  else
+    echo "  ${GUARDED_SYSTEMCTL} restart ${SERVICE}"
+    echo "  wait 10s then check systemctl is-active ${SERVICE}"
+  fi
+  echo "[safe-restart] DRY-RUN: no action taken."
+  exit 0
+fi
+
+# ── Stop or Restart ───────────────────────────────────────────────────────────
+if [[ $STOP_MODE -eq 1 ]]; then
+  echo "[safe-restart] stopping ${SERVICE}..."
+  "$REAL_SYSTEMCTL" stop "$SERVICE"
+  log_guard "STOPPED"
+  echo "[safe-restart] stopped ${AGENT}."
+  exit 0
+fi
+
+echo "[safe-restart] restarting ${SERVICE}..."
+
+if is_critical && lock_present; then
+  # ── Lock dance: move drop-in aside, reload, restart, restore, reload ──────
+  echo "[safe-restart] OVERRIDE_USED: moving critical6-lock drop-in aside for restart window"
+  log_guard "OVERRIDE_USED"
+
+  restore_lock() {
+    local exit_code=$?
+    if [[ -f "$LOCK_BACKUP" ]]; then
+      echo "[safe-restart] trap: restoring lock drop-in from backup" >&2
+      mv "$LOCK_BACKUP" "$LOCK_FILE"
+      "$REAL_SYSTEMCTL" daemon-reload 2>/dev/null || true
+      echo "[safe-restart] trap: lock restored" >&2
+      printf '%s LOCK_RESTORED_VIA_TRAP unit=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SERVICE" \
+        >> "$GUARD_LOG" 2>/dev/null || true
+    fi
+    exit "$exit_code"
+  }
+  trap restore_lock EXIT
+
+  mv "$LOCK_FILE" "$LOCK_BACKUP"
+  "$REAL_SYSTEMCTL" daemon-reload
+
+  GCG_CRITICAL6_OVERRIDE=1 "$GUARDED_SYSTEMCTL" restart "$SERVICE"
+
+  mv "$LOCK_BACKUP" "$LOCK_FILE"
+  "$REAL_SYSTEMCTL" daemon-reload
+
+  trap - EXIT
+
+  printf '%s OVERRIDE_USED verb=restart unit=%s lock_restored=yes\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$SERVICE" \
+    >> "$GUARD_LOG" 2>/dev/null || true
+
+  echo "[safe-restart] lock restored: ${LOCK_FILE}"
+
+elif is_critical; then
+  echo "[safe-restart] WARNING: critical-6 lock not found at ${LOCK_FILE} — proceeding without lock dance"
+  GCG_CRITICAL6_OVERRIDE=1 "$GUARDED_SYSTEMCTL" restart "$SERVICE"
+
+else
+  "$GUARDED_SYSTEMCTL" restart "$SERVICE"
+fi
+
+# ── Post-restart health check ─────────────────────────────────────────────────
+echo "[safe-restart] waiting 10s for service to stabilise..."
+sleep 10
+
+STATE=$("$REAL_SYSTEMCTL" is-active "$SERVICE" 2>/dev/null || echo "unknown")
+echo "[safe-restart] post-restart state: ${STATE}"
+
+if [[ "$STATE" == "active" ]]; then
+  echo "[safe-restart] OK: ${AGENT} is active."
+  log_guard "COMPLETED-OK"
+else
+  echo "[safe-restart] WARNING: ${AGENT} is '${STATE}' after restart — investigate immediately." >&2
+  echo "  journalctl -u ${SERVICE} -n 50 --no-pager" >&2
+  log_guard "COMPLETED-UNHEALTHY"
+  exit 2
+fi

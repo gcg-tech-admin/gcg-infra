@@ -1,0 +1,11 @@
+[Unit]
+Description=GCG Nightly Doc Index + Dispatch
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Environment=GCG_DB_HOST=10.0.0.2
+ExecStart=/opt/gcg/shared/bin/gcg-doc-index
+StandardOutput=journal
+StandardError=journal

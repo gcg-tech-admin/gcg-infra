@@ -17,6 +17,7 @@ Environment=NODE_OPTIONS=--max-old-space-size=3072
 Environment=NODE_ENV=production
 Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-jc/state
 Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-jc/openclaw.json
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-jc/openclaw.json
 ExecStart=/usr/bin/openclaw gateway
 ExecStopPost=/bin/sh -c 'sleep 2; for pid in $(lsof -t -i:20301 2>/dev/null); do if [ "$pid" != "$$" ]; then kill -9 "$pid" 2>/dev/null; fi; done'
 MemoryHigh=10G

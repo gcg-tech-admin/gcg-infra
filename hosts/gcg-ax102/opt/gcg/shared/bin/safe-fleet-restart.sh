@@ -21,7 +21,7 @@ restart_one() {
   local a="$1"
   echo "  [$(date -u +%H:%M:%S)] restart openclaw-$a"
   systemctl reset-failed "openclaw-$a" 2>/dev/null || true
-  timeout "$TIMEOUT_PER_AGENT" systemctl restart "openclaw-$a"
+  timeout "$TIMEOUT_PER_AGENT" /opt/gcg/shared/bin/safe-restart "$a" --force-critical6-if-needed
   local s
   s=$(systemctl is-active "openclaw-$a")
   echo "  [$(date -u +%H:%M:%S)] openclaw-$a: $s"

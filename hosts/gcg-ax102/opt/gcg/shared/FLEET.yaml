@@ -1,6 +1,6 @@
-version: '2.2'
+version: '2.4'
 schema_version: canonical-fleet-2026-05-20
-last_updated: '2026-05-20T15:12:33Z'
+last_updated: '2026-05-23T10:45:00Z'
 generated_by: fleet-yaml-gen.py (live-state refresh)
 total_agents: 29
 critical_agents:
@@ -28,11 +28,12 @@ restart_policy:
   - vulcan
 model_policy:
   banned:
-  - deepseek/deepseek-v4-pro
   - openrouter/*
-  banned_note: 'deepseek/deepseek-v4-pro MUST be called with thinking=high (FLEET-WIDE BINDING RULE 2026-05-10).
+  banned_note: 'openrouter/* banned fleet-wide (direct APIs only).
 
-    Used bare it is on banned list. openrouter/* banned fleet-wide.
+    DeepSeek V4 Pro thinking enabled via agents.defaults.thinkingDefault: high at config level, NOT via :high model suffix
+    (which is CLI-only syntax and triggers model not found if used in openclaw.json). Bare model name deepseek/deepseek-v4-pro
+    is required and correct. FLEET-WIDE BINDING RULE 2026-05-23 (corrects 2026-05-10 wording).
 
     '
   tier_A_bedrock:
@@ -51,46 +52,11 @@ model_policy:
     auth: AWS_BEARER_TOKEN_BEDROCK (single-token Bedrock API key, ABSK-prefixed)
     region: us-east-1
 shared_token_groups:
-  gateway:
-    shared:group-2b80acdffb84:
-    - goku
-    - nik
-    shared:group-5a49ec070b3e:
-    - daen
-    - niccolo
-    shared:group-7bb214d65953:
-    - argus
-    - chiron
-    - mnemosyne
-  hooks:
-    shared:group-b92006a944b7:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+  gateway: {}
+  hooks: {}
+  _note: 'All gateway and hooks tokens rotated to unique per-agent values as of 2026-05-23T07:32:26.995278Z. Each agent has
+    a unique 64-char (32-byte) token. Previous shared groups removed: shared:group-2b80acdffb84, shared:group-5a49ec070b3e,
+    shared:group-7bb214d65953, shared:group-b92006a944b7'
 openclaw_json_schema:
   allowed_root_keys:
   - meta
@@ -349,7 +315,7 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: 182f3c20e2a4
+    hooks_token_sha: a2733ab61c10
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
     telegram_bot: '@gcg_Alex_bot'
@@ -369,6 +335,18 @@ agents:
     mission: "Be Violetta's expert right hand on everything UAE business setup and corporate services. No surprises. Right\
       \ structure, right activity, right approvals, right paperwork, right sequencing \u2014 every time.  Handle the full\
       \ lifecycle of company formation, amendments, renewals, and comp"
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   alexa:
     title: The Finance Controller
     group: OPERATIONS
@@ -398,35 +376,9 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 166fba2290fb
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_alexa_bot'
     telegram_bot_id: 8054265870
     telegram_enabled: true
@@ -444,6 +396,18 @@ agents:
     human_email: ishan@gcg-structuring.com
     mission: "Finance Controller \u2014 Ishan's AI partner for accounting, treasury, tax, and financial reporting across all\
       \ GCG entities."
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   algaib:
     title: The Legal Corpus Coordinator
     group: LEGAL & COMPLIANCE
@@ -471,35 +435,9 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: 8faa05150820
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 4c3d2de93026
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_algaib_legal_bot'
     telegram_bot_id: 8622638966
     telegram_enabled: true
@@ -517,6 +455,28 @@ agents:
     human_email: flore@global-capital-group.com
     mission: "Named after the Quranic concept meaning 'the unseen' or 'hidden knowledge' \u2014 I reveal the hidden legal\
       \ frameworks, regulations, and compliance requirements that govern free zones and special jurisdictions."
+    capabilities:
+      broker_allowed: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins:
+      - anthropic
+      - browser
+      - codex
+      - deepseek
+      - google
+      - memory-core
+      - moonshot
+      - openai
+      - slack
+      - telegram
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   angela:
     title: Jacques' right hand. Admin assassin. The one who makes the paperwork disappear.
     group: SALES & CRM
@@ -546,35 +506,9 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 44b46a614953
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_angela_bot'
     telegram_bot_id: 8492339542
     telegram_enabled: true
@@ -592,6 +526,18 @@ agents:
     human_email: jacques@gcg-structuring.com
     mission: Jacques' right hand and admin assassin. Makes the paperwork disappear, keeps the calendar clean, and ensures
       nothing falls through the cracks in the advisory pipeline.
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   anna:
     title: "Marketing Director \u2014 GCG Structuring"
     group: MARKETING & MEDIA
@@ -622,7 +568,7 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: f69eb5301239
-    hooks_token_sha: b51a3fcb1791
+    hooks_token_sha: b051572c4043
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
     telegram_bot: '@gcg_anna_cmo_bot'
@@ -642,6 +588,18 @@ agents:
     mission: "Generate qualified leads for GCG Structuring \u2014 effortlessly \u2014 through content that is so good people\
       \ come to us.  Not through cold outreach. Not through paid spam. Through a consistent engine of great content, smart\
       \ partnerships, and a brand presence that makes entrepreneurs thin"
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   argus:
     title: The All-Seeing Eye
     group: INFRASTRUCTURE
@@ -674,36 +632,10 @@ agents:
     channel_token_shared_with:
     - chiron
     - mnemosyne
-    gateway_token_sha: 7bb214d65953
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    gateway_token_sha: 31f0a4267699
+    hooks_token_sha: 90a606d47586
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_argus_bot'
     telegram_bot_id: 8663850713
     telegram_enabled: true
@@ -729,6 +661,29 @@ agents:
     mission: Review EVERY incoming email across 6 shared GCG inboxes. Classify, label, route to the right person, escalate
       urgent matters, and produce a structured daily digest by 8:00 AM Dubai. I operate with the judgment of a senior executive
       assistant who understands finance, legal, compli
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: perplexity
+      audio_transcription: true
+      plugins:
+      - anthropic
+      - brave
+      - deepseek
+      - google
+      - memory-core
+      - moonshot
+      - openai
+      - perplexity
+      - slack
+      - telegram
+      - xai
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 1
   bob:
     title: Real Estate Analyst & Deal Partner
     group: REAL ESTATE
@@ -756,35 +711,9 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: 39d2e35b0a42
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 2c865fa35e58
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_bob_bot'
     telegram_bot_id: 8580109340
     telegram_enabled: true
@@ -803,6 +732,18 @@ agents:
     human_email: vincent@global-capital-group.com
     mission: "Legal Corpus Coordinator \u2014 named after the Quranic concept of 'the unseen'. Manages legal knowledge corpus,\
       \ document analysis, and research for GCG's legal team."
+    capabilities:
+      broker_allowed: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   chiron:
     title: Health & Longevity Research Specialist
     group: PERSONAL
@@ -836,35 +777,9 @@ agents:
     - argus
     - mnemosyne
     gateway_token_sha: 7bb214d65953
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: f7d87e338655
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_chiron_bot'
     telegram_bot_id: 8668502205
     telegram_enabled: true
@@ -889,6 +804,29 @@ agents:
     human_email: peter@gcg-structuring.com
     mission: "You are Chiron \u2014 the centaur who taught medicine to the gods. Named after the original medical researcher.\
       \ You find, evaluate, and synthesize peer-reviewed health science. You don't coach, you don't train \u2014 you RESEARCH."
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: perplexity
+      audio_transcription: true
+      plugins:
+      - acpx
+      - anthropic
+      - brave
+      - deepseek
+      - google
+      - memory-core
+      - moonshot
+      - openai
+      - perplexity
+      - telegram
+      - xai
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 1
   daen:
     title: The Architect
     group: INFRASTRUCTURE
@@ -919,36 +857,10 @@ agents:
     channel_token_policy: shared:group-5a49ec070b3e
     channel_token_shared_with:
     - niccolo
-    gateway_token_sha: 5a49ec070b3e
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    gateway_token_sha: 0878a415aaba
+    hooks_token_sha: d2f31281cc8f
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@Gcg_daen_hq_bot'
     telegram_bot_id: 8398665503
     telegram_enabled: true
@@ -974,6 +886,29 @@ agents:
     mission: "Like The Architect in the Matrix \u2014 I see the whole system. Every agent, every data flow, every connection.\
       \ I design the structures, wire the intelligence, and keep the machine running. But unlike that Architect, I'm not detached.\
       \ I'm in the trenches with Peter, building GCG from "
+    capabilities:
+      broker_allowed: true
+      dwd_enabled: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins:
+      - anthropic
+      - browser
+      - codex
+      - deepseek
+      - google
+      - memory-core
+      - moonshot
+      - openai
+      - slack
+      - telegram
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: true
+      subagents_max_depth: 0
   goku:
     title: Health & Performance Coach
     group: PERSONAL
@@ -1005,36 +940,10 @@ agents:
     channel_token_policy: shared:group-2b80acdffb84
     channel_token_shared_with:
     - nik
-    gateway_token_sha: 2b80acdffb84
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    gateway_token_sha: cda043a529f0
+    hooks_token_sha: 1b3acfb205e9
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_goku_bot'
     telegram_bot_id: 8744210862
     telegram_enabled: true
@@ -1062,6 +971,29 @@ agents:
     human_telegram: 418059105
     mission: "Keep Peter in peak condition \u2014 physically, mentally, metabolically. No fluff, no excuses. Train hard, recover\
       \ smart, track everything."
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: perplexity
+      audio_transcription: true
+      plugins:
+      - acpx
+      - anthropic
+      - brave
+      - deepseek
+      - google
+      - memory-core
+      - moonshot
+      - openai
+      - perplexity
+      - telegram
+      - xai
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 1
   hector:
     title: LinkedIn content strategist and ghostwriter for Vincent Ribes
     group: REAL ESTATE
@@ -1089,35 +1021,9 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: b8b15b17532b
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: a74c7e529bd9
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_hector_bot'
     telegram_bot_id: 8798082333
     telegram_enabled: true
@@ -1136,6 +1042,18 @@ agents:
     mission: "I'm Hector \u2014 Vincent's content engine. I turn market intelligence into LinkedIn content in Vincent's voice.\
       \ I don't post autonomously \u2014 ever. My job is to produce drafts that Vincent can review, refine, and publish on\
       \ his own terms."
+    capabilities:
+      broker_allowed: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   jc:
     title: '?'
     group: SALES & CRM
@@ -1167,35 +1085,9 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: 8d346202d01f
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: ce63b59692f7
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_jc_bot'
     telegram_bot_id: 8741694609
     telegram_enabled: true
@@ -1226,6 +1118,30 @@ agents:
     mission: '- **Name:** Jean-Claude (JC) - **Role:** Corporate Structuring Advisor, Global Capital Group (GCG) - **Positioning:**
       Premium business setup advisory for French-speaking entrepreneurs seeking UAE structuring. - **Public framing:** JC
       is a real GCG team member. - **Never** describ'
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: perplexity
+      audio_transcription: false
+      plugins:
+      - anthropic
+      - brave
+      - browser
+      - deepseek
+      - google
+      - memory-core
+      - moonshot
+      - openai
+      - perplexity
+      - slack
+      - telegram
+      - xai
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 1
   kenji:
     title: "Compliance Officer \u2014 GCG Global Capital Group"
     group: LEGAL & COMPLIANCE
@@ -1255,35 +1171,9 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 4807eea09907
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@Gcg_kenji_bot'
     telegram_bot_id: 7698119540
     telegram_enabled: true
@@ -1303,6 +1193,28 @@ agents:
     mission: "You are the person who makes sure everything is done properly. Not because you enjoy bureaucracy \u2014 but\
       \ because you've seen what happens when it's not done. You've watched deals collapse, licenses get revoked, and good\
       \ people get in trouble because someone skipped a step."
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins:
+      - anthropic
+      - browser
+      - codex
+      - deepseek
+      - google
+      - memory-core
+      - moonshot
+      - openai
+      - slack
+      - telegram
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   kira:
     title: Slavyana's right hand. Account Manager's AI partner. The one who keeps every client file perfect, every deadline
       tracked, and every delivery seamless.
@@ -1333,35 +1245,9 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 49c53f7e24e8
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@Gcg_kira_bot'
     telegram_bot_id: 8756707283
     telegram_enabled: true
@@ -1379,6 +1265,18 @@ agents:
     human_email: slavyana@global-capital-group.com
     mission: Slavyana's right hand and Account Manager AI partner. Keeps every client file moving, every deadline met, every
       detail tracked.
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   leon:
     title: Head of Legal
     group: LEGAL & COMPLIANCE
@@ -1406,35 +1304,9 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: 358033828dd0
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 5c22dec3b0e8
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@Gcg_leon_bot'
     telegram_bot_id: 8775192855
     telegram_enabled: true
@@ -1452,6 +1324,18 @@ agents:
     human_email: flore@global-capital-group.com
     mission: "GCG's Legal AI Partner serving Flore \u2014 contracts, legal research, compliance across structuring, media,\
       \ real estate, and tokenization. Drafts, reviews, advises \u2014 never decides. All output goes through Flore."
+    capabilities:
+      broker_allowed: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   malik:
     title: "Banking Agent \u2014 GCG Fleet"
     group: OPERATIONS
@@ -1482,35 +1366,9 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: 9c44db76707f
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: c8297410c45b
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_malik_banking_bot'
     telegram_bot_id: 8697509604
     telegram_enabled: true
@@ -1529,6 +1387,18 @@ agents:
     mission: Be the banking problem-solver for every GCG client. Client can't get a bank account? Malik finds one. Card solution
       needed? Malik sources it. Payment rails blocked? Malik finds the workaround.  **Pure solutions. Zero bureaucracy. Never
       says no without an alternative.**
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   marcus:
     title: '?'
     group: SALES & CRM
@@ -1559,35 +1429,9 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: 107281a10e38
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: fecc6bd1c1c4
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@Gcg_marcus_bot'
     telegram_bot_id: 8581364061
     telegram_enabled: true
@@ -1609,6 +1453,29 @@ agents:
     mission: '- Name: **Marcus** - Role: **Client Advisor, Global Capital Group (GCG)** - Positioning: **Premium business
       setup advisory** for UAE free zones (and related banking/visa considerations). - **Public framing:** Marcus is a real
       GCG team member. - **Never** describe yourself as an A'
+    capabilities:
+      broker_allowed: true
+      dwd_enabled: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins:
+      - anthropic
+      - browser
+      - codex
+      - deepseek
+      - google
+      - memory-core
+      - moonshot
+      - openai
+      - slack
+      - telegram
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   max:
     title: Operational Extension to Olga Nechaieva
     group: OPERATIONS
@@ -1638,35 +1505,9 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 3b395307362e
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_max_bot'
     telegram_bot_id: 8418163510
     telegram_enabled: true
@@ -1684,6 +1525,18 @@ agents:
     human_email: olha@gcg-structuring.com
     mission: "Operational Extension to Olha Nechaieva \u2014 Associate Chief of Staff handling HR, hiring, admin, and internal\
       \ org operations for GCG."
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   mnemosyne:
     title: Memory Guardian
     group: INFRASTRUCTURE
@@ -1716,36 +1569,10 @@ agents:
     channel_token_shared_with:
     - argus
     - chiron
-    gateway_token_sha: 7bb214d65953
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    gateway_token_sha: 16e6ef37e956
+    hooks_token_sha: aea5a765dd66
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_mnemo_bot'
     telegram_bot_id: 8787026498
     telegram_enabled: true
@@ -1770,6 +1597,29 @@ agents:
     human_email: db@gcgstr.com
     mission: "Memory Guardian \u2014 sentinel of the fleet's memory infrastructure. Maintains pgvector embeddings, session\
       \ cleanup, agent coverage, and backup integrity."
+    capabilities:
+      broker_allowed: true
+      dwd_enabled: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: perplexity
+      audio_transcription: true
+      plugins:
+      - anthropic
+      - brave
+      - deepseek
+      - google
+      - memory-core
+      - moonshot
+      - openai
+      - perplexity
+      - telegram
+      - xai
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 3
   niccolo:
     title: Strategic Advisor to Peter
     group: STRATEGY
@@ -1799,36 +1649,10 @@ agents:
     channel_token_policy: shared:group-5a49ec070b3e
     channel_token_shared_with:
     - daen
-    gateway_token_sha: 5a49ec070b3e
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    gateway_token_sha: a1ec8515b4d9
+    hooks_token_sha: 2091b6b52094
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_niccolo_str_bot'
     telegram_bot_id: 8645993392
     telegram_enabled: true
@@ -1844,6 +1668,18 @@ agents:
     serves: Peter
     human_email: peter@gcg-structuring.com
     mission: "Niccol\xF2 is Peter's private strategic thinking partner. No meetings. No tasks. No operations. Pure thinking."
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   nik:
     title: Executive Assistant
     group: REAL ESTATE
@@ -1875,36 +1711,10 @@ agents:
     channel_token_policy: shared:group-2b80acdffb84
     channel_token_shared_with:
     - goku
-    gateway_token_sha: 2b80acdffb84
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    gateway_token_sha: 44c39bead793
+    hooks_token_sha: 5a8079f8c170
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_nik_bot'
     telegram_enabled: true
     telegram_groups: []
@@ -1923,6 +1733,29 @@ agents:
     serves: Vincent Ribes + Peter
     human_email: peter@gcgstr.com
     mission: Peter's life is 80% work. Nik handles all of it.
+    capabilities:
+      broker_allowed: true
+      dwd_enabled: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins:
+      - anthropic
+      - browser
+      - codex
+      - deepseek
+      - google
+      - memory-core
+      - moonshot
+      - openai
+      - slack
+      - telegram
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   phil:
     title: Michigan property sourcing, buy box scoring, DOBI coordination, pipeline tracking
     group: REAL ESTATE
@@ -1950,35 +1783,9 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: 2e49e27afedf
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 5f0d5f1c7dda
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_phil_bot'
     telegram_bot_id: 8637004506
     telegram_enabled: true
@@ -1997,6 +1804,18 @@ agents:
     mission: "I'm Phil \u2014 Vincent's deal engine. I find properties, score them against the buy box, coordinate ground\
       \ partners, and keep the pipeline moving. I don't make buy decisions \u2014 that's Bob and Vincent. I make sure they\
       \ only spend time on deals worth looking at."
+    capabilities:
+      broker_allowed: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   talos:
     title: The Engineer
     group: INFRASTRUCTURE
@@ -2025,35 +1844,9 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 743b143f848c
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@Gcg_talos_bot'
     telegram_bot_id: 8313610206
     telegram_enabled: true
@@ -2074,6 +1867,21 @@ agents:
     human_email: db@gcgstr.com
     mission: "Named after the bronze automaton of Crete \u2014 tireless, precise, protective. I don't just write code. I forge\
       \ systems that run fast, fail gracefully, and scale without breaking a sweat."
+    gateway_token_sha: 086e42d158f4
+    capabilities:
+      broker_allowed: true
+      dwd_enabled: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins:
+      - telegram
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: true
+      subagents_max_depth: 0
   tom:
     title: Inbox triage, email drafting, Google Calendar, meeting invites for Vincent Ribes
     group: REAL ESTATE
@@ -2101,35 +1909,9 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: a8b86be25a5a
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - varys
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 0795aecdb8b2
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_tom_bot'
     telegram_bot_id: 8724189703
     telegram_enabled: true
@@ -2147,6 +1929,18 @@ agents:
     human_email: vincent@global-capital-group.com
     mission: "I'm Tom \u2014 Vincent's Executive Assistant. I manage the operational side of his professional life so he can\
       \ focus on deals, relationships, and building GCG's real estate portfolio. Nothing leaves my hands without his approval."
+    capabilities:
+      broker_allowed: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   varys:
     title: The Spider
     group: INFRASTRUCTURE
@@ -2176,35 +1970,9 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - vera
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: ab486dc5d580
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@Gcg_varys_bot'
     telegram_bot_id: 8519995526
     telegram_enabled: true
@@ -2222,6 +1990,18 @@ agents:
     human_email: db@gcgstr.com
     mission: "Named after the Master of Whispers \u2014 the one who always knows. No dragons, no armies. Just information,\
       \ delivered when it matters most."
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   vera:
     title: "Capital Raising CMO \u2014 the marketing engine behind GCG's real estate investment arm"
     group: MARKETING & MEDIA
@@ -2254,35 +2034,9 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - viktor
-    - vulcan
-    - yuri
+    hooks_token_sha: 5a07fcdd3ace
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_vera_mktg_cap_bot'
     telegram_bot_id: 8727315748
     telegram_enabled: true
@@ -2301,6 +2055,18 @@ agents:
     mission: "Turn GCG's US real estate deal flow into a compelling, documented, distributable investment story \u2014 and\
       \ get it in front of the right international capital at the right time.  **Lead gen philosophy: Credibility first. Distribution\
       \ second. Capital follows.**  The investor doesn't t"
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   viktor:
     title: Structuring Ops
     group: OPERATIONS
@@ -2330,35 +2096,9 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - vulcan
-    - yuri
+    hooks_token_sha: 62153cd1f0c7
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@Gcg_viktor_bot'
     telegram_bot_id: 8596503415
     telegram_enabled: true
@@ -2376,6 +2116,18 @@ agents:
     human_email: sergei@gcg-structuring.com
     mission: "Named from 'victory' \u2014 because operations don't succeed by accident. They succeed through precision, follow-through,\
       \ and zero tolerance for loose ends."
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   vulcan:
     title: God of the Forge
     group: INFRASTRUCTURE
@@ -2405,35 +2157,9 @@ agents:
     anthropic_profile: true
     channel_token_policy: missing
     channel_token_shared_with: []
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - yuri
+    hooks_token_sha: 46642e8a6635
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@gcg_vulcan_bot'
     telegram_bot_id: 8520965675
     telegram_enabled: true
@@ -2451,6 +2177,19 @@ agents:
     human_email: db@gcgstr.com
     mission: "Named for the Roman god who forged weapons for the gods \u2014 you forge the tools, workflows, and automations\
       \ that make GCG's operations run like clockwork."
+    capabilities:
+      broker_allowed: true
+      dwd_enabled: true
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: false
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
   yuri:
     title: GCG's financial trader and quant strategist.
     group: TRADING
@@ -2481,35 +2220,9 @@ agents:
     channel_token_policy: per_agent
     channel_token_shared_with: []
     gateway_token_sha: a25a091b7ffd
-    hooks_token_sha: b92006a944b7
-    hooks_token_policy: shared:group-b92006a944b7
-    hooks_token_shared_with:
-    - alexa
-    - algaib
-    - angela
-    - argus
-    - bob
-    - chiron
-    - daen
-    - goku
-    - hector
-    - jc
-    - kenji
-    - kira
-    - leon
-    - malik
-    - marcus
-    - max
-    - mnemosyne
-    - niccolo
-    - nik
-    - phil
-    - talos
-    - tom
-    - varys
-    - vera
-    - viktor
-    - vulcan
+    hooks_token_sha: ded7eae180ca
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
     telegram_bot: '@Gcg_yuri_trade_bot'
     telegram_bot_id: 8103756692
     telegram_enabled: true
@@ -2529,6 +2242,24 @@ agents:
     human_email: peter@gcg-structuring.com
     mission: "Cold-blooded with numbers. Warm with risk management. Yuri doesn't guess \u2014 he calculates. Every trade has\
       \ a thesis, every thesis has data behind it, and every position has a stop-loss before it has a target."
-updated_at: '2026-05-22T17:27:56.545201Z'
-change_summary: 'v2.1->v2.2: Tier A (algaib, bob, leon, hector, tom, phil) primary=amazon-bedrock/us.anthropic.claude-sonnet-4-6,
-  fallbacks=[moonshot/kimi-k2.6, deepseek/deepseek-v4-pro:high]. Bedrock wired via AWS_BEARER_TOKEN_BEDROCK in bootstrap.'
+    capabilities:
+      broker_allowed: false
+      telegram_enabled: true
+      telegram_dm_policy: allowlist
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: true
+      op_sa_runtime: false
+      subagents_max_depth: 0
+updated_at: '2026-05-23T11:25:28.757971Z'
+change_summary: "v2.3->v2.4: DeepSeek V4 Pro thinking mode wiring corrected. 20 agents (talos, nik, alexa, alex, angela, anna,\
+  \ argus, chiron, goku, jc, kenji, kira, malik, marcus, max, mnemosyne, varys, vera, viktor, yuri) had `:high` model suffix\
+  \ in primary/fallbacks \u2014 that's CLI-only syntax, openclaw.json runtime resolver returned 'model not found' for `deepseek/deepseek-v4-pro:high`,\
+  \ causing silent fallback to next model in chain. Reverted all :high suffixes to bare `deepseek/deepseek-v4-pro`. Added\
+  \ `agents.defaults.thinkingDefault: \"high\"` to those 21 agents \u2014 that's the correct openclaw.json schema knob (per\
+  \ pi-coding-agent v0.75.1). Unbanned bare `deepseek/deepseek-v4-pro` in FLEET.yaml banned list (it's now the canonical form).\
+  \ Bonus: parallel session ('Talos DeepSeek V4 Pro errors') added missing `models.providers.deepseek` block to all 29 agents\
+  \ and fixed 14 with misplaced `models.google/gemini-3.5-flash` keys."

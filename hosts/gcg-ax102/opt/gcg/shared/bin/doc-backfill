@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""
+doc-backfill — add/complete frontmatter on GCG shared docs.
+Usage:
+  doc-backfill --dry-run
+  doc-backfill --apply [--path /opt/gcg/shared/docs/subdir/] [--limit N]
+  doc-backfill --report
+"""
+import argparse
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+DOCS_ROOT = Path("/opt/gcg/shared/docs")
+
+SKIP_FILES = {"KNOWLEDGE_INDEX.md", "DOC_INDEX.md"}
+SKIP_DIR_PARTS = {"superseded", "archive", "_archived"}
+
+BUCKET_FROM_DIR = {
+    "architecture": "architecture",
+    "reference": "reference",
+    "research": "record",
+    "reviews": "record",
+    "council": "decisions",
+    "decisions": "decisions",
+    "runbooks": "reference",
+    "sops": "reference",
+    "guides": "reference",
+    "playbooks": "reference",
+    "fleet": "reference",
+    "compliance": "reference",
+    "rollback_refs": "reference",
+    "strategies": "plans",
+    "proposals": "plans",
+    "handoffs": "handoffs",
+    "plans": "plans",
+}
+
+STATUS_BY_DIR = {
+    "proposals": "DRAFT",
+    "strategies": "DRAFT",
+    "reviews": "BINDING",
+    "research": "BINDING",
+}
+
+DOMAIN_BY_DIR = {
+    "architecture": "architecture",
+    "decisions": "architecture",
+    "council": "architecture",
+    "strategies": "architecture",
+    "reference": "operations",
+    "runbooks": "operations",
+    "sops": "operations",
+    "guides": "operations",
+    "playbooks": "operations",
+    "fleet": "agent-fleet",
+    "compliance": "compliance",
+    "rollback_refs": "operations",
+    "research": "infrastructure",
+    "reviews": "security",
+    "proposals": "architecture",
+    "plans": "architecture",
+    "handoffs": "operations",
+}
+
+KEYWORD_TAGS = [
+    (r"memory|recall|embed|pgvector|lightrag|mnemosyne|embedding", ["embedding"]),
+    (r"fleet|openclaw|agent(?!-fleet)", ["agent-fleet"]),
+    (r"dispatch|inbox|a2a|messaging|fleet\.send", ["messaging"]),
+    (r"postgres|postgresql|schema|migration|alter\s+table", ["postgresql"]),
+    (r"docker|compose|container|image", ["docker"]),
+    (r"ssh|credential|secret|token|1password|credstore", ["auth"]),
+    (r"backup|borg|storagebox|snapshot", ["backup"]),
+    (r"incident|breach|kinsing|malware|attack|compromise", ["incident-response"]),
+    (r"freezone|ifza|dmcc|jafza|license|visa|uae.business", ["freezone"]),
+    (r"meridian|crm|client|deal|quote.engine|quote.tool", ["api"]),
+    (r"redteam|red.team|audit|postmortem|retrospective", ["security"]),
+    (r"cron|timer|systemd|\.service|\.timer", ["cron"]),
+    (r"api|endpoint|route|fastapi|next\.?js", ["api"]),
+    (r"hetzner|ax102|ax42|vps|server.infra", ["infrastructure"]),
+    (r"council|nemesis|cassandra|socrates|confucius", ["architecture"]),
+    (r"model|anthropic|claude|gemini|deepseek|kimi|bedrock", ["agent-fleet"]),
+    (r"security|token.rotation|key.rotation|revoc", ["security"]),
+    (r"lightrag|knowledge.graph|graph.db", ["embedding"]),
+    (r"meridian", ["meridian"]),
+]
+
+# Strong domain override patterns
+DOMAIN_OVERRIDES = [
+    (r"memory|recall|embed|pgvector|lightrag|mnemosyne", "agent-fleet", 2),
+    (r"openclaw|fleet|agent.dispatch", "agent-fleet", 2),
+    (r"incident|breach|kinsing|malware|attack|compromise|security|revoc", "security", 2),
+    (r"freezone|ifza|dmcc|jafza|uae.business|license.*fee", "product", 2),
+    (r"hetzner|ax102|ax42|server|vps|borg|backup", "infrastructure", 2),
+]
+
+
+def get_dir_key(path: Path) -> Optional[str]:
+    """Return the immediate parent directory name relative to docs root."""
+    try:
+        rel = path.relative_to(DOCS_ROOT)
+        parts = rel.parts
+        if len(parts) >= 2:
+            return parts[0]  # top-level subdir
+    except ValueError:
+        pass
+    return None
+
+
+def should_skip(path: Path) -> bool:
+    if path.name in SKIP_FILES:
+        return True
+    if ".bak." in path.name:
+        return True
+    for part in path.parts:
+        if part in SKIP_DIR_PARTS:
+            return True
+    return False
+
+
+def parse_frontmatter(content: str):
+    """
+    Returns (fm_dict, body_str, fm_raw_str) or ({}, content, None) if no frontmatter.
+    fm_dict: simple key→value (strings, lists handled minimally).
+    """
+    if not content.startswith("---"):
+        return {}, content, None
+
+    # Find closing ---
+    rest = content[3:]
+    # allow optional newline after opening ---
+    if rest.startswith("\n"):
+        rest = rest[1:]
+    end = rest.find("\n---")
+    if end == -1:
+        return {}, content, None
+
+    fm_raw = rest[:end]
+    body = rest[end + 4:]  # skip \n---
+    if body.startswith("\n"):
+        body = body[1:]
+
+    fm_dict = parse_yaml_simple(fm_raw)
+    return fm_dict, body, fm_raw
+
+
+def parse_yaml_simple(yaml_str: str) -> dict:
+    """
+    Minimal YAML parser for frontmatter. Handles:
+      key: value
+      key: 'value'
+      key: "value"
+      key: [item1, item2]
+      key: ['item1', 'item2']
+    Multi-line list:
+      key:
+        - item1
+        - item2
+    """
+    result = {}
+    lines = yaml_str.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip() or line.strip().startswith("#"):
+            i += 1
+            continue
+        m = re.match(r'^(\w[\w\-]*)\s*:\s*(.*)', line)
+        if not m:
+            i += 1
+            continue
+        key = m.group(1)
+        val = m.group(2).strip()
+
+        if val == "" or val is None:
+            # Maybe multiline list follows
+            items = []
+            i += 1
+            while i < len(lines) and lines[i].startswith("  - "):
+                items.append(lines[i][4:].strip().strip("'\""))
+                i += 1
+            result[key] = items if items else ""
+            continue
+
+        # Inline list
+        if val.startswith("["):
+            inner = val.strip("[]")
+            items = [x.strip().strip("'\"") for x in re.split(r',\s*', inner) if x.strip()]
+            result[key] = items
+        else:
+            # Strip quotes
+            result[key] = val.strip("'\"")
+        i += 1
+    return result
+
+
+def infer_title(path: Path, body: str) -> str:
+    m = re.search(r'^#\s+(.+)', body, re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+    stem = path.stem
+    return re.sub(r'[-_]', ' ', stem).title()
+
+
+def infer_bucket(path: Path) -> str:
+    dir_key = get_dir_key(path)
+    if dir_key and dir_key in BUCKET_FROM_DIR:
+        return BUCKET_FROM_DIR[dir_key]
+    # Root docs: try filename
+    stem = path.stem.lower()
+    if re.search(r'handoff', stem):
+        return "handoffs"
+    if re.search(r'plan|proposal|strategy', stem):
+        return "plans"
+    if re.search(r'decision|council|arch', stem):
+        return "decisions"
+    return "reference"
+
+
+def infer_status(path: Path, title: str) -> str:
+    dir_key = get_dir_key(path)
+    if "[DRAFT]" in title:
+        return "DRAFT"
+    if dir_key and dir_key in STATUS_BY_DIR:
+        return STATUS_BY_DIR[dir_key]
+    return "BINDING"
+
+
+def infer_effective(path: Path) -> str:
+    mtime = path.stat().st_mtime
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def infer_tags(path: Path, content_sample: str) -> list:
+    dir_key = get_dir_key(path) or ""
+    stem = path.stem.lower()
+    probe = (stem + " " + content_sample).lower()
+
+    # Base domain from dir
+    domain = DOMAIN_BY_DIR.get(dir_key, "operations")
+
+    # Domain override if strong content signal
+    for pattern, override_domain, _ in DOMAIN_OVERRIDES:
+        matches = len(re.findall(pattern, probe, re.IGNORECASE))
+        if matches >= 2:
+            domain = override_domain
+            break
+
+    # Sub-domain tags from keywords
+    subdomain_tags = []
+    for pattern, tags in KEYWORD_TAGS:
+        if re.search(pattern, probe, re.IGNORECASE):
+            for t in tags:
+                if t != domain and t not in subdomain_tags:
+                    subdomain_tags.append(t)
+        if len(subdomain_tags) >= 3:
+            break
+
+    final = [domain] + subdomain_tags[:3]
+    # Dedupe preserving order
+    seen = set()
+    deduped = []
+    for t in final:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped[:4]
+
+
+def fm_to_yaml(fm: dict) -> str:
+    """Serialize frontmatter dict back to YAML lines."""
+    lines = []
+    order = ["title", "bucket", "status", "effective", "tags", "owner"]
+    written = set()
+    for key in order:
+        if key in fm:
+            val = fm[key]
+            if isinstance(val, list):
+                items = ", ".join(f"'{v}'" for v in val)
+                lines.append(f"{key}: [{items}]")
+            else:
+                # Quote if contains special chars
+                s = str(val)
+                if any(c in s for c in [":", "#", "'", '"', "{"]):
+                    s = "'" + s.replace("'", "''") + "'"
+                lines.append(f"{key}: {s}")
+            written.add(key)
+    # Any extra keys not in order
+    for key, val in fm.items():
+        if key not in written:
+            if isinstance(val, list):
+                items = ", ".join(f"'{v}'" for v in val)
+                lines.append(f"{key}: [{items}]")
+            else:
+                lines.append(f"{key}: {val}")
+    return "\n".join(lines)
+
+
+def process_file(path: Path, dry_run: bool = True):
+    """
+    Returns (action, description, new_content_or_none)
+    action: 'skip' | 'add' | 'patch' | 'error'
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return "error", f"read error: {e}", None
+
+    try:
+        fm, body, fm_raw = parse_frontmatter(raw)
+    except Exception as e:
+        return "error", f"parse error: {e}", None
+
+    content_sample = raw[:600]
+    missing = []
+    added_fields = {}
+
+    # Determine what's needed
+    title = fm.get("title", "")
+    if not title:
+        title = infer_title(path, body if fm_raw else raw)
+        added_fields["title"] = title
+        missing.append("title")
+
+    if not fm.get("bucket"):
+        b = infer_bucket(path)
+        added_fields["bucket"] = b
+        missing.append(f"bucket={b}")
+
+    if not fm.get("status"):
+        s = infer_status(path, fm.get("title", title))
+        added_fields["status"] = s
+        missing.append(f"status={s}")
+
+    if not fm.get("effective"):
+        e = infer_effective(path)
+        added_fields["effective"] = e
+        missing.append(f"effective={e}")
+
+    tags_val = fm.get("tags", [])
+    if not tags_val or (isinstance(tags_val, list) and len(tags_val) == 0):
+        t = infer_tags(path, content_sample)
+        added_fields["tags"] = t
+        missing.append(f"tags={t}")
+
+    if not fm.get("owner"):
+        added_fields["owner"] = "mnemosyne"
+        missing.append("owner=mnemosyne")
+
+    if not missing:
+        return "skip", "already complete", None
+
+    # Build new frontmatter
+    new_fm = dict(fm)
+    new_fm.update(added_fields)
+
+    # Ensure key order
+    ordered_fm = {}
+    for k in ["title", "bucket", "status", "effective", "tags", "owner"]:
+        if k in new_fm:
+            ordered_fm[k] = new_fm[k]
+    for k, v in new_fm.items():
+        if k not in ordered_fm:
+            ordered_fm[k] = v
+
+    fm_yaml = fm_to_yaml(ordered_fm)
+    new_content = f"---\n{fm_yaml}\n---\n{body}"
+
+    if fm_raw is None:
+        action = "add"
+        desc = f"adding: {', '.join(missing)}"
+    else:
+        action = "patch"
+        desc = f"adding missing: {', '.join(missing)}"
+
+    if not dry_run:
+        try:
+            path.write_text(new_content, encoding="utf-8")
+        except Exception as e:
+            return "error", f"write error: {e}", None
+
+    return action, desc, new_content
+
+
+def collect_files(root: Path) -> list:
+    files = []
+    for p in sorted(root.rglob("*.md")):
+        if should_skip(p):
+            continue
+        # Skip broken symlinks
+        if p.is_symlink() and not p.exists():
+            continue
+        # Skip symlinks that resolve outside the docs root (aliases/duplicates)
+        if p.is_symlink():
+            try:
+                resolved = p.resolve()
+                if not str(resolved).startswith(str(root.resolve())):
+                    continue
+            except Exception:
+                continue
+        files.append(p)
+    return files
+
+
+def run_report(root: Path):
+    files = collect_files(root)
+    total = len(files)
+    has_tags = 0
+    has_fm = 0
+    missing_tags = 0
+    no_fm = 0
+    for p in files:
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except:
+            continue
+        fm, body, fm_raw = parse_frontmatter(raw)
+        if fm_raw is None:
+            no_fm += 1
+        else:
+            has_fm += 1
+            tags = fm.get("tags", [])
+            if tags and len(tags) > 0:
+                has_tags += 1
+            else:
+                missing_tags += 1
+
+    print(f"Docs root: {root}")
+    print(f"Total docs: {total}")
+    print(f"  No frontmatter at all:         {no_fm}")
+    print(f"  Has frontmatter, no tags:      {missing_tags}")
+    print(f"  Has frontmatter + tags:        {has_tags}")
+    print()
+    # Field coverage
+    fields = ["title", "bucket", "status", "effective", "tags", "owner"]
+    print("Field coverage (across all docs):")
+    for field in fields:
+        count = 0
+        for p in files:
+            try:
+                raw = p.read_text(encoding="utf-8", errors="replace")
+            except:
+                continue
+            fm, _, fm_raw = parse_frontmatter(raw)
+            val = fm.get(field)
+            if val and val != [] and val != "":
+                count += 1
+        pct = round(100 * count / total) if total else 0
+        print(f"  {field:12s}: {count:4d}/{total} ({pct}%)")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Backfill frontmatter on GCG docs")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--report", action="store_true")
+    parser.add_argument("--path", type=Path, default=DOCS_ROOT)
+    parser.add_argument("--limit", type=int, default=None)
+    args = parser.parse_args()
+
+    if not args.dry_run and not args.apply and not args.report:
+        parser.print_help()
+        sys.exit(1)
+
+    if args.report:
+        run_report(args.path)
+        return
+
+    files = collect_files(args.path)
+    if args.limit:
+        files = files[: args.limit]
+
+    counts = {"skip": 0, "add": 0, "patch": 0, "error": 0}
+    dry_run = not args.apply
+
+    for p in files:
+        action, desc, _ = process_file(p, dry_run=dry_run)
+        counts[action] += 1
+        label = {
+            "skip": "[SKIP]",
+            "add": "[ADD] ",
+            "patch": "[PATCH]",
+            "error": "[ERROR]",
+        }[action]
+        if action != "skip":
+            print(f"{label} {p} — {desc}")
+        else:
+            pass  # suppress skip noise; uncomment below for verbose
+            # print(f"{label} {p} — {desc}")
+
+    mode = "DRY RUN" if dry_run else "APPLIED"
+    print(
+        f"\n[{mode}] Total: {counts['skip']} complete, "
+        f"{counts['add']} added, {counts['patch']} patched, "
+        f"{counts['error']} errors"
+    )
+
+
+if __name__ == "__main__":
+    main()

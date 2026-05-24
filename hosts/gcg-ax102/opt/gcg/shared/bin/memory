@@ -344,6 +344,7 @@ PYCLIENT
 cmd_capture() {
   local input="" agent="unknown" source_type="conversation"
   local memory_type="" importance="normal" scope="agent_private"
+  local no_supersede="" supersede_threshold="0.85"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -362,6 +363,9 @@ cmd_capture() {
       --importance=*)              importance="${1#--importance=}"; shift ;;
       --scope)                     scope="$2"; shift 2 ;;
       --scope=*)                   scope="${1#--scope=}"; shift ;;
+      --no-supersede)              no_supersede="1"; shift ;;
+      --supersede-threshold)       supersede_threshold="$2"; shift 2 ;;
+      --supersede-threshold=*)     supersede_threshold="${1#--supersede-threshold=}"; shift ;;
       *)
         if [[ -z "$input" ]]; then input="$1"; shift
         else echo "ERROR: unexpected arg: $1" >&2; exit 1; fi
@@ -399,6 +403,10 @@ cmd_capture() {
   if [[ -n "$memory_type" ]]; then
     memory_type_b64=$(echo -n "$memory_type" | base64 -w0)
   fi
+  local no_supersede_flag="0"
+  [[ -n "$no_supersede" ]] && no_supersede_flag="1"
+  local threshold_b64
+  threshold_b64=$(echo -n "$supersede_threshold" | base64 -w0)
 
   PYTHON_SCRIPT=$(cat <<'PYSCRIPT'
 import sys, os, base64
@@ -416,6 +424,8 @@ if mt:
     mt = base64.b64decode(mt).decode("utf-8")
 else:
     mt = None
+no_supersede_flag = (sys.argv[6] == "1") if len(sys.argv) > 6 else False
+threshold_val = float(base64.b64decode(sys.argv[7]).decode("utf-8")) if len(sys.argv) > 7 else 0.85
 
 # Read input from stdin to avoid argv size limits
 input_text = sys.stdin.read()
@@ -431,6 +441,8 @@ rows = embed_text(
     scope_type=sc,
     importance=imp,
     memory_type=mt,
+    no_supersede=no_supersede_flag,
+    supersede_threshold=threshold_val,
 )
 print(f"[capture] {rows} row(s) written to memories (agent={ag}, source_type={src_type})")
 PYSCRIPT
@@ -438,9 +450,9 @@ PYSCRIPT
 
   if [[ -n "${FILE_PATH:-}" ]]; then
     # Large files: pipe via stdin to avoid ARG_MAX
-    cat "$FILE_PATH" | $PYTHON -c "$PYTHON_SCRIPT" "$source_type_b64" "$agent_b64" "$scope_b64" "$importance_b64" "$memory_type_b64" || exit_code=$?
+    cat "$FILE_PATH" | $PYTHON -c "$PYTHON_SCRIPT" "$source_type_b64" "$agent_b64" "$scope_b64" "$importance_b64" "$memory_type_b64" "${no_supersede_flag:-0}" "$threshold_b64" || exit_code=$?
   else
-    echo -n "$input" | $PYTHON -c "$PYTHON_SCRIPT" "$source_type_b64" "$agent_b64" "$scope_b64" "$importance_b64" "$memory_type_b64" || exit_code=$?
+    echo -n "$input" | $PYTHON -c "$PYTHON_SCRIPT" "$source_type_b64" "$agent_b64" "$scope_b64" "$importance_b64" "$memory_type_b64" "${no_supersede_flag:-0}" "$threshold_b64" || exit_code=$?
   fi
 
   _audit_capture "$agent" "$input_trunc" "$exit_code"
@@ -500,6 +512,41 @@ cmd_research() {
   exit $exit_code
 }
 
+
+# -- Subcommand: outcome --
+cmd_outcome() {
+  local agent="unknown" memory_id="" signal="" weight="1" json_flag=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)         echo "memory outcome --memory-id N --signal positive|negative [--weight N] [--agent name] [--json]"; exit 0 ;;
+      --agent)           agent="$2"; shift 2 ;;
+      --agent=*)         agent="${1#--agent=}"; shift ;;
+      --memory-id)       memory_id="$2"; shift 2 ;;
+      --memory-id=*)     memory_id="${1#--memory-id=}"; shift ;;
+      --signal)          signal="$2"; shift 2 ;;
+      --signal=*)        signal="${1#--signal=}"; shift ;;
+      --weight)          weight="$2"; shift 2 ;;
+      --weight=*)        weight="${1#--weight=}"; shift ;;
+      --json)            json_flag="--json"; shift ;;
+      *)                 echo "ERROR: unexpected arg: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  if [[ -z "$memory_id" || -z "$signal" ]]; then
+    echo "ERROR: outcome requires --memory-id and --signal" >&2; exit 1
+  fi
+
+  _preflight "$agent"
+
+  $PYTHON /opt/gcg/shared/gcg_tools/memory_outcome.py \
+    --memory-id "$memory_id" \
+    --signal "$signal" \
+    --weight "$weight" \
+    --agent "$agent" \
+    ${json_flag:+"$json_flag"} || exit $?
+}
+
 # ── Dispatch ───────────────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
   _help_main; exit 0
@@ -508,6 +555,7 @@ fi
 case "$1" in
   recall)            shift; cmd_recall "$@" ;;
   capture)           shift; cmd_capture "$@" ;;
+  outcome)           shift; cmd_outcome "$@" ;;
   research)          shift; cmd_research "$@" ;;
   --help|-h|help)    _help_main; exit 0 ;;
   *)

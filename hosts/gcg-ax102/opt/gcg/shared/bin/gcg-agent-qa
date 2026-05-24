@@ -1,0 +1,621 @@
+#!/usr/bin/env python3
+"""
+gcg-agent-qa — 11-tier QA verifier for OpenClaw fleet agents.
+
+Usage:
+  gcg-agent-qa <agent>            # check only (default)
+  gcg-agent-qa <agent> --remediate  # auto-fix safe WARN drifts
+  gcg-agent-qa <agent> --report   # JSON output
+  gcg-agent-qa --all              # iterate all fleet agents (check only)
+
+Spec: /Users/petr/.ssh/AGENT_SPEC.md
+Truth: /opt/gcg/shared/FLEET.yaml
+"""
+from __future__ import annotations
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, asdict, field
+from pathlib import Path
+from typing import Any, Callable
+
+# ─── constants ──────────────────────────────────────────────────────────────
+
+FLEET_YAML       = "/opt/gcg/shared/FLEET.yaml"
+AGENT_DIR_TMPL   = "/opt/gcg/openclaw-{name}"
+RUNTIME_ENV_TMPL = "/run/openclaw-{name}/env"
+CREDSTORE_DIR    = "/etc/credstore.encrypted"
+SYSTEMD_UNIT_TMPL = "/etc/systemd/system/openclaw-{name}.service"
+SHARED_BIN       = "/opt/gcg/shared/bin"
+SHARED_SKILLS    = "/opt/gcg/shared/skills"
+AUDIT_LOG        = "/var/log/gcg-provision/qa.log"
+
+CRITICAL_6       = {"daen", "talos", "marcus", "mnemosyne", "vulcan", "nik"}
+PLAINTEXT_KEY_RE = re.compile(r'"(api_key|token|secret|password)"\s*:\s*"(?!\$\{)[A-Za-z0-9_\-]{16,}"')
+
+VALID_TIERS  = {"A", "B", "C", "D"}
+VALID_STATUS = {"PASS", "WARN", "FAIL", "SKIP"}
+
+# ─── result types ───────────────────────────────────────────────────────────
+
+@dataclass
+class Check:
+    tier: int
+    name: str
+    status: str            # PASS | WARN | FAIL | SKIP
+    detail: str = ""
+    remediation: str = ""  # human-readable fix
+    autofix: Callable | None = field(default=None, repr=False)
+
+    def to_json(self) -> dict[str, Any]:
+        d = asdict(self)
+        d.pop("autofix", None)
+        return d
+
+
+@dataclass
+class AgentReport:
+    agent: str
+    timestamp: str
+    checks: list[Check] = field(default_factory=list)
+
+    @property
+    def summary(self) -> dict[str, int]:
+        s = {k: 0 for k in VALID_STATUS}
+        for c in self.checks:
+            s[c.status] = s.get(c.status, 0) + 1
+        return s
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "agent": self.agent,
+            "timestamp": self.timestamp,
+            "summary": self.summary,
+            "checks": [c.to_json() for c in self.checks],
+        }
+
+
+# ─── helpers ────────────────────────────────────────────────────────────────
+
+def _run(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def _load_json(path: str) -> dict[str, Any] | None:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _load_fleet() -> dict[str, Any]:
+    try:
+        import yaml
+    except ImportError:
+        sys.stderr.write("PyYAML required: pip install --break-system-packages pyyaml\n")
+        sys.exit(2)
+    with open(FLEET_YAML) as f:
+        return yaml.safe_load(f)
+
+
+def _systemctl(verb: str, unit: str) -> tuple[int, str]:
+    rc, out, err = _run(["systemctl", verb, unit])
+    return rc, ((out or err) or "").strip()
+
+
+def _agent_config(name: str) -> dict[str, Any] | None:
+    return _load_json(f"{AGENT_DIR_TMPL.format(name=name)}/openclaw.json")
+
+
+def _backup(path: str) -> str:
+    bak = f"{path}.bak.{int(time.time())}"
+    subprocess.run(["cp", "-a", path, bak], check=True)
+    return bak
+
+
+# ─── tier checks ────────────────────────────────────────────────────────────
+
+def tier1_identity(name: str, fleet: dict, cfg: dict | None) -> list[Check]:
+    out = []
+    agent_dir = AGENT_DIR_TMPL.format(name=name)
+    out.append(Check(1, "agent_dir_exists",
+        "PASS" if Path(agent_dir).is_dir() else "FAIL",
+        f"{agent_dir}",
+        f"mkdir -p {agent_dir}" if not Path(agent_dir).is_dir() else ""))
+    out.append(Check(1, "openclaw_json",
+        "PASS" if cfg else "FAIL",
+        "loaded" if cfg else "missing or invalid",
+        "" if cfg else "regenerate via gcg-provision-base"))
+    in_fleet = fleet.get("agents", {}).get(name) is not None
+    out.append(Check(1, "fleet_yaml_entry",
+        "PASS" if in_fleet else "FAIL",
+        f"agents.{name}" if in_fleet else "not registered",
+        "" if in_fleet else f"add agents.{name} block to {FLEET_YAML}"))
+    workspace = Path(agent_dir) / "workspace"
+    out.append(Check(1, "workspace_dir",
+        "PASS" if workspace.is_dir() else "WARN",
+        str(workspace),
+        f"mkdir -p {workspace}" if not workspace.is_dir() else ""))
+    agents_md = workspace / "AGENTS.md"
+    out.append(Check(1, "agents_md",
+        "PASS" if agents_md.is_file() else "WARN",
+        str(agents_md) if agents_md.is_file() else "missing",
+        "" if agents_md.is_file() else f"gcg-provision-base {name} --agents-md-only"))
+    return out
+
+
+def tier2_security(name: str, cfg: dict | None) -> list[Check]:
+    out = []
+    cfg_path = f"{AGENT_DIR_TMPL.format(name=name)}/openclaw.json"
+
+    # Plaintext upstream API keys — walk only models.providers + integrations
+    # (gateway.auth.token + hooks.token are legit plaintext, rotated per-agent)
+    # OpenClaw supports two safe reference forms: "${VAR}" and "env:VAR_NAME" — both are non-plaintext.
+    plain_hits: list[str] = []
+    def _walk(node, path):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                _walk(v, f"{path}.{k}" if path else k)
+        elif isinstance(node, str):
+            if any(p in path for p in ("models.providers.", "integrations.", "auth.profiles.")) and \
+               any(t in path.lower() for t in ("api_key", "apikey", "key", "secret", "token", "password")) and \
+               not node.startswith("${") and not node.startswith("env:") and len(node) >= 16 and \
+               not path.endswith(".env") and \
+               not any(x in path for x in ("gateway.auth.token", "hooks.token")):
+                plain_hits.append(path)
+    if cfg:
+        _walk(cfg, "")
+    out.append(Check(2, "no_plaintext_secrets",
+        "FAIL" if plain_hits else "PASS",
+        f"{len(plain_hits)} field(s): {plain_hits[:3]}" if plain_hits else "clean",
+        "migrate inline keys to ${ENV_VAR} interpolation" if plain_hits else ""))
+
+    # tokens unique + length
+    # Gateway token may live in openclaw.json (gateway.auth.token) OR be injected at runtime
+    # via GATEWAY_TOKEN_<AGENT> from credstore (zero-plaintext design). Check runtime env file
+    # as fallback so env-injection agents don't false-positive.
+    if cfg:
+        g = (cfg.get("gateway", {}) or {}).get("auth", {}).get("token", "")
+        h = (cfg.get("hooks", {}) or {}).get("token", "")
+        # Fallback: read GATEWAY_TOKEN_<NAME> from runtime env file if not in JSON (env-injection design).
+        # Also use runtime value for tokens_length check (JSON may have stale pre-rotation value).
+        runtime_gw = ""
+        runtime_env = RUNTIME_ENV_TMPL.format(name=name)
+        try:
+            env_key = f"GATEWAY_TOKEN_{name.upper()}="
+            for line in Path(runtime_env).read_text().splitlines():
+                if line.startswith(env_key):
+                    runtime_gw = line[len(env_key):].strip()
+                    break
+        except Exception:
+            pass
+        if not g:
+            g = runtime_gw
+        # tokens_unique: if gateway token is missing from both config and runtime, SKIP (not yet running)
+        if not g and not h:
+            out.append(Check(2, "tokens_unique", "SKIP", "no tokens found (agent not yet running?)"))
+        elif not g:
+            out.append(Check(2, "tokens_unique", "WARN",
+                f"gateway token missing from config+runtime; hooks={h[:12]}..",
+                "ensure GATEWAY_TOKEN_{name.upper()} in credstore gateway-env"))
+        else:
+            out.append(Check(2, "tokens_unique",
+                "PASS" if h and g != h else "FAIL",
+                f"gateway={g[:12]}.. hooks={h[:12] if h else 'MISSING'}..",
+                "rotate via gcg-rotate-tokens; hooks.token MUST NOT equal gateway.auth.token"))
+        # For length check: if JSON token is short but runtime credstore has 64-char, prefer runtime.
+        # A short token in JSON + 64-char runtime = stale JSON (real drift, needs openclaw.json update).
+        g_eff = runtime_gw if runtime_gw and len(runtime_gw) >= 64 else g
+        g_len_detail = f"json={len(g)},runtime={len(runtime_gw)}" if runtime_gw and runtime_gw != g else f"g={len(g)}"
+        out.append(Check(2, "tokens_length",
+            "PASS" if len(g_eff) >= 64 and len(h) >= 64 else "WARN",
+            f"{g_len_detail} h={len(h)}" + (" (json stale vs runtime)" if runtime_gw and len(runtime_gw) >= 64 and len(g) < 64 else ""),
+            "update openclaw.json gateway.auth.token to match rotated 64-char token" if runtime_gw and len(runtime_gw) >= 64 and len(g) < 64 else "rotate to 64-char (32-byte hex) tokens"))
+
+    # systemd-creds present
+    expected_creds = ["op-sa-token", "db-env", "gateway-env"]
+    missing = [c for c in expected_creds if not Path(f"{CREDSTORE_DIR}/{c}").exists()]
+    out.append(Check(2, "credstore_complete",
+        "PASS" if not missing else "WARN",
+        f"missing: {missing}" if missing else "all present",
+        f"systemd-creds encrypt for {missing}" if missing else ""))
+
+    # runtime env writes to tmpfs
+    runtime = RUNTIME_ENV_TMPL.format(name=name)
+    if Path(runtime).is_file():
+        st = Path(runtime).stat()
+        ok = (st.st_mode & 0o777) == 0o600
+        out.append(Check(2, "runtime_env_perms",
+            "PASS" if ok else "WARN",
+            f"mode={oct(st.st_mode & 0o777)}",
+            f"chmod 600 {runtime}" if not ok else ""))
+    return out
+
+
+def tier3_model_routing(name: str, fleet: dict, cfg: dict | None) -> list[Check]:
+    out = []
+    if not cfg:
+        return [Check(3, "skip_no_cfg", "SKIP", "no openclaw.json")]
+
+    declared = fleet.get("agents", {}).get(name, {}).get("tier")
+    # resolve primary loosely; pick first string value
+    primary = None
+    for keypath in [("models", "default"), ("agents", "defaults", "model"),
+                    ("models", "primary"), ("models", "model")]:
+        node = cfg
+        for k in keypath:
+            if isinstance(node, dict) and k in node:
+                node = node[k]
+            else:
+                node = None; break
+        if isinstance(node, str):
+            primary = node; break
+        if isinstance(node, dict) and isinstance(node.get("primary"), str):
+            primary = node["primary"]; break
+
+    out.append(Check(3, "tier_declared",
+        "PASS" if declared in VALID_TIERS else "WARN",
+        f"tier={declared}",
+        "set tier in FLEET.yaml"))
+    out.append(Check(3, "primary_model_set",
+        "PASS" if primary else "WARN",
+        f"primary={primary or 'unset'}"))
+
+    # banned :high suffix in config
+    cfg_text = json.dumps(cfg)
+    bad = re.search(r'"deepseek/deepseek-v4-pro:high"', cfg_text)
+    out.append(Check(3, "no_high_suffix_in_config",
+        "FAIL" if bad else "PASS",
+        "found `:high` suffix (CLI-only syntax)" if bad else "clean",
+        "revert to bare model + add agents.defaults.thinkingDefault: high" if bad else ""))
+
+    # thinkingDefault for deepseek users
+    uses_deepseek = "deepseek/deepseek-v4-pro" in cfg_text
+    thinking = cfg.get("agents", {}).get("defaults", {}).get("thinkingDefault")
+    if uses_deepseek:
+        out.append(Check(3, "thinking_default_set",
+            "PASS" if thinking == "high" else "WARN",
+            f"thinkingDefault={thinking!r}",
+            'set agents.defaults.thinkingDefault: "high"'))
+
+    # provider blocks present for referenced providers
+    # deepseek needs models.providers.deepseek (custom baseUrl at api.deepseek.com).
+    # moonshot/kimi-k2.6 is routed via auth.profiles["moonshot:default"] — no models.providers block needed.
+    # Check: if moonshot referenced but no auth profile for it, that's the real gap.
+    providers = cfg.get("models", {}).get("providers", {})
+    auth_profiles = cfg.get("auth", {}).get("profiles", {})
+    if "deepseek/" in cfg_text:
+        out.append(Check(3, "provider_deepseek_block",
+            "PASS" if "deepseek" in providers else "FAIL",
+            "" if "deepseek" in providers else "missing models.providers.deepseek",
+            "add models.providers.deepseek block"))
+    if "moonshot/" in cfg_text:
+        has_moonshot_profile = any("moonshot" in k for k in auth_profiles)
+        out.append(Check(3, "provider_moonshot_block",
+            "PASS" if has_moonshot_profile else "FAIL",
+            "auth.profiles has moonshot entry" if has_moonshot_profile else "missing auth.profiles moonshot:default",
+            "add moonshot:default to auth.profiles with mode: api_key"))
+    return out
+
+
+def tier4_memory(name: str, cfg: dict | None) -> list[Check]:
+    out = []
+    if not cfg:
+        return [Check(4, "skip_no_cfg", "SKIP", "no openclaw.json")]
+    cfg_text = json.dumps(cfg)
+
+    # recall_v5: canonical recall is invoked via /opt/gcg/shared/bin/memory CLI from AGENTS.md,
+    # NOT via a config key. Checking openclaw.json for "recall_v5" string is a false positive.
+    # Check that the memory CLI binary exists instead (fleet-wide shared binary).
+    memory_cli = Path(f"{SHARED_BIN}/memory")
+    out.append(Check(4, "recall_v5_referenced",
+        "PASS" if memory_cli.exists() else "WARN",
+        f"memory CLI at {memory_cli}" if memory_cli.exists() else f"missing {memory_cli}",
+        f"deploy recall binary to {memory_cli}" if not memory_cli.exists() else ""))
+    out.append(Check(4, "recall_v2_absent",
+        "PASS" if "recall_v2" not in cfg_text else "WARN",
+        "deprecated recall_v2 still referenced" if "recall_v2" in cfg_text else "clean",
+        "swap recall_v2 → recall_v5"))
+
+    workspace_mem = Path(AGENT_DIR_TMPL.format(name=name)) / "workspace" / "memory"
+    out.append(Check(4, "workspace_memory_dir",
+        "PASS" if workspace_mem.is_dir() else "WARN",
+        str(workspace_mem),
+        f"mkdir -p {workspace_mem}" if not workspace_mem.is_dir() else ""))
+    return out
+
+
+def tier5_comms(name: str, fleet: dict, cfg: dict | None) -> list[Check]:
+    out = []
+    if not cfg:
+        return [Check(5, "skip_no_cfg", "SKIP", "no openclaw.json")]
+    inbox = "agent_messages" in json.dumps(cfg) or "inbox" in json.dumps(cfg)
+    out.append(Check(5, "fleet_inbox_wired",
+        "PASS" if inbox else "WARN",
+        "inbox hook present" if inbox else "no fleet inbox hook",
+        "wire fleet inbox auto-inject hook"))
+    return out
+
+
+def tier6_workspace(name: str) -> list[Check]:
+    out = []
+    ws = Path(AGENT_DIR_TMPL.format(name=name)) / "workspace"
+    logs = Path(AGENT_DIR_TMPL.format(name=name)) / "logs"
+    out.append(Check(6, "workspace_present", "PASS" if ws.is_dir() else "FAIL", str(ws)))
+    out.append(Check(6, "logs_dir", "PASS" if logs.is_dir() else "WARN", str(logs),
+        f"mkdir -p {logs}" if not logs.is_dir() else ""))
+    return out
+
+
+def tier7_systemd(name: str) -> list[Check]:
+    out = []
+    unit = f"openclaw-{name}.service"
+    unit_path = SYSTEMD_UNIT_TMPL.format(name=name)
+    out.append(Check(7, "unit_file",
+        "PASS" if Path(unit_path).is_file() else "FAIL",
+        unit_path,
+        f"create {unit_path}" if not Path(unit_path).is_file() else ""))
+    rc, state = _systemctl("is-active", unit)
+    out.append(Check(7, "unit_active",
+        "PASS" if state == "active" else "FAIL",
+        f"state={state}",
+        f"systemctl reset-failed {unit} && systemctl restart {unit}" if state != "active" else ""))
+    rc, txt, _err = _run(["systemctl", "show", unit, "--property=NRestarts"])
+    nr = txt.strip().split("=")[-1] if "=" in txt else "?"
+    out.append(Check(7, "restart_count_sane",
+        "PASS" if nr.isdigit() and int(nr) < 5 else "WARN",
+        f"NRestarts={nr}"))
+
+    # MemoryMax drop-in — check any .conf in the unit's drop-in dir for MemoryMax setting
+    dropin_dir = Path(f"/etc/systemd/system/{unit}.d")
+    has_memmax = False
+    if dropin_dir.is_dir():
+        for conf in dropin_dir.glob("*.conf"):
+            try:
+                if "MemoryMax" in conf.read_text():
+                    has_memmax = True
+                    break
+            except Exception:
+                pass
+    dropin_target = dropin_dir / "memory.conf"
+    out.append(Check(7, "memory_max_dropin",
+        "PASS" if has_memmax else "WARN",
+        f"MemoryMax found in {dropin_dir}" if has_memmax else f"no MemoryMax in {dropin_dir}",
+        f"echo -e '[Service]\\nMemoryMax=4G' > {dropin_target}" if not has_memmax else ""))
+    return out
+
+
+def tier8_observability(name: str) -> list[Check]:
+    out = []
+    log = Path(AGENT_DIR_TMPL.format(name=name)) / "logs" / "gateway.log"
+    if log.is_file():
+        age = time.time() - log.stat().st_mtime
+        # WARN if log exists but hasn't been written in 2h (agent may be stalled)
+        out.append(Check(8, "log_recent",
+            "PASS" if age < 7200 else "WARN",
+            f"age={int(age)}s",
+            "check systemctl status + journalctl for agent" if age >= 7200 else ""))
+    else:
+        # log_missing = SKIP: idle agents and newly started agents legitimately produce no gateway.log.
+        # Real staleness is caught by unit_active check in tier7.
+        out.append(Check(8, "log_missing", "SKIP", f"no gateway.log at {log} (idle or pre-first-request)"))
+    return out
+
+
+def tier9_integration(name: str, fleet: dict, cfg: dict | None) -> list[Check]:
+    out = []
+    a = fleet.get("agents", {}).get(name, {})
+    out.append(Check(9, "registry_entry",
+        "PASS" if a else "FAIL",
+        "FLEET.yaml has agent" if a else "missing"))
+    # AGENTS.md inject — search for canonical block markers (any of several valid forms)
+    # Older agents use auto_recall.py path; newer use FLEET_INDEX.md reference.
+    # Accept: "## GCG Fleet", "fleet_inbox", "FLEET_INDEX", "FLEET.yaml", "FLEET_INDEX.md"
+    agents_md = Path(AGENT_DIR_TMPL.format(name=name)) / "workspace" / "AGENTS.md"
+    has_inject = False
+    if agents_md.is_file():
+        md_text = agents_md.read_text()
+        has_inject = any(marker in md_text for marker in (
+            "## GCG Fleet", "fleet_inbox", "FLEET_INDEX", "FLEET.yaml", "auto_recall.py"
+        ))
+    out.append(Check(9, "agents_md_canonical_inject",
+        "PASS" if has_inject else "WARN",
+        "canonical block present" if has_inject else "no canonical block",
+        "re-run gcg-provision-integrations --agents-md-only"))
+    return out
+
+
+def tier10_asana_pat(name: str) -> list[Check]:
+    out = []
+    vault = "/opt/gcg/shared/secrets/asana.enc"
+    if not Path(vault).is_file():
+        return [Check(10, "vault_missing", "SKIP", "asana.enc absent")]
+    # We can't decrypt cheaply; just check vault freshness
+    age = time.time() - Path(vault).stat().st_mtime
+    out.append(Check(10, "asana_vault_present",
+        "PASS",
+        f"age={int(age/86400)}d"))
+    # The actual key-presence check requires Fernet decrypt; flag as SKIP unless run with --deep
+    out.append(Check(10, "pat_entry_for_agent",
+        "SKIP",
+        "deep check required (--deep flag)",
+        f"run gcg-rotate-pat verify {name}"))
+    return out
+
+
+def tier11_capabilities(name: str, fleet: dict) -> list[Check]:
+    out = []
+    caps = fleet.get("agents", {}).get(name, {}).get("capabilities", {})
+    if not caps:
+        return [Check(11, "no_capabilities_block", "WARN", "missing",
+            f"add agents.{name}.capabilities block to FLEET.yaml")]
+
+    # skills declared exist
+    skills = caps.get("skills_allowed", []) or []
+    missing_skills = [s for s in skills if not Path(f"{SHARED_SKILLS}/{s}").exists()]
+    out.append(Check(11, "skills_resolve",
+        "PASS" if not missing_skills else "WARN",
+        f"missing: {missing_skills}" if missing_skills else f"{len(skills)} ok"))
+
+    # DWD
+    out.append(Check(11, "dwd_flag",
+        "PASS",
+        f"dwd_enabled={caps.get('dwd_enabled', False)}"))
+
+    # Gmail impersonation declared
+    imps = caps.get("gmail_impersonation", []) or []
+    out.append(Check(11, "gmail_impersonation_declared",
+        "PASS" if imps else "SKIP",
+        f"{len(imps)} aliases" if imps else "none"))
+
+    # Broker
+    out.append(Check(11, "broker_flag",
+        "PASS",
+        f"broker={caps.get('broker_allowed', False)}"))
+
+    # MCP servers
+    mcps = caps.get("mcp_servers", []) or []
+    out.append(Check(11, "mcp_servers_declared",
+        "PASS" if mcps else "SKIP",
+        f"{len(mcps)} servers" if mcps else "none"))
+
+    # API scopes
+    scopes = caps.get("api_scopes", []) or []
+    out.append(Check(11, "api_scopes_declared",
+        "PASS" if scopes else "WARN",
+        f"{len(scopes)} scopes"))
+    return out
+
+
+# ─── runner ─────────────────────────────────────────────────────────────────
+
+def run_qa(name: str) -> AgentReport:
+    fleet = _load_fleet()
+    cfg = _agent_config(name)
+    rep = AgentReport(agent=name, timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    rep.checks += tier1_identity(name, fleet, cfg)
+    rep.checks += tier2_security(name, cfg)
+    rep.checks += tier3_model_routing(name, fleet, cfg)
+    rep.checks += tier4_memory(name, cfg)
+    rep.checks += tier5_comms(name, fleet, cfg)
+    rep.checks += tier6_workspace(name)
+    rep.checks += tier7_systemd(name)
+    rep.checks += tier8_observability(name)
+    rep.checks += tier9_integration(name, fleet, cfg)
+    rep.checks += tier10_asana_pat(name)
+    rep.checks += tier11_capabilities(name, fleet)
+    return rep
+
+
+# ─── output ─────────────────────────────────────────────────────────────────
+
+COLORS = {"PASS": "\033[32m", "WARN": "\033[33m", "FAIL": "\033[31m", "SKIP": "\033[90m", "_": "\033[0m"}
+
+def print_report(rep: AgentReport, color: bool = True) -> None:
+    s = rep.summary
+    print(f"\n{'═'*70}\nAGENT: {rep.agent}    {rep.timestamp}")
+    print(f"  PASS={s['PASS']}  WARN={s['WARN']}  FAIL={s['FAIL']}  SKIP={s['SKIP']}")
+    print("═"*70)
+    cur_tier = 0
+    for c in rep.checks:
+        if c.tier != cur_tier:
+            print(f"\n── Tier {c.tier} ──")
+            cur_tier = c.tier
+        col = COLORS.get(c.status, "") if color else ""
+        rst = COLORS["_"] if color else ""
+        print(f"  {col}{c.status:4}{rst}  {c.name:32s}  {c.detail}")
+        if c.status in ("FAIL", "WARN") and c.remediation:
+            print(f"        → fix: {c.remediation}")
+    print()
+
+
+def _audit(rep: AgentReport, mode: str) -> None:
+    try:
+        Path(AUDIT_LOG).parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps({"mode": mode, **rep.to_json()}) + "\n")
+    except Exception:
+        pass
+
+
+# ─── remediate (stub — extend per WARN type) ────────────────────────────────
+
+REMEDIATIONS: dict[str, Callable[[str], bool]] = {
+    # name: fn(agent) -> bool
+    # Add concrete autofixers here. For now, dispatch is signature-only.
+}
+
+
+def remediate(rep: AgentReport) -> int:
+    fixed = 0
+    for c in rep.checks:
+        if c.status != "WARN":
+            continue
+        fn = REMEDIATIONS.get(c.name)
+        if not fn:
+            continue
+        try:
+            if fn(rep.agent):
+                fixed += 1
+                print(f"  ✓ auto-fixed {c.name}")
+        except Exception as e:
+            print(f"  ✗ remediation failed {c.name}: {e}")
+    return fixed
+
+
+# ─── cli ────────────────────────────────────────────────────────────────────
+
+def list_all_agents() -> list[str]:
+    return sorted((_load_fleet().get("agents") or {}).keys())
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="gcg-agent-qa")
+    p.add_argument("agent", nargs="?", help="agent name (omit with --all)")
+    p.add_argument("--all", action="store_true", help="run against every agent in FLEET.yaml")
+    p.add_argument("--check", action="store_true", help="(default) read-only verify")
+    p.add_argument("--remediate", action="store_true", help="auto-fix safe WARN drifts")
+    p.add_argument("--report", action="store_true", help="emit JSON to stdout")
+    p.add_argument("--no-color", action="store_true")
+    args = p.parse_args()
+
+    if args.all:
+        agents = list_all_agents()
+    elif args.agent:
+        agents = [args.agent]
+    else:
+        p.print_usage(); return 2
+
+    overall_fail = 0
+    for a in agents:
+        rep = run_qa(a)
+        mode = "remediate" if args.remediate else "check"
+        _audit(rep, mode)
+
+        if args.remediate:
+            fixed = remediate(rep)
+            # re-run after fixes
+            rep = run_qa(a)
+
+        if args.report:
+            print(json.dumps(rep.to_json()))
+        else:
+            print_report(rep, color=not args.no_color)
+
+        if rep.summary["FAIL"] > 0:
+            overall_fail += 1
+
+    return 1 if overall_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

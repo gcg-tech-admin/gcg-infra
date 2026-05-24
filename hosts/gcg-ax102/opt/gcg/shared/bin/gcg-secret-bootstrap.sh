@@ -1,7 +1,11 @@
 #!/bin/bash
 # gcg-secret-bootstrap.sh — systemd ExecStartPre
-# Fetches DeepSeek/Moonshot/Gemini/Anthropic from 1Password,
+# Fetches DeepSeek/Moonshot/Gemini/Anthropic/OpenAI from 1Password,
 # writes runtime env to /run/openclaw-${AGENT}/env (tmpfs, 0600).
+# Per-agent channel tokens (TELEGRAM_BOT_TOKEN, SLACK_BOT_TOKEN, SLACK_APP_TOKEN) and GATEWAY_TOKEN
+# come from systemd-credstore (/etc/credstore.encrypted/gateway-env), keyed by agent name.
+# Tier A agents (bob, leon, hector, tom, phil, algaib) also get AWS_BEARER_TOKEN_BEDROCK + AWS_REGION=us-east-1.
+# Daen + Talos persist OP_SA token to runtime for ad-hoc op reads.
 # Opt-in agents also get Google Workspace SA JSON (DWD) at /run/openclaw-${AGENT}/google-sa.json (tmpfs, 0400).
 # Anthropic available for one-off tasks — NOT for recurring processes.
 # Plaintext NEVER on persistent disk.
@@ -16,10 +20,21 @@ mkdir -p "$RUNTIME_DIR"; chmod 700 "$RUNTIME_DIR"
 DB_ENV=""
 [ -r "$CREDENTIALS_DIRECTORY/db-env" ] && DB_ENV=$(cat "$CREDENTIALS_DIRECTORY/db-env")
 
-PER_AGENT_PWD="/opt/gcg/shared/credentials/db/gcg_${AGENT}.pwd"
-if [ -r "$PER_AGENT_PWD" ]; then
-  AGENT_DB_PASSWORD=$(tr -d '\n' < "$PER_AGENT_PWD")
-  DB_ENV=$(echo "$DB_ENV" | sed "s/^GCG_DB_USER=.*/GCG_DB_USER=gcg_${AGENT}/" | sed "s/^GCG_DB_PASSWORD=.*/GCG_DB_PASSWORD=${AGENT_DB_PASSWORD}/" | sed "s/^PGPASSWORD=.*/PGPASSWORD=${AGENT_DB_PASSWORD}/")
+# Per-agent DB password: try 1Password first (zero-plaintext mandate, enforced 2026-05-23).
+# Fall back to legacy .pwd file ONLY for existing agents provisioned before 2026-05-23.
+# New agents MUST have password in 1Password (provision-memory.py stores it there).
+# Legacy .pwd files tracked in plaintext purge backlog #87 for rotation + shred.
+AGENT_DB_PASSWORD=""
+if [ -n "$OP_SERVICE_ACCOUNT_TOKEN" ]; then
+  AGENT_DB_PASSWORD=$(op read "op://GCG Agent Fleet/db-${AGENT}/password" 2>/dev/null || true)
+fi
+if [ -z "$AGENT_DB_PASSWORD" ]; then
+  # Backward-compat fallback for 29 legacy agents (#87: rotate then shred these files)
+  PER_AGENT_PWD="/opt/gcg/shared/credentials/db/gcg_${AGENT}.pwd"
+  [ -r "$PER_AGENT_PWD" ] && AGENT_DB_PASSWORD=$(tr -d '\n' < "$PER_AGENT_PWD")
+fi
+if [ -n "$AGENT_DB_PASSWORD" ]; then
+  DB_ENV=$(printf '%s' "$DB_ENV" | sed "s/^GCG_DB_USER=.*/GCG_DB_USER=gcg_${AGENT}/" | sed "s/^GCG_DB_PASSWORD=.*/GCG_DB_PASSWORD=${AGENT_DB_PASSWORD}/" | sed "s/^PGPASSWORD=.*/PGPASSWORD=${AGENT_DB_PASSWORD}/")
 fi
 
 GW_LINE=""
@@ -47,6 +62,7 @@ DEEPSEEK_KEY=$(op read "op://GCG Agent Fleet/Deepseek API/password" 2>/dev/null 
 MOONSHOT_KEY=$(op read "op://GCG Agent Fleet/Moonshot Kimi/credential" 2>/dev/null || true)
 GEMINI_KEY=$(op read   "op://GCG Agent Fleet/Gemini Api Key/password" 2>/dev/null || true)
 OPENAI_OAUTH=$(op read "op://GCG Agent Fleet/OpenAI OAuth/credential" 2>/dev/null || true)
+OPENAI_KEY=$(op read "op://GCG Agent Fleet/qlowj7vobk3twfl66rw4cso544/password" 2>/dev/null || true)
 
 {
   [ -n "$DB_ENV" ]         && echo "$DB_ENV"
@@ -65,8 +81,10 @@ OPENAI_OAUTH=$(op read "op://GCG Agent Fleet/OpenAI OAuth/credential" 2>/dev/nul
     echo "GOOGLE_API_KEY=$GEMINI_KEY"
   fi
   [ -n "$OPENAI_OAUTH" ]   && echo "OPENAI_OAUTH_TOKEN=$OPENAI_OAUTH"
+  [ -n "$OPENAI_KEY" ]     && echo "OPENAI_API_KEY=$OPENAI_KEY"
 } > "$RUNTIME_DIR/env"
 chmod 600 "$RUNTIME_DIR/env"
+echo "GCG_RECALL_DAEMON=1" >> "$RUNTIME_DIR/env"
 
 # OP_SERVICE_ACCOUNT_TOKEN persistence — daen+talos only (per CLAUDE.md spec).
 # Enables ad-hoc `op read` at runtime for these two engineering/orchestration agents.
@@ -118,9 +136,9 @@ open(tpl_path,'w').write(json.dumps(d, indent=2))
 PYTEMPL
     fi
     # Build runtime auth-profiles from template + anthropic api_key
-    python3 - "$TEMPLATE" "$TMPFS_AUTH" "$ANTHROPIC_KEY" "$DEEPSEEK_KEY" "$MOONSHOT_KEY" "$GEMINI_KEY" <<'PYBUILD'
+    python3 - "$TEMPLATE" "$TMPFS_AUTH" "$ANTHROPIC_KEY" "$DEEPSEEK_KEY" "$MOONSHOT_KEY" "$GEMINI_KEY" "$OPENAI_KEY" <<'PYBUILD'
 import json, os, sys
-tpl, tmpfs, anth, deep, moon, gem = sys.argv[1:]
+tpl, tmpfs, anth, deep, moon, gem, oai = sys.argv[1:]
 d = json.load(open(tpl)) if os.path.exists(tpl) else {'version':1,'profiles':{}}
 profs = d.setdefault('profiles',{})
 for prov_id, prov_name, key in [
@@ -128,6 +146,7 @@ for prov_id, prov_name, key in [
     ('deepseek:default',   'deepseek',  deep),
     ('moonshot:default',   'moonshot',  moon),
     ('google:default',     'google',    gem),
+    ('openai:default',     'openai',    oai),
 ]:
     if key:
         profs[prov_id] = {'type': 'api_key', 'provider': prov_name, 'apiKey': key}

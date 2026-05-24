@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+"""
+gcg-create-agent — Master orchestrator for OpenClaw fleet agent provisioning.
+
+Usage:
+  gcg-create-agent <name>                      # interactive interview
+  gcg-create-agent <name> --spec-file <path>   # non-interactive from YAML/JSON
+  gcg-create-agent <name> --dry-run            # plan only, no mutations
+  gcg-create-agent --resume <name>             # restart from last checkpoint
+
+Spec:     /opt/gcg/shared/AGENT_SPEC.md
+Playbook: /opt/gcg/shared/AGENT_DEPLOYMENT_PLAYBOOK.md
+
+Phase flow:
+  0  validate inputs against AGENT_SPEC
+  1  provision-base (tiers 1, 2, 3, 7)
+  2  provision-memory (tier 4)
+  3  provision-integrations (tiers 5, 9, 10, 11)
+  4  systemctl daemon-reload + start
+  5  gcg-agent-qa <name> --check
+  6  gcg-agent-qa <name> --remediate (auto-fix WARNs)
+  7  final report
+
+Each phase:
+  - Logs to /var/log/gcg-provision/create-<name>-<ts>.log
+  - Writes checkpoint to /var/lib/gcg-provision/state/<name>.state (JSON)
+  - On failure: STOP, print remediation hint, exit non-zero
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+# ─── constants ────────────────────────────────────────────────────────────────
+
+SHARED_BIN       = "/opt/gcg/shared/bin"
+FLEET_YAML       = "/opt/gcg/shared/FLEET.yaml"
+PROVISION_BASE   = f"{SHARED_BIN}/provision-base"
+PROVISION_MEMORY = f"{SHARED_BIN}/provision-memory"
+PROVISION_INTEG  = f"{SHARED_BIN}/provision-integrations"
+GCG_AGENT_QA     = f"{SHARED_BIN}/gcg-agent-qa"
+LOG_DIR          = "/var/log/gcg-provision"
+STATE_DIR        = "/var/lib/gcg-provision/state"
+
+CRITICAL_6 = {"daen", "talos", "marcus", "mnemosyne", "vulcan", "nik"}
+NAME_RE    = re.compile(r'^[a-z][a-z0-9-]{2,15}$')
+VALID_TIERS = ("A", "B", "C", "D")
+
+# Default models per tier (mirrors AGENT_SPEC.md §2.2)
+TIER_DEFAULTS = {
+    "A": {
+        "primary":   "amazon-bedrock/us.anthropic.claude-sonnet-4-6",
+        "fallbacks": ["moonshot/kimi-k2.6", "deepseek/deepseek-v4-pro"],
+        "desc":      "US Bedrock — high-throughput Claude Sonnet via AWS",
+    },
+    "B": {
+        "primary":   "moonshot/kimi-k2.6",
+        "fallbacks": ["deepseek/deepseek-v4-pro"],
+        "desc":      "Core — Kimi K2.6 (19 agents)",
+    },
+    "C": {
+        "primary":   "anthropic/claude-sonnet-4-6",
+        "fallbacks": ["moonshot/kimi-k2.6", "deepseek/deepseek-v4-pro"],
+        "desc":      "Engineering — Claude direct (talos sub: openai-codex/gpt-5.5)",
+    },
+    "D": {
+        "primary":   "moonshot/kimi-k2.6",
+        "fallbacks": ["deepseek/deepseek-v4-pro"],
+        "desc":      "Orchestration — Kimi + Opus dispatch",
+    },
+}
+
+# ─── helpers ──────────────────────────────────────────────────────────────────
+
+def ts_utc() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def log(msg: str, level: str = "INFO", logfile: str | None = None) -> None:
+    line = f"[{ts_utc()}] [{level}] {msg}"
+    stream = sys.stderr if level == "ERROR" else sys.stdout
+    print(line, file=stream)
+    if logfile:
+        try:
+            with open(logfile, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+def die(msg: str, logfile: str | None = None) -> None:
+    log(msg, "ERROR", logfile)
+    sys.exit(1)
+
+
+def prompt(question: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        ans = input(f"  {question}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(130)
+    return ans if ans else default
+
+
+def prompt_bool(question: str, default: bool = False) -> bool:
+    default_str = "Y/n" if default else "y/N"
+    ans = prompt(f"{question} ({default_str})").lower()
+    if not ans:
+        return default
+    return ans in ("y", "yes", "1", "true")
+
+
+def prompt_list(question: str, default: list | None = None) -> list[str]:
+    default_str = ",".join(default) if default else ""
+    ans = prompt(f"{question} (comma-separated)", default_str)
+    return [x.strip() for x in ans.split(",") if x.strip()] if ans else []
+
+
+def _load_fleet_yaml() -> dict:
+    if not Path(FLEET_YAML).exists():
+        return {}
+    try:
+        import yaml
+        with open(FLEET_YAML) as f:
+            return yaml.safe_load(f) or {}
+    except ImportError:
+        # fallback to grep
+        return {}
+
+
+def agent_in_fleet(name: str) -> bool:
+    fleet = _load_fleet_yaml()
+    return name in fleet.get("agents", {})
+
+
+# ─── checkpoint (state) ───────────────────────────────────────────────────────
+
+def state_path(name: str) -> Path:
+    return Path(STATE_DIR) / f"{name}.state"
+
+
+def load_state(name: str) -> dict:
+    p = state_path(name)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {"completed_phases": [], "started_at": ts_utc()}
+
+
+def save_state(name: str, state: dict) -> None:
+    p = state_path(name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(state, indent=2))
+
+
+def mark_phase(name: str, phase: int) -> None:
+    st = load_state(name)
+    phases = st.get("completed_phases", [])
+    if phase not in phases:
+        phases.append(phase)
+    st["completed_phases"] = phases
+    st["last_phase"] = phase
+    st["updated_at"] = ts_utc()
+    save_state(name, st)
+
+
+def clear_state(name: str) -> None:
+    p = state_path(name)
+    if p.exists():
+        p.unlink()
+
+
+# ─── input validation ─────────────────────────────────────────────────────────
+
+def validate_name(name: str, force_critical: bool = False) -> None:
+    if not NAME_RE.match(name):
+        die(
+            f"Invalid name {name!r}. Must match ^[a-z][a-z0-9-]{{2,15}}$ "
+            "(lowercase, start with letter, 3-16 chars, kebab-case)."
+        )
+    if name in CRITICAL_6 and not force_critical:
+        die(
+            f"CRITICAL AGENT: {name!r} is in the critical-6 (daen, talos, marcus, "
+            "mnemosyne, vulcan, nik). Pass --force-critical to proceed."
+        )
+
+
+def validate_spec(spec: dict) -> list[str]:
+    """Validate a spec dict against AGENT_SPEC rules. Returns list of errors."""
+    errors: list[str] = []
+    name = spec.get("name", "")
+    if not NAME_RE.match(name):
+        errors.append(f"name {name!r} invalid")
+
+    tier = spec.get("tier", "")
+    if tier not in VALID_TIERS:
+        errors.append(f"tier {tier!r} must be one of {VALID_TIERS}")
+
+    if not spec.get("role", "").strip():
+        errors.append("role is required")
+
+    # Model checks
+    primary = spec.get("primary_model", "")
+    if primary and "openrouter/" in primary:
+        errors.append("openrouter/* banned fleet-wide")
+    for fb in spec.get("fallbacks", []):
+        if "openrouter/" in fb:
+            errors.append(f"openrouter/* banned in fallback: {fb}")
+        if ":high" in fb:
+            errors.append(f":high suffix forbidden in config (CLI-only syntax): {fb}")
+    if primary and ":high" in primary:
+        errors.append(f":high suffix forbidden in config: {primary}")
+
+    # Capability checks
+    caps = spec.get("capabilities", {})
+    for skill in caps.get("skills_allowed", []):
+        skill_path = Path("/opt/gcg/shared/skills") / skill / "SKILL.md"
+        if Path("/opt/gcg/shared/skills").exists() and not skill_path.exists():
+            errors.append(f"skill {skill!r} not found at {skill_path}")
+    gmail = caps.get("gmail_impersonation", [])
+    if gmail and not caps.get("dwd_enabled", False):
+        errors.append("gmail_impersonation requires dwd_enabled=true")
+
+    return errors
+
+
+# ─── interview (interactive) ──────────────────────────────────────────────────
+
+def interview(name: str) -> dict:
+    print("\n" + "═" * 60)
+    print(f"  GCG Create Agent — {name}")
+    print("═" * 60)
+    print()
+
+    # Check name collision
+    if agent_in_fleet(name):
+        die(
+            f"Agent {name!r} already exists in FLEET.yaml. "
+            "Use gcg-agent-qa to verify, or choose a different name."
+        )
+
+    # Tier selection
+    print("  Tiers:")
+    for t, info in TIER_DEFAULTS.items():
+        print(f"    {t} — {info['desc']}")
+    tier = ""
+    while tier not in VALID_TIERS:
+        tier = prompt("Tier (A/B/C/D)", "B").upper()
+
+    # Role
+    role = ""
+    while not role.strip():
+        role = prompt("Role/purpose (one-line description)")
+
+    # Model (with tier defaults)
+    defaults = TIER_DEFAULTS[tier]
+    print(f"\n  Default model for Tier {tier}: {defaults['primary']}")
+    primary = prompt("Primary model (Enter to accept default)", defaults["primary"])
+
+    fb_default = ",".join(defaults["fallbacks"])
+    fallbacks_raw = prompt(f"Fallbacks (comma-separated, Enter to accept default)", fb_default)
+    fallbacks = [x.strip() for x in fallbacks_raw.split(",") if x.strip()]
+
+    # Capabilities (Tier 11)
+    print("\n  Capabilities (Tier 11):")
+    skills_allowed   = prompt_list("skills_allowed (leave blank = fleet default)")
+    dwd_enabled      = prompt_bool("dwd_enabled")
+    gmail_raw        = prompt_list("gmail_impersonation mailboxes (leave blank = none)")
+    broker_allowed   = prompt_bool("broker_allowed")
+    api_scopes       = prompt_list("api_scopes (e.g. slack,asana,telegram)")
+    mcp_servers      = prompt_list("mcp_servers")
+
+    spec = {
+        "name": name,
+        "tier": tier,
+        "role": role,
+        "primary_model": primary,
+        "fallbacks": fallbacks,
+        "capabilities": {
+            "skills_allowed":      skills_allowed,
+            "dwd_enabled":         dwd_enabled,
+            "gmail_impersonation": gmail_raw,
+            "broker_allowed":      broker_allowed,
+            "api_scopes":          api_scopes,
+            "mcp_servers":         mcp_servers,
+        },
+    }
+
+    # Summary + confirm
+    print("\n" + "─" * 60)
+    print("  Summary:")
+    print(f"    name:     {name}")
+    print(f"    tier:     {tier}")
+    print(f"    role:     {role}")
+    print(f"    primary:  {primary}")
+    print(f"    fallbacks:{fallbacks}")
+    caps = spec["capabilities"]
+    print(f"    skills:   {caps['skills_allowed'] or '(fleet default)'}")
+    print(f"    dwd:      {caps['dwd_enabled']}")
+    print(f"    gmail:    {caps['gmail_impersonation'] or 'none'}")
+    print(f"    broker:   {caps['broker_allowed']}")
+    print(f"    scopes:   {caps['api_scopes'] or 'none'}")
+    print(f"    mcp:      {caps['mcp_servers'] or 'none'}")
+    print("─" * 60)
+
+    ok = prompt_bool("Proceed with provisioning?", default=True)
+    if not ok:
+        print("  Aborted.")
+        sys.exit(0)
+
+    return spec
+
+
+def load_spec_file(path: str) -> dict:
+    """Load spec from YAML or JSON file."""
+    text = Path(path).read_text()
+    try:
+        import yaml
+        data = yaml.safe_load(text)
+    except ImportError:
+        data = json.loads(text)
+    if not isinstance(data, dict):
+        die(f"Spec file {path!r} must be a mapping, got {type(data).__name__}")
+    return data
+
+
+# ─── phase execution ──────────────────────────────────────────────────────────
+
+def run_phase(
+    phase_num: int,
+    phase_name: str,
+    cmd: list[str],
+    logfile: str,
+    dry_run: bool,
+) -> int:
+    """
+    Run a phase command. Returns exit code.
+    In dry-run mode: print command but don't execute.
+    Streams output to stdout AND appends to logfile.
+    """
+    log(f"Phase {phase_num}: {phase_name}", logfile=logfile)
+    cmd_str = " ".join(cmd)
+
+    if dry_run:
+        log(f"  [dry-run] would-run: {cmd_str}", logfile=logfile)
+        return 0
+
+    log(f"  running: {cmd_str}", logfile=logfile)
+
+    try:
+        Path(logfile).parent.mkdir(parents=True, exist_ok=True)
+        with open(logfile, "a") as lf:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                lf.write(line)
+            proc.wait()
+        return proc.returncode
+    except FileNotFoundError as e:
+        log(f"  Phase {phase_num} ERROR: command not found — {e}", "ERROR", logfile)
+        return 127
+    except Exception as e:
+        log(f"  Phase {phase_num} ERROR: {e}", "ERROR", logfile)
+        return 1
+
+
+PHASE_HINTS = {
+    1: "provision-base failed. Check: FLEET.yaml write permissions, systemd access, credstore write. Re-run with --resume after fixing.",
+    2: "provision-memory failed. Check: AX42 SSH reachable (ssh -i ~/.ssh/id_ed25519_v6 root@95.217.114.49), 1Password op CLI available on AX102. Re-run with --resume.",
+    3: "provision-integrations failed. Check: FLEET.yaml accessible, /opt/gcg/shared/skills/ exists, DB reachable. Re-run with --resume.",
+    4: "systemctl daemon-reload/start failed. Check: unit file at /etc/systemd/system/openclaw-<name>.service exists. Try: systemctl status openclaw-<name>.",
+    5: "gcg-agent-qa --check found FAILs. Review output above. Fix manually, then re-run with --resume.",
+    6: "gcg-agent-qa --remediate reported errors. Some items may require manual intervention (see WARN/FAIL output above).",
+}
+
+
+def build_provision_base_cmd(spec: dict, dry_run: bool, force_critical: bool) -> list[str]:
+    cmd = [
+        PROVISION_BASE,
+        spec["name"],
+        "--tier", spec["tier"],
+        "--role", spec.get("role", ""),
+    ]
+    if spec.get("tier_sub"):
+        cmd += ["--tier-sub", spec["tier_sub"]]
+    if dry_run:
+        cmd.append("--dry-run")
+    if force_critical and spec["name"] in CRITICAL_6:
+        cmd.append("--force")
+    return cmd
+
+
+def build_provision_memory_cmd(spec: dict, dry_run: bool, force_critical: bool) -> list[str]:
+    cmd = [PROVISION_MEMORY, spec["name"]]
+    if dry_run:
+        cmd.append("--dry-run")
+    if force_critical and spec["name"] in CRITICAL_6:
+        cmd.append("--force")
+    return cmd
+
+
+def build_provision_integrations_cmd(spec: dict, dry_run: bool, force_critical: bool) -> list[str]:
+    caps = spec.get("capabilities", {})
+    caps_json = json.dumps(caps)
+    cmd = [
+        PROVISION_INTEG,
+        spec["name"],
+        "--capabilities", caps_json,
+    ]
+    if dry_run:
+        cmd.append("--dry-run")
+    if force_critical and spec["name"] in CRITICAL_6:
+        cmd.append("--force")
+    return cmd
+
+
+def build_systemctl_cmds(name: str) -> list[list[str]]:
+    unit = f"openclaw-{name}.service"
+    return [
+        ["systemctl", "daemon-reload"],
+        ["systemctl", "enable", unit],
+        ["systemctl", "start",  unit],
+    ]
+
+
+def build_qa_check_cmd(name: str) -> list[str]:
+    return [GCG_AGENT_QA, name, "--check", "--no-color"]
+
+
+def build_qa_remediate_cmd(name: str) -> list[str]:
+    return [GCG_AGENT_QA, name, "--remediate", "--no-color"]
+
+
+# ─── final report parsing ─────────────────────────────────────────────────────
+
+def parse_qa_output(qa_output: str) -> dict[str, int]:
+    """Parse gcg-agent-qa stdout for PASS/WARN/FAIL counts."""
+    counts = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
+    for line in qa_output.splitlines():
+        m = re.search(r'PASS=(\d+)\s+WARN=(\d+)\s+FAIL=(\d+)\s+SKIP=(\d+)', line)
+        if m:
+            counts["PASS"] = int(m.group(1))
+            counts["WARN"] = int(m.group(2))
+            counts["FAIL"] = int(m.group(3))
+            counts["SKIP"] = int(m.group(4))
+            break
+    return counts
+
+
+def get_agent_pid(name: str) -> str:
+    try:
+        r = subprocess.run(
+            ["systemctl", "show", f"openclaw-{name}.service", "--property=MainPID"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in r.stdout.splitlines():
+            if line.startswith("MainPID="):
+                return line.split("=")[1].strip()
+    except Exception:
+        pass
+    return "?"
+
+
+def get_systemd_state(name: str) -> str:
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", f"openclaw-{name}.service"],
+            capture_output=True, text=True, timeout=5
+        )
+        return r.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+# ─── print final report ───────────────────────────────────────────────────────
+
+def print_final_report(
+    name: str,
+    spec: dict,
+    qa_counts: dict[str, int],
+    remediated: int,
+    duration: float,
+    logfile: str,
+    dry_run: bool,
+) -> None:
+    caps = spec.get("capabilities", {})
+    skills    = caps.get("skills_allowed", [])
+    dwd       = caps.get("dwd_enabled", False)
+    broker    = caps.get("broker_allowed", False)
+    api_scopes = caps.get("api_scopes", [])
+    mcp       = caps.get("mcp_servers", [])
+
+    caps_str = (
+        f"skills({len(skills)}) "
+        f"dwd({'yes' if dwd else 'no'}) "
+        f"broker({'yes' if broker else 'no'}) "
+        f"scopes({len(api_scopes)}) "
+        f"mcp({len(mcp)})"
+    )
+
+    pid_str = "N/A (dry-run)" if dry_run else f"active (PID {get_agent_pid(name)})"
+    state   = "dry-run" if dry_run else get_systemd_state(name)
+    if not dry_run and state == "active":
+        pid_str = f"active (PID {get_agent_pid(name)})"
+    elif not dry_run:
+        pid_str = f"{state}"
+
+    qa_str = f"PASS={qa_counts['PASS']} WARN={qa_counts['WARN']} FAIL={qa_counts['FAIL']}"
+
+    print()
+    print("═" * 50)
+    if dry_run:
+        print(f"═══ [dry-run] Agent plan: {name} ═══")
+    else:
+        print(f"═══ Agent created: {name} ═══")
+    print(f"tier:         {spec.get('tier', '?')}")
+    print(f"model:        {spec.get('primary_model', '?')}")
+    print(f"capabilities: {caps_str}")
+    print(f"systemd:      {pid_str}")
+    print(f"QA:           {qa_str}")
+    if remediated:
+        print(f"remediated:   {remediated} items auto-fixed")
+    print(f"duration:     {duration:.1f}s")
+    print(f"log:          {logfile}")
+    print()
+    if not dry_run:
+        print(f"Next: run smoke test → /opt/gcg/shared/bin/fleet ping {name}")
+    print("═" * 50)
+
+
+# ─── main orchestration ───────────────────────────────────────────────────────
+
+def run_create(
+    name: str,
+    spec: dict,
+    dry_run: bool,
+    resume: bool,
+    force_critical: bool,
+    ts: str,
+) -> int:
+    logfile = f"{LOG_DIR}/create-{name}-{ts.replace(':', '').replace('-', '')}.log"
+    Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    start_time = time.time()
+
+    log(f"Starting gcg-create-agent: {name} (dry_run={dry_run})", logfile=logfile)
+
+    # Load or init state
+    state = load_state(name) if resume else {"completed_phases": [], "started_at": ts}
+    if not resume:
+        save_state(name, state)
+    completed = set(state.get("completed_phases", []))
+
+    # Build all phase commands up front (for dry-run preview)
+    phase_cmds = {
+        0: ("validate inputs",          None),   # handled inline
+        1: ("provision-base",            build_provision_base_cmd(spec, dry_run, force_critical)),
+        2: ("provision-memory",          build_provision_memory_cmd(spec, dry_run, force_critical)),
+        3: ("provision-integrations",    build_provision_integrations_cmd(spec, dry_run, force_critical)),
+        # phase 4 = multiple commands (systemctl)
+        5: ("gcg-agent-qa --check",      build_qa_check_cmd(name)),
+        6: ("gcg-agent-qa --remediate",  build_qa_remediate_cmd(name)),
+    }
+
+    qa_output    = ""
+    qa_counts    = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
+    remediated   = 0
+
+    # ── Phase 0: Validate ─────────────────────────────────────────────────────
+    if 0 not in completed:
+        log("Phase 0: validate inputs", logfile=logfile)
+        errors = validate_spec(spec)
+        if errors:
+            for e in errors:
+                log(f"  VALIDATION ERROR: {e}", "ERROR", logfile)
+            die("Validation failed. Fix errors above and re-run.", logfile)
+        log("  validation: OK", logfile=logfile)
+        if dry_run:
+            # Print what each phase WOULD run
+            log("  [dry-run] Phase plan:", logfile=logfile)
+            log(f"    phase 1: {' '.join(phase_cmds[1][1])}", logfile=logfile)
+            log(f"    phase 2: {' '.join(phase_cmds[2][1])}", logfile=logfile)
+            log(f"    phase 3: {' '.join(phase_cmds[3][1])}", logfile=logfile)
+            for cmd in build_systemctl_cmds(name):
+                log(f"    phase 4: {' '.join(cmd)}", logfile=logfile)
+            log(f"    phase 5: {' '.join(phase_cmds[5][1])}", logfile=logfile)
+            log(f"    phase 6: {' '.join(phase_cmds[6][1])}", logfile=logfile)
+        mark_phase(name, 0)
+        completed.add(0)
+
+    # ── Phase 1: provision-base ───────────────────────────────────────────────
+    if 1 not in completed:
+        rc = run_phase(1, "provision-base (tiers 1,2,3,7)", phase_cmds[1][1], logfile, dry_run)
+        if rc != 0:
+            log(f"\nPhase 1 FAILED (exit {rc}).", "ERROR", logfile)
+            log(PHASE_HINTS[1], "ERROR", logfile)
+            return rc
+        mark_phase(name, 1)
+        completed.add(1)
+    else:
+        log("Phase 1: provision-base — skipped (checkpoint)", logfile=logfile)
+
+    # ── Phase 2: provision-memory ─────────────────────────────────────────────
+    if 2 not in completed:
+        rc = run_phase(2, "provision-memory (tier 4)", phase_cmds[2][1], logfile, dry_run)
+        if rc != 0:
+            log(f"\nPhase 2 FAILED (exit {rc}).", "ERROR", logfile)
+            log(PHASE_HINTS[2], "ERROR", logfile)
+            return rc
+        mark_phase(name, 2)
+        completed.add(2)
+    else:
+        log("Phase 2: provision-memory — skipped (checkpoint)", logfile=logfile)
+
+    # ── Phase 3: provision-integrations ──────────────────────────────────────
+    if 3 not in completed:
+        rc = run_phase(3, "provision-integrations (tiers 5,9,10,11)", phase_cmds[3][1], logfile, dry_run)
+        if rc != 0:
+            log(f"\nPhase 3 FAILED (exit {rc}).", "ERROR", logfile)
+            log(PHASE_HINTS[3], "ERROR", logfile)
+            return rc
+        mark_phase(name, 3)
+        completed.add(3)
+    else:
+        log("Phase 3: provision-integrations — skipped (checkpoint)", logfile=logfile)
+
+    # ── Phase 4: systemctl daemon-reload + enable + start ─────────────────────
+    if 4 not in completed:
+        log("Phase 4: systemctl daemon-reload + enable + start", logfile=logfile)
+        for cmd in build_systemctl_cmds(name):
+            rc = run_phase(4, " ".join(cmd), cmd, logfile, dry_run)
+            if rc != 0:
+                # start failures are non-fatal on critical-6 (manual restart window required)
+                if name in CRITICAL_6 and "start" in cmd:
+                    log(f"  WARNING: start failed for critical-6 {name} — schedule restart manually", "WARN", logfile)
+                else:
+                    log(f"\nPhase 4 FAILED: {' '.join(cmd)} (exit {rc}).", "ERROR", logfile)
+                    log(PHASE_HINTS[4], "ERROR", logfile)
+                    return rc
+        mark_phase(name, 4)
+        completed.add(4)
+    else:
+        log("Phase 4: systemctl — skipped (checkpoint)", logfile=logfile)
+
+    # ── Phase 5: gcg-agent-qa --check ─────────────────────────────────────────
+    if 5 not in completed:
+        if dry_run:
+            log(f"Phase 5: [dry-run] would-run: {' '.join(phase_cmds[5][1])}", logfile=logfile)
+            qa_counts = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
+        else:
+            log("Phase 5: gcg-agent-qa --check", logfile=logfile)
+            try:
+                qa_result = subprocess.run(
+                    phase_cmds[5][1],
+                    capture_output=True, text=True, timeout=90
+                )
+                qa_output = qa_result.stdout + qa_result.stderr
+                print(qa_output)
+                with open(logfile, "a") as lf:
+                    lf.write(qa_output)
+                qa_counts = parse_qa_output(qa_output)
+            except subprocess.TimeoutExpired:
+                log("  QA --check timed out (90s)", "WARN", logfile)
+        mark_phase(name, 5)
+        completed.add(5)
+    else:
+        log("Phase 5: gcg-agent-qa --check — skipped (checkpoint)", logfile=logfile)
+
+    # ── Phase 6: gcg-agent-qa --remediate ────────────────────────────────────
+    if 6 not in completed:
+        if dry_run:
+            log(f"Phase 6: [dry-run] would-run: {' '.join(phase_cmds[6][1])}", logfile=logfile)
+        else:
+            log("Phase 6: gcg-agent-qa --remediate", logfile=logfile)
+            try:
+                rem_result = subprocess.run(
+                    phase_cmds[6][1],
+                    capture_output=True, text=True, timeout=120
+                )
+                rem_output = rem_result.stdout + rem_result.stderr
+                print(rem_output)
+                with open(logfile, "a") as lf:
+                    lf.write(rem_output)
+                # Count auto-fixed items (heuristic: lines containing "auto-fixed" or "✓")
+                remediated = sum(1 for ln in rem_output.splitlines()
+                                 if "auto-fixed" in ln or "✓" in ln or "CHANGED" in ln.upper())
+                # Re-run check to get final counts
+                qa2 = subprocess.run(
+                    phase_cmds[5][1],
+                    capture_output=True, text=True, timeout=90
+                )
+                qa_counts = parse_qa_output(qa2.stdout + qa2.stderr)
+            except subprocess.TimeoutExpired:
+                log("  QA --remediate timed out (120s)", "WARN", logfile)
+        mark_phase(name, 6)
+        completed.add(6)
+    else:
+        log("Phase 6: gcg-agent-qa --remediate — skipped (checkpoint)", logfile=logfile)
+
+    # ── Phase 7: final report ─────────────────────────────────────────────────
+    duration = time.time() - start_time
+    print_final_report(name, spec, qa_counts, remediated, duration, logfile, dry_run)
+
+    # Clear checkpoint on clean success
+    if not dry_run and qa_counts.get("FAIL", 0) == 0:
+        clear_state(name)
+    elif not dry_run:
+        log(f"QA still has FAIL items. State preserved at {state_path(name)} for --resume.", logfile=logfile)
+
+    return 0 if qa_counts.get("FAIL", 0) == 0 else 1
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="gcg-create-agent",
+        description="Master orchestrator: create a new OpenClaw fleet agent end-to-end.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  gcg-create-agent nova                      # interactive interview\n"
+            "  gcg-create-agent nova --spec-file nova.yaml  # non-interactive\n"
+            "  gcg-create-agent nova --dry-run            # plan only\n"
+            "  gcg-create-agent --resume nova             # restart from checkpoint\n"
+        ),
+    )
+    p.add_argument("name", nargs="?", help="Agent name (kebab-case, 3-16 chars)")
+    p.add_argument("--spec-file", metavar="PATH",
+                   help="YAML/JSON spec file (non-interactive)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Plan only — no mutations, exit 0")
+    p.add_argument("--resume", metavar="NAME",
+                   help="Resume from last checkpoint for <name>")
+    p.add_argument("--force-critical", action="store_true",
+                   help="Allow overwriting a critical-6 agent")
+    args = p.parse_args()
+
+    # Resolve agent name
+    if args.resume:
+        name = args.resume.lower().strip()
+        resume = True
+    elif args.name:
+        name = args.name.lower().strip()
+        resume = False
+    else:
+        p.print_usage()
+        return 2
+
+    ts = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+    dry_run = args.dry_run
+
+    # Validate name (critical-6 guard)
+    validate_name(name, args.force_critical)
+
+    # Idempotency check (non-resume, non-critical)
+    if not resume and not dry_run and agent_in_fleet(name):
+        die(
+            f"Agent {name!r} already exists in FLEET.yaml. "
+            "already exists, use gcg-agent-qa to verify. "
+            "Pass --force-critical if this is a critical-6 rebuild."
+        )
+
+    # Load or collect spec
+    if args.resume:
+        st = load_state(name)
+        spec = st.get("spec")
+        if not spec:
+            die(f"No saved spec in state for {name!r}. Cannot resume without original spec.")
+    elif args.spec_file:
+        spec = load_spec_file(args.spec_file)
+        spec.setdefault("name", name)
+    else:
+        spec = interview(name)
+
+    # Save spec into state for resume
+    if not resume:
+        st = {"completed_phases": [], "started_at": ts, "spec": spec}
+        save_state(name, st)
+
+    return run_create(
+        name=name,
+        spec=spec,
+        dry_run=dry_run,
+        resume=resume,
+        force_critical=args.force_critical,
+        ts=ts,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

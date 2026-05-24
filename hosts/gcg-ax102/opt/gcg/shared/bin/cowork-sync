@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+cowork-sync v2 — GCG Cowork session sync
+- Captures done/decisions to pgvector (shared_fleet scope)
+- Writes per-project COWORK_SYNC_*.md to /opt/gcg/shared/docs/reference/ (ontology-compliant)
+- Also mirrors to mnemosyne workspace for legacy access
+"""
+
+import sys, json, subprocess, os, datetime, argparse
+
+DOCS_REF = "/opt/gcg/shared/docs/reference"
+MNEMO_WS = "/opt/gcg/openclaw-mnemosyne/workspace"
+MEMORY_CLI = "/opt/gcg/shared/bin/memory"
+
+# Project → output file (in DOCS_REF)
+PROJECT_FILES = {
+    "gcg-memory":        "cowork-sync-memory.md",
+    "gcg-intelligence":  "cowork-sync-intelligence.md",
+    "fleet-ops":         "cowork-sync-fleet.md",
+    "gcg-sales":         "cowork-sync-sales.md",
+    "general":           "cowork-sync-general.md",
+}
+
+def capture_memory(text, project, memory_type="lesson", importance="normal"):
+    try:
+        result = subprocess.run(
+            [MEMORY_CLI, "capture",
+             "--agent", "mnemosyne",
+             "--source-type", "cowork_session",
+             "--memory-type", memory_type,
+             "--importance", importance,
+             "--scope", "shared_fleet",
+             text],
+            capture_output=True, text=True, timeout=30
+        )
+        return result.returncode == 0, result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+    except Exception as e:
+        return False, str(e)
+
+def update_doc(project, session_title, done_items, todo_items, decisions, sync_date, dry_run=False):
+    fname = PROJECT_FILES.get(project, PROJECT_FILES["general"])
+    ref_path = os.path.join(DOCS_REF, fname)
+    # Legacy mirror
+    legacy_fname = fname.upper().replace("-", "_").replace(".MD", ".md")
+    legacy_fname = "COWORK_SYNC_" + fname.split("cowork-sync-")[1].upper().replace(".MD", ".MD") if "cowork-sync-" in fname else fname
+    legacy_path = os.path.join(MNEMO_WS, legacy_fname)
+
+    header = f"""# Cowork Session Sync — {project.upper().replace("-", " ")}
+
+**Ontology bucket:** reference  
+**Maintained by:** cowork-sync (daily 7am + 2am doc-index)  
+**Accessible to:** Daen, Talos, Mnemosyne, any building agent  
+
+---
+
+"""
+    for path in [ref_path, legacy_path]:
+        if not os.path.exists(path):
+            if not dry_run:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as f:
+                    f.write(header)
+
+    lines = [f"\n## {sync_date} — {session_title}\n"]
+    if done_items:
+        lines.append("### ✓ Done\n")
+        for item in done_items:
+            lines.append(f"- {item}\n")
+    if todo_items:
+        lines.append("\n### ⬜ Todo\n")
+        for item in todo_items:
+            lines.append(f"- [ ] {item}\n")
+    if decisions:
+        lines.append("\n### ⚡ Decisions\n")
+        for d in decisions:
+            lines.append(f"- {d}\n")
+    lines.append("\n")
+
+    if not dry_run:
+        for path in [ref_path, legacy_path]:
+            with open(path, "a") as f:
+                f.writelines(lines)
+    else:
+        print(f"    DRY-RUN → {ref_path} (+ legacy mirror)")
+    return ref_path
+
+def main():
+    parser = argparse.ArgumentParser(description="GCG Cowork session sync v2")
+    parser.add_argument("--file", help="Read JSON from file")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    if args.file:
+        with open(args.file) as f:
+            payload = json.load(f)
+    else:
+        raw = sys.stdin.read()
+        if not raw.strip():
+            print("ERROR: no input on stdin", file=sys.stderr)
+            sys.exit(1)
+        payload = json.loads(raw)
+
+    sync_date = payload.get("sync_date", datetime.date.today().isoformat())
+    sessions = payload.get("sessions", [])
+    if not sessions:
+        print("No sessions to sync.")
+        sys.exit(0)
+
+    total_memories = 0
+    errors = []
+    total_todos = 0
+
+    print(f"[cowork-sync v2] {sync_date} — {len(sessions)} sessions")
+
+    for s in sessions:
+        title = s.get("title", "Untitled")
+        project = s.get("project", "general")
+        done = s.get("done", [])
+        todo = s.get("todo", [])
+        decisions = s.get("decisions", [])
+        print(f"\n  [{project}] {title}")
+
+        for item in done:
+            text = f"[Cowork {sync_date}][{project}] DONE: {item}"
+            if args.dry_run:
+                print(f"    DRY-RUN capture: {text[:80]}")
+            else:
+                ok, msg = capture_memory(text, project, "lesson", "normal")
+                if ok: total_memories += 1
+                else: errors.append(f"capture({item[:40]}): {msg}")
+                print(f"    {'✓' if ok else '✗'} {item[:60]}")
+
+        for d in decisions:
+            text = f"[Cowork {sync_date}][{project}] DECISION: {d}"
+            if not args.dry_run:
+                ok, msg = capture_memory(text, project, "decision", "high")
+                if ok: total_memories += 1
+                else: errors.append(f"decision({d[:40]}): {msg}")
+
+        update_doc(project, title, done, todo, decisions, sync_date, args.dry_run)
+        total_todos += len(todo)
+
+    # Append to sync log
+    log_entry = f"{sync_date} | sessions={len(sessions)} memories={total_memories} todos={total_todos} errors={len(errors)}\n"
+    if not args.dry_run:
+        for log_path in [
+            f"{MNEMO_WS}/cowork-sync.log",
+            f"{DOCS_REF}/cowork-sync.log"
+        ]:
+            with open(log_path, "a") as f:
+                f.write(log_entry)
+
+    print(f"\n[cowork-sync v2] done: {total_memories} memories, {total_todos} todos, {len(errors)} errors")
+    if errors:
+        for e in errors: print(f"  ✗ {e}")
+    sys.exit(1 if errors else 0)
+
+if __name__ == "__main__":
+    main()

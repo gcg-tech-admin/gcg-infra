@@ -1,0 +1,11 @@
+[Unit]
+Description=Run GCG correction detector hourly
+
+[Timer]
+OnBootSec=5min
+OnCalendar=hourly
+Persistent=true
+Unit=gcg-correction-detector.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=GCG Doc Index nightly at 2am UAE (22:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 22:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

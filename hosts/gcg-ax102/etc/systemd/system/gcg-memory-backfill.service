@@ -1,0 +1,18 @@
+[Unit]
+Description=GCG Memory Ontology Backfill (A1.2 → A2.3)
+After=network.target
+# One-shot: does not restart on failure — Peter re-starts manually after investigation.
+# Re-running is safe: completed phases are skipped via .backfill_phase_state.json.
+
+[Service]
+Type=oneshot
+User=root
+LoadCredentialEncrypted=deepseek-key:/etc/credstore.encrypted/deepseek-key
+ExecStart=/opt/gcg/shared/gcg_tools/run_memory_backfill.sh
+StandardOutput=journal
+StandardError=journal
+MemoryMax=2G
+# No Restart= — intentionally absent for oneshot investigation pattern
+
+[Install]
+WantedBy=multi-user.target

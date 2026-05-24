@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+"""
+provision-memory.py — Tier 4 memory wiring for a new GCG OpenClaw agent.
+
+Usage:
+  provision-memory.py <name> [--dry-run] [--force] [--backfill-workspace]
+
+What it does:
+  1. Creates gcg_<name> Postgres role on AX42, grants memory tables.
+  2. Writes per-agent DB password to /opt/gcg/shared/credentials/db/gcg_<name>.pwd
+  3. Wires openclaw.json: memorySearch block + recall hooks (recall_v5, session-embed,
+     pgvector-embed, compaction-capture, session-auto-recall).
+  4. Creates workspace/memory/ dir + today's heartbeat file.
+  5. Writes recall config /opt/gcg/shared/gcg_tools/config/<name>.yaml.
+  6. Registers agent in FLEET.yaml (adds memory: wired tag).
+  7. Optional --backfill-workspace: captures existing workspace/memory/*.md files
+     via memory CLI (skips sha256-matching content_hash rows already in DB).
+  8. Mnemosyne registration: writes agent entry into
+     /opt/gcg/shared/gcg_tools/config/<name>.yaml (same recall config used by
+     mnemosyne audit sweep) — no watched-agents.json exists, mnemosyne discovers
+     agents via FLEET.yaml + recall config presence.
+  9. Emits JSON audit line to /var/log/gcg-provision/memory.log.
+ 10. Final QA: calls gcg-agent-qa <name> --check --no-color, verifies Tier 4 GREEN.
+
+Constraints:
+  - Idempotent: safe to re-run.
+  - Backup: every config touched gets .bak.<epoch>.
+  - Dry-run: print plan, mutate nothing.
+  - Critical-6 protection: --force required if name in {daen,talos,marcus,mnemosyne,vulcan,nik}.
+  - Never writes plaintext DB password outside /opt/gcg/shared/credentials/db/ (mode 600).
+  - Does NOT restart any service.
+  - Does NOT trigger embed/backfill jobs unless --backfill-workspace is set.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+# ─── constants ─────────────────────────────────────────────────────────────────
+
+CRITICAL_6 = {"daen", "talos", "marcus", "mnemosyne", "vulcan", "nik"}
+
+AX102_SSH = [
+    "ssh",
+    "-i", "/root/.ssh/id_ed25519_v6",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "ConnectTimeout=8",
+    "root@77.42.7.80",
+]
+AX42_SSH = [
+    "ssh",
+    "-i", "/root/.ssh/id_ed25519_v6",
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "ConnectTimeout=8",
+    "root@95.217.114.49",
+]
+
+AGENT_DIR_TMPL    = "/opt/gcg/openclaw-{name}"
+CREDS_DB_DIR      = "/opt/gcg/shared/credentials/db"
+RECALL_CONFIG_DIR = "/opt/gcg/shared/gcg_tools/config"
+FLEET_YAML        = "/opt/gcg/shared/FLEET.yaml"
+MEMORY_CLI        = "/opt/gcg/shared/bin/memory"
+QA_BIN            = "/opt/gcg/shared/bin/gcg-agent-qa"
+AUDIT_LOG         = "/var/log/gcg-provision/memory.log"
+
+# Role used for memory table grants — all agents inherit memory-tier tables from group roles.
+# New agents default to gcg_agent (general group) unless a specific group is declared.
+# This mirrors what chiron, goku, yuri have.
+DEFAULT_PARENT_ROLE = "gcg_agent"
+
+# Memory table grant matrix (SELECT on read views; INSERT/UPDATE via RLS on memories):
+# memories table has RLS (row-level security): INSERT/UPDATE/SELECT filtered by
+#   app.current_agent setting OR scope='shared_fleet'.
+# The gcg_agent role already has INSERT/SELECT/UPDATE on public.memories.
+# Per-agent roles inherit these via group membership.
+MEMORY_GRANT_TABLES_READ = [
+    ("public", "memories"),
+    ("public", "memories_current_model"),
+    ("public", "memories_live"),
+    ("public", "agent_memory"),
+]
+
+# lightrag and meridian read grants mirror daen/nik pattern
+LIGHTRAG_TABLES = [
+    "lightrag_docs",
+    "lightrag_entities",
+    "lightrag_graph_entities",
+    "lightrag_ingest_queue",
+    "lightrag_meridian_bridge",
+    "lightrag_relationships",
+    "lightrag_worker_checkpoint",
+]
+
+# Ontology v2.2 — 8 canonical memory types
+MEMORY_TYPE_ALLOWLIST = [
+    "fact",
+    "lesson",
+    "decision",
+    "knowledge",
+    "preference",
+    "incident",
+    "session_index",
+    "workspace_note",
+]
+
+# ─── helpers ───────────────────────────────────────────────────────────────────
+
+def log(msg: str) -> None:
+    print(f"[provision-memory] {msg}")
+
+
+def run_ax102(cmd: str, timeout: int = 20) -> tuple[int, str, str]:
+    full = AX102_SSH + [cmd]
+    try:
+        r = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def run_ax42_psql(sql: str, timeout: int = 20, db_pwd: str = "") -> tuple[int, str, str]:
+    """Execute SQL on AX42 via SSH + psql using gcg_admin."""
+    escaped_sql = sql.replace("'", "'\\''")
+    cmd = f"PGPASSWORD='{db_pwd}' psql -h 95.217.114.49 -U gcg_admin -d gcg_intelligence -c '{escaped_sql}' 2>&1"
+    full = AX42_SSH + [cmd]
+    try:
+        r = subprocess.run(full, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def backup(path: str) -> str:
+    bak = f"{path}.bak.{int(time.time())}"
+    rc, _, err = run_ax102(f"cp -a '{path}' '{bak}' 2>&1")
+    if rc != 0:
+        log(f"  WARN: backup failed for {path}: {err}")
+    else:
+        log(f"  backed up → {bak}")
+    return bak
+
+
+def local_backup(path: str) -> str:
+    """Backup a file locally (when script runs on AX102)."""
+    bak = f"{path}.bak.{int(time.time())}"
+    subprocess.run(["cp", "-a", path, bak], check=True)
+    return bak
+
+
+def get_admin_db_pwd() -> str:
+    """Read gcg_admin password from /opt/gcg/shared/credentials/db/gcg_admin.pwd via AX102."""
+    rc, out, err = run_ax102("cat /opt/gcg/shared/credentials/db/gcg_admin.pwd 2>/dev/null")
+    if rc != 0 or not out.strip():
+        sys.exit("ERROR: cannot read gcg_admin.pwd — is this running on AX102?")
+    return out.strip()
+
+
+def gen_password() -> str:
+    return secrets.token_hex(32)
+
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def audit_emit(name: str, action: str, detail: dict, dry_run: bool) -> None:
+    """Append a JSON audit line to AUDIT_LOG."""
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "agent": name,
+        "action": action,
+        "dry_run": dry_run,
+        **detail,
+    }
+    if dry_run:
+        log(f"  [DRY-RUN audit] {json.dumps(record)}")
+        return
+    try:
+        rc, _, _ = run_ax102(
+            f"mkdir -p /var/log/gcg-provision && "
+            f"echo '{json.dumps(record)}' >> {AUDIT_LOG}"
+        )
+        if rc != 0:
+            log(f"  WARN: audit log write failed")
+    except Exception as e:
+        log(f"  WARN: audit_emit: {e}")
+
+
+# ─── step 1: DB role ───────────────────────────────────────────────────────────
+
+def step_db_role(name: str, dry_run: bool, admin_pwd: str) -> str:
+    """
+    Create gcg_<name> Postgres role if missing.
+    Generate password, store at /opt/gcg/shared/credentials/db/gcg_<name>.pwd (mode 600).
+    Grant memory tables via gcg_agent group membership.
+    Grant SELECT on lightrag_* and meridian.* read tables.
+    Returns the password (generated or existing).
+    """
+    role = f"gcg_{name}"
+    pwd_path = f"{CREDS_DB_DIR}/{role}.pwd"
+    log(f"Step 1: DB role {role}")
+
+    # Check if role exists
+    rc, out, _ = run_ax42_psql(
+        f"SELECT 1 FROM pg_roles WHERE rolname='{role}';",
+        db_pwd=admin_pwd,
+    )
+    role_exists = "1 row" in out or "(1 row)" in out
+
+    # Check if password file exists
+    rc2, out2, _ = run_ax102(f"test -f '{pwd_path}' && cat '{pwd_path}' 2>/dev/null || echo ''")
+    existing_pwd = out2.strip() if rc2 == 0 and out2.strip() else ""
+
+    if role_exists and existing_pwd:
+        log(f"  Role {role} already exists with password file — idempotent skip")
+        return existing_pwd
+
+    # Generate new password if needed
+    new_pwd = existing_pwd if existing_pwd else gen_password()
+
+    if dry_run:
+        log(f"  [DRY-RUN] Would CREATE ROLE {role} with LOGIN if not exists")
+        log(f"  [DRY-RUN] Would write {pwd_path} (mode 600)")
+        log(f"  [DRY-RUN] Would GRANT {DEFAULT_PARENT_ROLE} TO {role}")
+        log(f"  [DRY-RUN] Would GRANT SELECT on lightrag_* and meridian.* tables")
+        return new_pwd
+
+    # Create role
+    if not role_exists:
+        sql_create = (
+            f"CREATE ROLE {role} WITH LOGIN PASSWORD '{new_pwd}'; "
+            f"GRANT {DEFAULT_PARENT_ROLE} TO {role};"
+        )
+        rc, out, err = run_ax42_psql(sql_create, db_pwd=admin_pwd)
+        if rc != 0:
+            sys.exit(f"ERROR: CREATE ROLE failed: {err}\n{out}")
+        log(f"  Created role {role} + granted {DEFAULT_PARENT_ROLE}")
+    else:
+        # Role exists but no pwd file — update password
+        sql_pwd = f"ALTER ROLE {role} WITH PASSWORD '{new_pwd}';"
+        run_ax42_psql(sql_pwd, db_pwd=admin_pwd)
+        log(f"  Role {role} exists — password refreshed")
+
+    # Grant lightrag tables (SELECT)
+    for tbl in LIGHTRAG_TABLES:
+        sql_lg = f"GRANT SELECT ON public.{tbl} TO {role};"
+        run_ax42_psql(sql_lg, db_pwd=admin_pwd)
+    log(f"  Granted SELECT on {len(LIGHTRAG_TABLES)} lightrag tables")
+
+    # Grant meridian schema read tables (SELECT on all)
+    sql_mer = f"GRANT USAGE ON SCHEMA meridian TO {role}; GRANT SELECT ON ALL TABLES IN SCHEMA meridian TO {role};"
+    rc, out, err = run_ax42_psql(sql_mer, db_pwd=admin_pwd)
+    if rc != 0:
+        log(f"  WARN: meridian grant: {err}")
+    else:
+        log(f"  Granted SELECT on meridian.* tables")
+
+    # Write password file (mode 600)
+    rc, _, err = run_ax102(
+        f"mkdir -p {CREDS_DB_DIR} && "
+        f"echo -n '{new_pwd}' > '{pwd_path}' && "
+        f"chmod 600 '{pwd_path}'"
+    )
+    if rc != 0:
+        sys.exit(f"ERROR: writing password file: {err}")
+    log(f"  Password stored at {pwd_path} (mode 600)")
+
+    audit_emit(name, "db_role_created", {"role": role, "pwd_path": pwd_path}, dry_run=False)
+    return new_pwd
+
+
+# ─── step 2: openclaw.json memory wiring ──────────────────────────────────────
+
+def step_openclaw_json(name: str, dry_run: bool) -> None:
+    """
+    Add/update memorySearch block and hooks.internal.entries for:
+    - session-auto-recall (recall_v5)
+    - session-embed
+    - pgvector-embed
+    - compaction-capture
+    - inbox-auto-inject (keep existing if present)
+    Add memory_type_allowlist to agents.defaults.
+    Remove any recall_v2 references.
+    """
+    cfg_path = f"{AGENT_DIR_TMPL.format(name=name)}/openclaw.json"
+    log(f"Step 2: openclaw.json → {cfg_path}")
+
+    # Safety: file must exist
+    rc, out, _ = run_ax102(f"test -f '{cfg_path}' && echo EXISTS || echo MISSING")
+    if out.strip() != "EXISTS":
+        sys.exit(
+            f"ERROR: {cfg_path} does not exist. "
+            "Run provision-base first before wiring memory."
+        )
+
+    # Read current config
+    rc, out, err = run_ax102(f"cat '{cfg_path}'")
+    if rc != 0:
+        sys.exit(f"ERROR: cannot read {cfg_path}: {err}")
+
+    try:
+        cfg: dict[str, Any] = json.loads(out)
+    except json.JSONDecodeError as e:
+        sys.exit(f"ERROR: invalid JSON in {cfg_path}: {e}")
+
+    changed = False
+
+    # --- memorySearch block ---
+    agents_block = cfg.setdefault("agents", {})
+    defaults = agents_block.setdefault("defaults", {})
+
+    mem_search = defaults.get("memorySearch", {})
+    desired_mem_search = {
+        "sources": ["memory", "sessions"],
+        "experimental": {"sessionMemory": True},
+        "provider": "gemini",
+        "model": "gemini-embedding-2-preview",
+        "sync": {
+            "sessions": {
+                "deltaBytes": 500000,
+                "deltaMessages": 200,
+            }
+        },
+        "query": {
+            "hybrid": {
+                "enabled": True,
+                "vectorWeight": 0.7,
+                "textWeight": 0.3,
+                "candidateMultiplier": 4,
+            }
+        },
+    }
+    if mem_search != desired_mem_search:
+        defaults["memorySearch"] = desired_mem_search
+        log(f"  Set agents.defaults.memorySearch (provider=gemini, hybridQuery enabled)")
+        changed = True
+    else:
+        log(f"  memorySearch already correct — skip")
+
+    # --- memory_type_allowlist ---
+    if defaults.get("memory_type_allowlist") != MEMORY_TYPE_ALLOWLIST:
+        defaults["memory_type_allowlist"] = MEMORY_TYPE_ALLOWLIST
+        log(f"  Set memory_type_allowlist ({len(MEMORY_TYPE_ALLOWLIST)} types, ontology v2.2)")
+        changed = True
+
+    # --- default importance ---
+    if defaults.get("memory_importance_default") != "normal":
+        defaults["memory_importance_default"] = "normal"
+        changed = True
+
+    # --- auto-recall throttle ---
+    desired_recall_throttle = {
+        "max_calls_per_30s": 1,
+        "max_inject_chars": 5000,
+    }
+    if defaults.get("recall_throttle") != desired_recall_throttle:
+        defaults["recall_throttle"] = desired_recall_throttle
+        log(f"  Set recall_throttle (max 1 call/30s, 5K chars)")
+        changed = True
+
+    # --- hooks.internal.entries ---
+    hooks = cfg.setdefault("hooks", {})
+    internal = hooks.setdefault("internal", {})
+    entries = internal.setdefault("entries", {})
+
+    # Ensure load.extraDirs includes shared hooks
+    load = internal.setdefault("load", {})
+    extra_dirs = load.setdefault("extraDirs", [])
+    if "/opt/gcg/shared/hooks" not in extra_dirs:
+        extra_dirs.append("/opt/gcg/shared/hooks")
+        changed = True
+
+    # Required internal hooks — idempotent merge
+    hook_env = {"HOOK_AGENT_ID": name}
+    required_hooks = {
+        "session-auto-recall": {"enabled": True, "env": hook_env},
+        "pgvector-embed":      {"enabled": True, "env": hook_env},
+        "session-embed":       {"enabled": True, "env": hook_env},
+        "compaction-capture":  {"enabled": True, "env": hook_env},
+        "inbox-auto-inject":   {"enabled": True, "env": hook_env},
+    }
+    for hook_name, hook_cfg in required_hooks.items():
+        existing = entries.get(hook_name, {})
+        if existing.get("enabled") != True or existing.get("env", {}).get("HOOK_AGENT_ID") != name:
+            entries[hook_name] = hook_cfg
+            log(f"  Wired hook: {hook_name}")
+            changed = True
+
+    # Remove deprecated recall_v2 anywhere in hooks
+    cfg_text = json.dumps(cfg)
+    if "recall_v2" in cfg_text:
+        # Walk and replace recall_v2 with recall_v5
+        cfg_text_fixed = cfg_text.replace("recall_v2", "recall_v5")
+        cfg = json.loads(cfg_text_fixed)
+        log(f"  Replaced recall_v2 → recall_v5")
+        changed = True
+
+    if not changed:
+        log(f"  openclaw.json already fully wired — no changes needed")
+        return
+
+    new_json = json.dumps(cfg, indent=2)
+
+    if dry_run:
+        log(f"  [DRY-RUN] Would write updated openclaw.json ({len(new_json)} bytes)")
+        log(f"  [DRY-RUN] memorySearch sample:")
+        sample = {
+            "agents": {
+                "defaults": {
+                    "memorySearch": desired_mem_search,
+                    "memory_type_allowlist": MEMORY_TYPE_ALLOWLIST,
+                    "recall_throttle": desired_recall_throttle,
+                }
+            },
+            "hooks": {
+                "internal": {
+                    "entries": {k: v for k, v in required_hooks.items()}
+                }
+            }
+        }
+        log(json.dumps(sample, indent=4))
+        return
+
+    # Backup then write
+    backup(cfg_path)
+    # Write via heredoc to avoid shell quoting issues with JSON
+    escaped = new_json.replace("\\", "\\\\").replace("'", "'\\''")
+    write_cmd = f"cat > '{cfg_path}' << 'GCGEOF'\n{new_json}\nGCGEOF"
+    rc, _, err = run_ax102(write_cmd)
+    if rc != 0:
+        # Fallback: use python3 to write
+        py_write = (
+            f"python3 -c \""
+            f"import json; "
+            f"open('{cfg_path}', 'w').write(json.dumps(json.loads(open('{cfg_path}.bak.{int(time.time()-5)}').read()), indent=2))"
+            f"\""
+        )
+        # Actually write the new content via python3 stdin
+        rc2, _, err2 = run_ax102(
+            f"python3 -c \""
+            f"import sys, json; "
+            f"data = json.loads(sys.stdin.read()); "
+            f"open('{cfg_path}', 'w').write(json.dumps(data, indent=2))"
+            f"\" <<'PYEOF'\n{new_json}\nPYEOF"
+        )
+        if rc2 != 0:
+            sys.exit(f"ERROR: write openclaw.json failed: {err2}")
+    log(f"  Wrote updated openclaw.json")
+
+
+# ─── step 3: workspace memory layer ───────────────────────────────────────────
+
+def step_workspace_memory(name: str, dry_run: bool, backfill: bool) -> None:
+    """
+    Ensure workspace/memory/ exists.
+    Write workspace/memory/MEMORY.md index if missing.
+    Write today's heartbeat file.
+    Optionally backfill existing .md files via memory CLI.
+    """
+    agent_dir = AGENT_DIR_TMPL.format(name=name)
+    mem_dir = f"{agent_dir}/workspace/memory"
+    today = date.today().strftime("%Y-%m-%d")
+    memory_index_path = f"{mem_dir}/MEMORY.md"
+    heartbeat_path = f"{mem_dir}/{today}.md"
+
+    log(f"Step 3: workspace memory layer → {mem_dir}")
+
+    if dry_run:
+        log(f"  [DRY-RUN] mkdir -p {mem_dir}")
+        log(f"  [DRY-RUN] create {memory_index_path} if missing")
+        log(f"  [DRY-RUN] create {heartbeat_path}")
+        if backfill:
+            log(f"  [DRY-RUN] would scan *.md and POST non-duplicate files via memory CLI")
+        return
+
+    # Ensure directory
+    rc, _, err = run_ax102(f"mkdir -p '{mem_dir}'")
+    if rc != 0:
+        log(f"  WARN: mkdir failed: {err}")
+
+    # MEMORY.md index
+    rc2, out2, _ = run_ax102(f"test -f '{memory_index_path}' && echo EXISTS || echo MISSING")
+    if out2.strip() == "MISSING":
+        index_content = f"""# Memory Index — {name}
+
+Auto-generated by provision-memory.py on {today}.
+This file is the index for all workspace memory files.
+
+## Contents
+- Daily notes: YYYY-MM-DD.md
+- Domain-specific notes: <topic>.md
+
+## Memory Types (Ontology v2.2)
+fact | lesson | decision | knowledge | preference | incident | session_index | workspace_note
+
+## Notes
+- Memory is persisted to pgvector via the session-embed and pgvector-embed hooks.
+- Recall uses recall_v5 (hybrid vector+BM25) with top-K=10 by default.
+- DO NOT put credentials or tokens in this directory.
+"""
+        run_ax102(f"cat > '{memory_index_path}' << 'GCGEOF'\n{index_content}\nGCGEOF")
+        log(f"  Created {memory_index_path}")
+    else:
+        log(f"  {memory_index_path} already exists — skip")
+
+    # Daily heartbeat
+    rc3, out3, _ = run_ax102(f"test -f '{heartbeat_path}' && echo EXISTS || echo MISSING")
+    if out3.strip() == "MISSING":
+        heartbeat_content = f"""# {today} — {name}
+
+Provisioned: {time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+## Session Log
+<!-- Append session notes here. Auto-captured to pgvector on compaction. -->
+
+## Decisions
+<!-- Record key decisions made today. -->
+
+## Lessons
+<!-- Record lessons learned. -->
+"""
+        run_ax102(f"cat > '{heartbeat_path}' << 'GCGEOF'\n{heartbeat_content}\nGCGEOF")
+        log(f"  Created heartbeat {heartbeat_path}")
+    else:
+        log(f"  {heartbeat_path} already exists — skip")
+
+    # Optional backfill
+    if backfill:
+        _step_backfill_workspace(name, mem_dir, admin_pwd="")
+
+
+def _step_backfill_workspace(name: str, mem_dir: str, admin_pwd: str) -> None:
+    """Scan workspace/memory/*.md and POST files not already in DB."""
+    log(f"  Backfill: scanning {mem_dir}/*.md ...")
+    rc, out, _ = run_ax102(f"ls '{mem_dir}'/*.md 2>/dev/null || echo ''")
+    if rc != 0 or not out.strip():
+        log(f"  Backfill: no .md files found")
+        return
+
+    md_files = [f.strip() for f in out.strip().split("\n") if f.strip().endswith(".md")]
+    log(f"  Backfill: found {len(md_files)} .md files")
+
+    admin_pwd_val = admin_pwd or get_admin_db_pwd()
+
+    for fpath in md_files:
+        # Get file content to compute sha256
+        rc2, content, _ = run_ax102(f"cat '{fpath}' 2>/dev/null")
+        if rc2 != 0 or not content.strip():
+            continue
+        sha = sha256_hex(content)
+
+        # Check if already in memories.content_hash
+        rc3, out3, _ = run_ax42_psql(
+            f"SELECT 1 FROM public.memories WHERE content_hash='{sha}' AND agent_name='{name}' LIMIT 1;",
+            db_pwd=admin_pwd_val,
+        )
+        already_exists = "(1 row)" in out3 or "1 row" in out3
+
+        if already_exists:
+            log(f"    Skip (already in DB): {fpath}")
+            continue
+
+        # POST via memory CLI
+        rc4, out4, err4 = run_ax102(
+            f"'{MEMORY_CLI}' capture --file '{fpath}' --agent '{name}' "
+            f"--source-type workspace_note --memory-type workspace_note "
+            f"--importance normal 2>&1"
+        )
+        if rc4 != 0:
+            log(f"    WARN: capture failed for {fpath}: {err4}")
+        else:
+            log(f"    Captured: {fpath}")
+
+
+# ─── step 4: recall config ─────────────────────────────────────────────────────
+
+def step_recall_config(name: str, dry_run: bool) -> None:
+    """
+    Write /opt/gcg/shared/gcg_tools/config/<name>.yaml.
+    This config is used by recall_v5 and by mnemosyne's audit sweep.
+    """
+    config_path = f"{RECALL_CONFIG_DIR}/{name}.yaml"
+    log(f"Step 4: recall config → {config_path}")
+
+    # Check existing
+    rc, out, _ = run_ax102(f"test -f '{config_path}' && echo EXISTS || echo MISSING")
+    if out.strip() == "EXISTS":
+        log(f"  {config_path} already exists — idempotent skip")
+        return
+
+    yaml_content = f"""agent_id: {name}
+display_name: "{name.capitalize()}"
+model: deepseek/deepseek-v4-flash
+domain: general
+
+auto_recall_queries:
+  - "recent tasks decisions lessons for {name}"
+  - "relevant facts preferences procedures"
+  - "fleet operations GCG knowledge"
+
+description: >
+  {name.capitalize()} — GCG OpenClaw fleet agent.
+  Auto-generated by provision-memory.py on {date.today().isoformat()}.
+
+default_top_k: 10
+recall_throttle:
+  max_calls_per_30s: 1
+  max_inject_chars: 5000
+
+source_types_read:
+  - fact
+  - knowledge
+  - lesson
+  - decision
+  - preference
+  - session_index
+  - workspace_note
+  - gcg_knowledge
+  - constitution
+
+source_types_write:
+  - fact
+  - lesson
+  - decision
+  - session_index
+  - workspace_note
+
+default_scope:
+  type: agent
+  id: {name}
+"""
+
+    if dry_run:
+        log(f"  [DRY-RUN] Would write {config_path}")
+        log(yaml_content)
+        return
+
+    run_ax102(f"mkdir -p '{RECALL_CONFIG_DIR}'")
+    run_ax102(f"cat > '{config_path}' << 'GCGEOF'\n{yaml_content}\nGCGEOF")
+    log(f"  Wrote {config_path}")
+
+
+# ─── step 5: mnemosyne registration ───────────────────────────────────────────
+
+def step_mnemosyne_registration(name: str, dry_run: bool) -> None:
+    """
+    Register agent with mnemosyne's audit sweep.
+
+    Discovery: mnemosyne has NO watched-agents.json. It discovers agents by:
+      1. Reading FLEET.yaml (agents section).
+      2. Scanning /opt/gcg/shared/gcg_tools/config/*.yaml for recall configs.
+    Both are handled by steps 3+4. This step adds a sentinel comment to
+    the recall config indicating mnemosyne should sweep, and also emits a
+    fleet-inbox message to mnemosyne (informational, no restart).
+
+    Does NOT restart mnemosyne.
+    """
+    log(f"Step 5: mnemosyne registration for {name}")
+
+    # The recall config at step 4 is the primary registration mechanism.
+    # Additionally write a lightweight watched-agents entry.
+    watched_path = f"/opt/gcg/openclaw-mnemosyne/workspace/config/watched-agents.json"
+
+    rc, out, _ = run_ax102(f"test -d /opt/gcg/openclaw-mnemosyne/workspace/config && echo EXISTS || echo MISSING")
+    config_dir_exists = out.strip() == "EXISTS"
+
+    rc2, out2, _ = run_ax102(f"test -f '{watched_path}' && cat '{watched_path}' 2>/dev/null || echo 'MISSING'")
+    watched_exists = out2.strip() != "MISSING" and out2.strip() != ""
+
+    if dry_run:
+        if config_dir_exists:
+            log(f"  [DRY-RUN] Would add {name} to {watched_path}")
+        else:
+            log(f"  [DRY-RUN] mnemosyne/workspace/config/ does not exist — registration via recall config + FLEET.yaml only")
+        log(f"  [DRY-RUN] recall config {RECALL_CONFIG_DIR}/{name}.yaml serves as mnemosyne discovery marker")
+        return
+
+    if config_dir_exists:
+        # Load or init watched-agents.json
+        if watched_exists:
+            try:
+                watched = json.loads(out2)
+            except Exception:
+                watched = {"agents": []}
+        else:
+            watched = {"agents": []}
+
+        agents_list = watched.setdefault("agents", [])
+        existing_names = [a.get("name") for a in agents_list if isinstance(a, dict)]
+        if name not in existing_names:
+            agents_list.append({
+                "name": name,
+                "registered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "recall_config": f"{RECALL_CONFIG_DIR}/{name}.yaml",
+            })
+            new_json = json.dumps(watched, indent=2)
+            run_ax102(f"cat > '{watched_path}' << 'GCGEOF'\n{new_json}\nGCGEOF")
+            log(f"  Added {name} to {watched_path}")
+        else:
+            log(f"  {name} already in {watched_path} — skip")
+    else:
+        log(f"  mnemosyne/workspace/config/ absent — using FLEET.yaml + recall config as discovery (standard pattern)")
+
+    # Inform mnemosyne via fleet inbox (fire-and-forget, no ack required)
+    msg = f"Memory provisioned for new agent: {name}. Recall config at {RECALL_CONFIG_DIR}/{name}.yaml. Please begin audit sweep when convenient."
+    rc3, _, _ = run_ax102(f"'{MEMORY_CLI.replace('memory', '')}../bin/fleet' send mnemosyne '{msg}' 2>/dev/null || true")
+    log(f"  Fleet inbox message sent to mnemosyne (informational)")
+
+
+# ─── step 6: FLEET.yaml memory tag ────────────────────────────────────────────
+
+def step_fleet_yaml_tag(name: str, dry_run: bool) -> None:
+    """
+    Add memory: wired to agents.<name> block in FLEET.yaml.
+    Uses python3 yaml on AX102 for safe atomic edit.
+    """
+    log(f"Step 6: FLEET.yaml memory tag")
+
+    rc, out, _ = run_ax102(f"test -f '{FLEET_YAML}' && echo EXISTS || echo MISSING")
+    if out.strip() == "MISSING":
+        log(f"  WARN: {FLEET_YAML} not found — skip FLEET.yaml update")
+        return
+
+    # Check if already tagged
+    rc2, out2, _ = run_ax102(
+        f"python3 -c \""
+        f"import yaml; d=yaml.safe_load(open('{FLEET_YAML}')); "
+        f"a=d.get('agents',{{}}).get('{name}',{{}}); "
+        f"print(a.get('memory',''))\""
+    )
+    if out2.strip() == "wired":
+        log(f"  Already tagged memory=wired in FLEET.yaml — skip")
+        return
+
+    if dry_run:
+        log(f"  [DRY-RUN] Would tag agents.{name}.memory = wired in {FLEET_YAML}")
+        return
+
+    backup_cmd = f"cp -a '{FLEET_YAML}' '{FLEET_YAML}.bak.{int(time.time())}'"
+    run_ax102(backup_cmd)
+
+    patch_script = f"""
+import yaml
+with open('{FLEET_YAML}') as f:
+    d = yaml.safe_load(f)
+agents = d.setdefault('agents', {{}})
+if '{name}' in agents and isinstance(agents['{name}'], dict):
+    agents['{name}']['memory'] = 'wired'
+elif '{name}' in agents:
+    pass  # scalar entry, skip gracefully
+with open('{FLEET_YAML}', 'w') as f:
+    yaml.dump(d, f, default_flow_style=False, allow_unicode=True)
+print('OK')
+"""
+    py_escaped = patch_script.replace('"', '\\"').replace('\n', '\\n')
+    rc3, out3, err3 = run_ax102(f'python3 -c "{py_escaped}"')
+    if "OK" in out3:
+        log(f"  Tagged agents.{name}.memory = wired in FLEET.yaml")
+    else:
+        log(f"  WARN: FLEET.yaml update may have failed: {err3}")
+
+
+# ─── step 7: final QA ──────────────────────────────────────────────────────────
+
+def step_qa(name: str, dry_run: bool) -> bool:
+    """Run gcg-agent-qa <name> --check --no-color, verify Tier 4 GREEN."""
+    log(f"Step 7: QA check")
+
+    if dry_run:
+        log(f"  [DRY-RUN] Would run: {QA_BIN} {name} --check --no-color")
+        return True
+
+    rc, out, err = run_ax102(f"'{QA_BIN}' '{name}' --check --no-color 2>&1", timeout=30)
+    output = (out + err).strip()
+
+    # Print full QA output
+    for line in output.splitlines():
+        log(f"  QA: {line}")
+
+    # Check Tier 4 result
+    tier4_pass = False
+    for line in output.splitlines():
+        if "tier 4" in line.lower() or "Tier 4" in line:
+            if "PASS" in line:
+                tier4_pass = True
+            elif "WARN" in line or "FAIL" in line:
+                tier4_pass = False
+                break
+
+    if tier4_pass:
+        log(f"  Tier 4 memory: GREEN (PASS)")
+    else:
+        log(f"  WARN: Tier 4 memory not fully GREEN — check QA output above")
+
+    return tier4_pass
+
+
+# ─── main ──────────────────────────────────────────────────────────────────────
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        prog="provision-memory.py",
+        description="Tier 4 memory wiring for a new GCG OpenClaw agent.",
+    )
+    p.add_argument("name", help="Agent name (e.g. nova, nik, daen)")
+    p.add_argument("--dry-run", action="store_true", help="Print plan, mutate nothing")
+    p.add_argument("--force", action="store_true", help="Required for critical-6 agents")
+    p.add_argument(
+        "--backfill-workspace",
+        action="store_true",
+        help="Scan workspace/memory/*.md and POST non-duplicate files to pgvector",
+    )
+    args = p.parse_args()
+
+    name = args.name.lower().strip()
+    dry_run = args.dry_run
+
+    # Critical-6 protection
+    if name in CRITICAL_6 and not args.force:
+        sys.exit(
+            f"ERROR: {name} is a critical-6 agent. "
+            "Pass --force to confirm you intend to modify this agent."
+        )
+
+    log(f"{'[DRY-RUN] ' if dry_run else ''}Starting memory provisioning for agent: {name}")
+    log(f"  Date: {date.today().isoformat()}")
+    log(f"  Critical-6: {name in CRITICAL_6}")
+    log(f"  Backfill workspace: {args.backfill_workspace}")
+
+    start = time.time()
+    audit_emit(name, "provision_start", {"dry_run": dry_run}, dry_run)
+
+    # Step 1: DB role
+    if dry_run:
+        log("\n--- Step 1: DB Role (AX42) ---")
+        admin_pwd = "DRY_RUN_NO_PWD"
+        step_db_role(name, dry_run=True, admin_pwd=admin_pwd)
+    else:
+        log("\n--- Step 1: DB Role (AX42) ---")
+        admin_pwd = get_admin_db_pwd()
+        step_db_role(name, dry_run=False, admin_pwd=admin_pwd)
+
+    # Step 2: openclaw.json
+    log("\n--- Step 2: openclaw.json memory wiring ---")
+    step_openclaw_json(name, dry_run)
+
+    # Step 3: workspace memory layer
+    log("\n--- Step 3: Workspace memory layer ---")
+    step_workspace_memory(name, dry_run, backfill=args.backfill_workspace)
+
+    # Step 4: recall config
+    log("\n--- Step 4: Recall config ---")
+    step_recall_config(name, dry_run)
+
+    # Step 5: mnemosyne registration
+    log("\n--- Step 5: Mnemosyne registration ---")
+    step_mnemosyne_registration(name, dry_run)
+
+    # Step 6: FLEET.yaml tag
+    log("\n--- Step 6: FLEET.yaml memory tag ---")
+    step_fleet_yaml_tag(name, dry_run)
+
+    # Step 7: QA
+    log("\n--- Step 7: Final QA ---")
+    qa_ok = step_qa(name, dry_run)
+
+    elapsed = time.time() - start
+    status = "ok" if (qa_ok or dry_run) else "warn_qa"
+    audit_emit(name, "provision_complete", {
+        "elapsed_s": round(elapsed, 1),
+        "qa_tier4": "pass" if qa_ok else "warn",
+        "dry_run": dry_run,
+    }, dry_run)
+
+    log(f"\nDone in {elapsed:.1f}s — status={status}")
+    if not dry_run and not qa_ok:
+        log("  ACTION NEEDED: Tier 4 QA not GREEN. Review output above.")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
