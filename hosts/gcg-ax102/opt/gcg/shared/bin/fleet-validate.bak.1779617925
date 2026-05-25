@@ -101,9 +101,7 @@ def validate_agent(name, declared, live, banned_models=None):
     o = live.get("openclaw_json") or {}
     gw_empty = o.get("gateway_token_empty", False)
     hk_empty = o.get("hooks_token_empty", False)
-    gw_sha = o.get("gateway_token_sha")
-    hk_sha = o.get("hooks_token_sha")
-    if gw_sha and hk_sha and not gw_empty and not hk_empty and gw_sha == hk_sha:
+    if not gw_empty and not hk_empty and o.get("gateway_token_sha") == o.get("hooks_token_sha"):
         findings.append(("FATAL", "hooks.token == gateway.auth.token (crash loop risk)"))
 
     # openclaw_json missing

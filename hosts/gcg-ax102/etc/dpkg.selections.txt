@@ -3,6 +3,7 @@ acl						install
 acpid						install
 adduser						install
 adwaita-icon-theme				install
+age						install
 aide						install
 aide-common					install
 amd64-microcode					install

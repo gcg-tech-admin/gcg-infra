@@ -1,0 +1,1117 @@
+#!/usr/bin/env python3
+"""
+gcg-provision-base — Tier 1 (identity), Tier 2 (security), Tier 3 (model routing),
+                      Tier 7 (systemd) provisioner for OpenClaw fleet agents.
+
+Usage:
+  gcg-provision-base <name> --tier {A|B|C|D} [--role "<role>"] [--dry-run]
+                     [--no-systemd] [--backup-only] [--force] [--start]
+
+Spec:    /opt/gcg/shared/AGENT_SPEC.md
+Playbook: /opt/gcg/shared/AGENT_DEPLOYMENT_PLAYBOOK.md
+QA tool: /opt/gcg/shared/bin/gcg-agent-qa
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+# ─── constants ────────────────────────────────────────────────────────────────
+
+AGENT_BASE     = "/opt/gcg/openclaw-{name}"
+SHARED_BIN     = "/opt/gcg/shared/bin"
+FLEET_YAML     = "/opt/gcg/shared/FLEET.yaml"
+CREDSTORE_DIR  = "/etc/credstore.encrypted"
+SYSTEMD_DIR    = "/etc/systemd/system"
+AUDIT_LOG      = "/var/log/gcg-provision/base.log"
+BOOTSTRAP_SCRIPT = f"{SHARED_BIN}/gcg-secret-bootstrap.sh"
+VALIDATE_SCRIPT  = "/opt/gcg/shared/scripts/validate-agent-config.py"
+
+CRITICAL_6 = {"daen", "talos", "marcus", "mnemosyne", "vulcan", "nik"}
+VALID_TIERS = {"A", "B", "C", "D"}
+
+# Ports are assigned sequentially; base is 18800, each agent gets a unique port.
+# Provisioner auto-assigns the next free port (reads existing FLEET.yaml entries).
+PORT_BASE = 18800
+
+# Name validation: kebab-case, lowercase alphanumeric + hyphen, 2–32 chars
+NAME_RE = re.compile(r'^[a-z][a-z0-9\-]{1,31}$')
+
+# ─── model routing tables ────────────────────────────────────────────────────
+
+PROVIDER_BLOCKS: dict[str, dict] = {
+    "deepseek": {
+        "baseUrl": "https://api.deepseek.com/v1",
+        "apiKey": "env:DEEPSEEK_API_KEY",
+        "api": "openai-completions",
+        "models": [
+            {"id": "deepseek-v4-pro",   "name": "DeepSeek V4 Pro"},
+            {"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash"},
+        ],
+    },
+    "moonshot": {
+        "baseUrl": "https://api.moonshot.cn/v1",
+        "apiKey": "env:MOONSHOT_API_KEY",
+        "api": "openai-completions",
+        "models": [
+            {"id": "kimi-k2.6", "name": "Kimi K2.6"},
+        ],
+    },
+    "amazon-bedrock": {
+        "api": "amazon-bedrock",
+        "region": "us-east-1",
+        "models": [
+            {"id": "us.anthropic.claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (Bedrock)"},
+        ],
+    },
+    "anthropic": {
+        "apiKey": "env:ANTHROPIC_API_KEY",
+        "api": "anthropic",
+        "models": [
+            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6"},
+            {"id": "claude-opus-4-6",   "name": "Claude Opus 4.6"},
+        ],
+    },
+    "openai-codex": {
+        "api": "openai-codex",
+        "models": [
+            {"id": "gpt-5.5", "name": "GPT-5.5"},
+        ],
+    },
+    "google": {
+        "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "apiKey": "env:GOOGLE_API_KEY",
+        "api": "openai-completions",
+        "models": [
+            {"id": "gemini-3.5-flash",       "name": "Gemini 3.5 Flash"},
+            {"id": "gemini-3.1-pro-preview",  "name": "Gemini 3.1 Pro Preview"},
+            {"id": "gemini-embedding-2-preview", "name": "Gemini Embedding 2 Preview"},
+        ],
+    },
+    "openai": {
+        "apiKey": "env:OPENAI_API_KEY",
+        "api": "openai-completions",
+        "models": [
+            {"id": "gpt-5.5", "name": "GPT-5.5"},
+        ],
+    },
+}
+
+# Auth-profile templates (mode declarations; actual keys are injected at runtime by bootstrap)
+AUTH_PROFILES: dict[str, dict] = {
+    "anthropic:default":    {"provider": "anthropic",    "mode": "api_key"},
+    "deepseek:default":     {"provider": "deepseek",     "mode": "api_key"},
+    "moonshot:default":     {"provider": "moonshot",     "mode": "api_key"},
+    "google:default":       {"provider": "google",       "mode": "api_key"},
+    "openai:default":       {"provider": "openai",       "mode": "api_key"},
+    "openai-codex:peter@global-capital-group.com": {
+        "provider": "openai-codex", "mode": "oauth"
+    },
+}
+
+
+def model_config_for_tier(tier: str, sub: str | None = None) -> dict:
+    """
+    Returns:
+      primary, fallbacks, providers_needed, auth_profiles_needed,
+      thinking_default, aws_bedrock
+    """
+    base = {
+        "thinking_default": "high",   # set whenever deepseek is in the stack
+        "aws_bedrock": False,
+    }
+
+    if tier == "A":
+        return {**base,
+            "primary":   "amazon-bedrock/us.anthropic.claude-sonnet-4-6",
+            "fallbacks": ["moonshot/kimi-k2.6", "deepseek/deepseek-v4-pro"],
+            "providers_needed": ["amazon-bedrock", "moonshot", "deepseek"],
+            "auth_profiles_needed": ["deepseek:default", "moonshot:default"],
+            "aws_bedrock": True,
+        }
+
+    if tier == "B":
+        return {**base,
+            "primary":   "moonshot/kimi-k2.6",
+            "fallbacks": ["deepseek/deepseek-v4-pro"],
+            "providers_needed": ["moonshot", "deepseek"],
+            "auth_profiles_needed": ["deepseek:default", "moonshot:default"],
+        }
+
+    if tier == "C":
+        # Sub-variant must be specified: "talos" (oauth codex) or "vulcan" (direct anthropic)
+        if sub == "talos":
+            return {**base,
+                "primary":   "openai-codex/gpt-5.5",
+                "fallbacks": ["moonshot/kimi-k2.6", "deepseek/deepseek-v4-pro"],
+                "providers_needed": ["openai-codex", "moonshot", "deepseek"],
+                "auth_profiles_needed": [
+                    "deepseek:default", "moonshot:default",
+                    "openai-codex:peter@global-capital-group.com",
+                ],
+            }
+        # vulcan / generic C-anthropic
+        return {**base,
+            "primary":   "anthropic/claude-sonnet-4-6",
+            "fallbacks": ["moonshot/kimi-k2.6", "deepseek/deepseek-v4-pro"],
+            "providers_needed": ["anthropic", "moonshot", "deepseek"],
+            "auth_profiles_needed": [
+                "anthropic:default", "deepseek:default", "moonshot:default",
+            ],
+        }
+
+    if tier == "D":
+        return {**base,
+            "primary":   "moonshot/kimi-k2.6",
+            "fallbacks": ["deepseek/deepseek-v4-pro"],
+            "providers_needed": ["moonshot", "deepseek", "anthropic"],
+            "auth_profiles_needed": [
+                "anthropic:default", "deepseek:default", "moonshot:default",
+            ],
+            # Opus dispatch is wired in subagents section by provision-integrations
+        }
+
+    raise ValueError(f"Unknown tier: {tier!r}")
+
+
+# ─── helpers ─────────────────────────────────────────────────────────────────
+
+def log(msg: str, level: str = "INFO") -> None:
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    prefix = {"INFO": "", "WARN": "WARN: ", "ERROR": "ERROR: "}.get(level, "")
+    print(f"[{ts}] {prefix}{msg}", file=sys.stderr if level == "ERROR" else sys.stdout)
+
+
+def die(msg: str) -> None:
+    log(msg, "ERROR")
+    sys.exit(1)
+
+
+def gen_token() -> str:
+    """Generate a unique 64-char (32-byte) hex token."""
+    return secrets.token_hex(32)
+
+
+def backup_file(path: str | Path) -> str | None:
+    p = Path(path)
+    if not p.exists():
+        return None
+    bak = f"{p}.bak.{int(time.time())}"
+    import shutil
+    shutil.copy2(str(p), bak)
+    return bak
+
+
+def run(cmd: list[str], check: bool = True, capture: bool = False, timeout: int = 30) -> subprocess.CompletedProcess:
+    kw: dict[str, Any] = {"timeout": timeout}
+    if capture:
+        kw["capture_output"] = True
+        kw["text"] = True
+    return subprocess.run(cmd, check=check, **kw)
+
+
+def _load_fleet_yaml() -> dict:
+    try:
+        import yaml
+    except ImportError:
+        die("PyYAML required: pip install --break-system-packages pyyaml")
+    with open(FLEET_YAML) as f:
+        return yaml.safe_load(f)
+
+
+def _dump_fleet_yaml(data: dict, path: str) -> None:
+    try:
+        import yaml
+    except ImportError:
+        die("PyYAML required: pip install --break-system-packages pyyaml")
+    with open(path, "w") as f:
+        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+
+def next_free_port(fleet: dict) -> int:
+    used = set()
+    for agent_data in fleet.get("agents", {}).values():
+        if isinstance(agent_data, dict) and "port" in agent_data:
+            used.add(agent_data["port"])
+    port = PORT_BASE
+    while port in used:
+        port += 100
+    return port
+
+
+def credstore_add_line(key: str, value: str, dry_run: bool) -> None:
+    """
+    Append a key=value pair to /etc/credstore.encrypted/gateway-env via
+    systemd-creds re-encrypt workflow. We never write plaintext to disk;
+    the credstore file is host-bound encrypted.
+
+    Strategy:
+      1. systemd-creds decrypt <credstore>/gateway-env > tmpfile (tmpfs)
+      2. append KEY=VALUE
+      3. systemd-creds encrypt tmpfile > <credstore>/gateway-env.new
+      4. mv .new -> gateway-env
+    Note: tmpfile lives in /run (tmpfs). Plaintext never hits persistent storage.
+    """
+    credstore_path = Path(CREDSTORE_DIR) / "gateway-env"
+    tmp_plain = f"/run/gcg-provision-cred-tmp.{os.getpid()}"
+
+    if dry_run:
+        log(f"  [dry-run] would add {key} to {credstore_path}")
+        return
+
+    try:
+        # Decrypt current content to tmpfs
+        if credstore_path.exists():
+            result = subprocess.run(
+                ["systemd-creds", "decrypt", str(credstore_path), tmp_plain],
+                capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                # If credstore file uses unit-specific encryption, we may not be able
+                # to re-encrypt at provision time. Log warning and skip.
+                log(f"  WARN: systemd-creds decrypt failed for gateway-env: {result.stderr.strip()}", "WARN")
+                log("  Tokens must be injected manually via: systemd-creds encrypt", "WARN")
+                return
+        else:
+            # Create empty file
+            Path(tmp_plain).write_text("")
+
+        # Append the new key
+        with open(tmp_plain, "a") as f:
+            f.write(f"{key}={value}\n")
+
+        # Re-encrypt back into credstore
+        out_path = f"{credstore_path}.new"
+        result = subprocess.run(
+            ["systemd-creds", "encrypt", "--name=gateway-env", tmp_plain, out_path],
+            capture_output=True, text=True, check=False
+        )
+        if result.returncode != 0:
+            log(f"  WARN: systemd-creds encrypt failed: {result.stderr.strip()}", "WARN")
+        else:
+            os.rename(out_path, str(credstore_path))
+            log(f"  credstore: wrote {key}")
+
+    finally:
+        # Wipe plaintext from tmpfs
+        if Path(tmp_plain).exists():
+            Path(tmp_plain).write_bytes(b"\x00" * Path(tmp_plain).stat().st_size)
+            Path(tmp_plain).unlink()
+
+
+def audit_log(entry: dict) -> None:
+    try:
+        Path(AUDIT_LOG).parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        log(f"audit log write failed: {e}", "WARN")
+
+
+# ─── tier 1: identity ────────────────────────────────────────────────────────
+
+def tier1_identity(name: str, tier: str, role: str, fleet: dict,
+                   dry_run: bool, force: bool) -> list[str]:
+    """Create directory structure, write workspace placeholder, register in FLEET.yaml."""
+    touched: list[str] = []
+    agent_dir = Path(AGENT_BASE.format(name=name))
+    workspace  = agent_dir / "workspace"
+    mem_dir    = workspace / "memory"
+    logs_dir   = agent_dir / "logs"
+
+    # --- directory creation ---
+    for d in [agent_dir, workspace, mem_dir, logs_dir]:
+        if d.exists():
+            log(f"  exists: {d}")
+        else:
+            log(f"  mkdir: {d}")
+            if not dry_run:
+                d.mkdir(parents=True, mode=0o755, exist_ok=True)
+            touched.append(str(d))
+
+    # --- AGENTS.md placeholder ---
+    agents_md = workspace / "AGENTS.md"
+    if agents_md.exists() and not force:
+        log(f"  AGENTS.md already present, skipping (use --force to overwrite)")
+    else:
+        header = (
+            f"# {name.capitalize()} — Fleet Roster\n\n"
+            f"**Role:** {role or '(role not specified)'}\n"
+            f"**Tier:** {tier}\n"
+            f"**Provisioned:** {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n\n"
+            "<!-- canonical fleet block injected by gcg-provision-integrations -->\n"
+        )
+        log(f"  write: {agents_md}")
+        if not dry_run:
+            if agents_md.exists():
+                backup_file(agents_md)
+            agents_md.write_text(header)
+        touched.append(str(agents_md))
+
+    # --- FLEET.yaml registration ---
+    existing = fleet.get("agents", {}).get(name)
+    if existing and not force:
+        log(f"  FLEET.yaml: agents.{name} already registered, skipping (use --force)")
+    else:
+        port = next_free_port(fleet)
+        entry: dict = {
+            "title": role or "(provisioned)",
+            "group": "PROVISIONED",
+            "tier": tier,
+            "critical": name in CRITICAL_6,
+            "host": "ax102",
+            "port": port,
+            "workspace": str(workspace),
+            "agents_md": str(agents_md),
+            "db_role": f"gcg_{name}",
+            "keys": _keys_for_tier(tier),
+            "google_sa": False,
+            "anthropic_profile": True,
+            "heartbeat": {"every": "30m", "model": "deepseek/deepseek-v4-flash"},
+            "telegram_enabled": False,
+            "mcp_servers": [],
+            "memory_max": 4 * 1024 ** 3,   # 4G
+            "has_validator": True,
+            "op_sa_persisted": name in {"daen", "talos"},
+            "mission": role or "(set via gcg-provision-integrations)",
+            "capabilities": {},
+        }
+        log(f"  FLEET.yaml: would add agents.{name} (port {port})")
+        if dry_run:
+            log(f"  [dry-run] FLEET.yaml diff:\n    agents.{name}: {json.dumps(entry, indent=4)}")
+        else:
+            bak = backup_file(FLEET_YAML)
+            if bak:
+                log(f"  backed up FLEET.yaml → {bak}")
+            fleet.setdefault("agents", {})[name] = entry
+            _dump_fleet_yaml(fleet, FLEET_YAML)
+        touched.append(FLEET_YAML)
+
+    return touched
+
+
+def _keys_for_tier(tier: str) -> list[str]:
+    base = ["deepseek", "moonshot"]
+    if tier in ("C", "D"):
+        base.append("anthropic")
+    if tier == "A":
+        base.append("gemini")
+    return base
+
+
+# ─── tier 2: security ────────────────────────────────────────────────────────
+
+def tier2_security(name: str, dry_run: bool, force: bool,
+                   existing_cfg: dict | None) -> tuple[str, str, list[str]]:
+    """
+    Generate gateway + hooks tokens.
+    Returns (gateway_token, hooks_token, files_touched).
+    Tokens are unique 64-char hex strings that MUST differ.
+    Idempotent: if config already has 64-char tokens and --force not set, reuse them.
+    """
+    touched: list[str] = []
+
+    # Check if tokens already exist in config
+    if existing_cfg and not force:
+        g = (existing_cfg.get("gateway", {}) or {}).get("auth", {}).get("token", "")
+        h = (existing_cfg.get("hooks", {}) or {}).get("token", "")
+        if len(g) == 64 and len(h) == 64 and g != h:
+            log(f"  security: reusing existing 64-char tokens (--force to rotate)")
+            return g, h, touched
+
+    # Generate fresh tokens, ensure they differ
+    gateway_token = gen_token()
+    hooks_token   = gen_token()
+    while hooks_token == gateway_token:
+        hooks_token = gen_token()
+
+    name_upper = name.upper()
+    log(f"  security: generated fresh tokens for {name}")
+    log(f"    GATEWAY_TOKEN_{name_upper}: {gateway_token[:12]}...")
+    log(f"    HOOKS_TOKEN_{name_upper}:   {hooks_token[:12]}...")
+
+    # Inject into credstore (gateway-env)
+    credstore_add_line(f"GATEWAY_TOKEN_{name_upper}", gateway_token, dry_run)
+    credstore_add_line(f"HOOKS_TOKEN_{name_upper}",   hooks_token,   dry_run)
+    touched.append(f"{CREDSTORE_DIR}/gateway-env")
+
+    return gateway_token, hooks_token, touched
+
+
+# ─── tier 3: model routing ───────────────────────────────────────────────────
+
+def tier3_build_openclaw_json(name: str, tier: str, role: str,
+                               gateway_token: str, hooks_token: str,
+                               tier_sub: str | None,
+                               fleet: dict, existing_cfg: dict | None,
+                               dry_run: bool, force: bool) -> tuple[dict, list[str]]:
+    """Build the full openclaw.json for the agent. Returns (config_dict, files_touched)."""
+    touched: list[str] = []
+    agent_dir = Path(AGENT_BASE.format(name=name))
+    cfg_path  = agent_dir / "openclaw.json"
+
+    if cfg_path.exists() and not force:
+        log(f"  openclaw.json already exists, skipping (use --force to regenerate)")
+        return existing_cfg or {}, touched
+
+    mc = model_config_for_tier(tier, tier_sub)
+
+    # Build providers block — only include providers needed for this tier
+    providers = {}
+    for p in mc["providers_needed"]:
+        if p in PROVIDER_BLOCKS:
+            providers[p] = PROVIDER_BLOCKS[p]
+
+    # Build auth.profiles block
+    auth_profiles = {}
+    for profile_key in mc["auth_profiles_needed"]:
+        if profile_key in AUTH_PROFILES:
+            auth_profiles[profile_key] = AUTH_PROFILES[profile_key]
+
+    # Also include google:default for gemini embedding (memorySearch)
+    if "google:default" not in auth_profiles:
+        auth_profiles["google:default"] = AUTH_PROFILES["google:default"]
+
+    # Assign port from FLEET.yaml (already set in tier1)
+    fleet_entry = fleet.get("agents", {}).get(name, {})
+    port = fleet_entry.get("port", 18800)
+
+    # thinkingDefault: "high" if deepseek is anywhere in the model stack
+    has_deepseek = any("deepseek" in p for p in mc["providers_needed"])
+    thinking_default = "high" if has_deepseek else "off"
+
+    cfg: dict = {
+        "meta": {
+            "lastTouchedVersion": "2026.5.23",
+            "lastTouchedAt": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        },
+        "env": {},
+        "auth": {
+            "profiles": auth_profiles,
+        },
+        "agents": {
+            "defaults": {
+                "model": {
+                    "primary":   mc["primary"],
+                    "fallbacks": mc["fallbacks"],
+                },
+                "models": {
+                    "moonshot/kimi-k2.6": {"alias": "kimi"},
+                    "deepseek/deepseek-v4-flash": {"alias": "deepseek-flash"},
+                },
+                "workspace": str(agent_dir / "workspace"),
+                "memorySearch": {
+                    "sources": ["memory", "sessions"],
+                    "experimental": {"sessionMemory": True},
+                    "query": {
+                        "hybrid": {
+                            "enabled": True,
+                            "vectorWeight": 0.7,
+                            "textWeight": 0.3,
+                            "candidateMultiplier": 4,
+                        }
+                    },
+                    "provider": "gemini",           # NOT "google" — common gotcha
+                    "model": "gemini-embedding-2-preview",
+                    "hybridQuery": True,
+                },
+                "heartbeat": {
+                    "every": "30m",
+                    "model": "deepseek/deepseek-v4-flash",
+                    "isolatedSession": True,
+                    "lightContext": True,
+                },
+                "subagents": {
+                    "model": mc["primary"],
+                    "maxConcurrent": 4,
+                    "thinking": "off",
+                },
+                "userTimezone": "Asia/Dubai",
+                "envelopeTimezone": "Asia/Dubai",
+                "compaction": {
+                    "mode": "safeguard",
+                    "model": "deepseek/deepseek-v4-flash",
+                    "memoryFlush": {
+                        "enabled": True,
+                        "softThresholdTokens": 5000,
+                        "prompt": (
+                            "Pre-compaction memory flush. Store durable memories now "
+                            "(use memory/YYYY-MM-DD.md; create memory/ if needed). "
+                            "IMPORTANT: If the file already exists, APPEND new content only "
+                            "and do not overwrite existing entries. "
+                            "If nothing to store, reply with NO_REPLY."
+                        ),
+                        "systemPrompt": "Session nearing compaction. Store durable memories now.",
+                    },
+                },
+                "thinkingDefault": thinking_default,
+            },
+            "list": [
+                {
+                    "id":      "main",
+                    "default": True,
+                    "name":    f"{name.capitalize()} - {role or 'Agent'}",
+                },
+            ],
+        },
+        "tools": {
+            "web": {
+                "search": {"enabled": True},
+                "fetch":  {"enabled": True},
+            },
+        },
+        "commands": {"native": "auto", "nativeSkills": "auto"},
+        "hooks": {
+            "enabled": True,
+            "token":   hooks_token,    # plaintext in config is correct for hooks.token
+            "path":    "/hooks",
+            "mappings": [
+                {
+                    "match":    {"path": "fleet"},
+                    "action":   "agent",
+                    "name":     "Fleet",
+                    "wakeMode": "now",
+                    "deliver":  True,
+                    "channel":  "telegram",
+                    "to":       "418059105",     # Peter's telegram ID
+                    "allowUnsafeExternalContent": True,
+                    "messageTemplate": "{{message}}",
+                },
+            ],
+            "internal": {
+                "entries": {
+                    "inbox-auto-inject": {
+                        "enabled": True,
+                        "env": {"HOOK_AGENT_ID": name},
+                    },
+                    "session-auto-recall": {
+                        "enabled": True,
+                        "env": {"HOOK_AGENT_ID": name},
+                    },
+                    "compaction-capture": {
+                        "enabled": True,
+                        "env": {"HOOK_AGENT_ID": name},
+                    },
+                },
+                "enabled": True,
+                "load": {"extraDirs": ["/opt/gcg/shared/hooks"]},
+            },
+        },
+        "channels": {
+            "telegram": {
+                "enabled":     True,
+                "dmPolicy":    "allowlist",
+                "groups":      {},
+                "allowFrom":   ["418059105", "7852845628"],
+                "groupPolicy": "allowlist",
+                "streaming":   {"mode": "off", "progress": {"toolProgress": False}},
+                "groupAllowFrom": ["418059105", "7852845628"],
+                "botToken":    "${TELEGRAM_BOT_TOKEN}",    # ${} interpolation, never plaintext
+            },
+            "slack": {
+                "enabled":     False,   # disabled until tokens provisioned
+                "mode":        "socket",
+                "botToken":    "${SLACK_BOT_TOKEN}",
+                "appToken":    "${SLACK_APP_TOKEN}",
+                "dmPolicy":    "open",
+                "allowFrom":   ["*"],
+                "groupPolicy": "open",
+            },
+        },
+        "gateway": {
+            "port": port,
+            "mode": "local",
+            "auth": {
+                "mode":  "token",
+                "token": gateway_token,     # unique per-agent plaintext token (not a secret — gateway control plane)
+            },
+            "http": {
+                "endpoints": {
+                    "chatCompletions": {"enabled": True},
+                },
+            },
+        },
+        "plugins": {
+            "entries": {
+                "telegram":  {"enabled": True},
+                "anthropic":  {"enabled": True},
+                "browser":   {"enabled": True},
+                "moonshot":  {"enabled": True},
+                "google":    {"enabled": True},
+                "deepseek":  {"enabled": True},
+            },
+            "allow": _plugins_for_tier(tier, tier_sub),
+        },
+        "browser": {"enabled": True, "headless": True, "noSandbox": True},
+        "models": {
+            "providers": providers,
+        },
+        "messages": {
+            "groupChat": {"visibleReplies": "message_tool"},
+        },
+        "skills": {
+            "entries": {},
+            "load": {"extraDirs": ["/opt/gcg/shared/skills"]},
+        },
+    }
+
+    # Tier D: add Opus dispatch subagent entry placeholder
+    if tier == "D":
+        cfg["agents"]["list"].append({
+            "id":    "opus-dispatch",
+            "name":  "Opus Dispatch",
+            "model": {"primary": "anthropic/claude-opus-4-6"},
+        })
+
+    # Tier C-talos: add openai-codex plugin + OAuth
+    if tier == "C" and tier_sub == "talos":
+        cfg["plugins"]["entries"]["codex"] = {"enabled": True}
+        cfg["plugins"]["allow"].append("codex")
+
+    # Write config
+    cfg_json = json.dumps(cfg, indent=2)
+    log(f"  write: {cfg_path}")
+    if not dry_run:
+        if cfg_path.exists():
+            backup_file(cfg_path)
+        cfg_path.write_text(cfg_json)
+        cfg_path.chmod(0o600)
+    else:
+        # Print a compact preview
+        log(f"  [dry-run] openclaw.json primary={mc['primary']} fallbacks={mc['fallbacks']}")
+        log(f"  [dry-run] providers: {list(providers.keys())}")
+        log(f"  [dry-run] thinkingDefault: {thinking_default}")
+    touched.append(str(cfg_path))
+
+    return cfg, touched
+
+
+def _plugins_for_tier(tier: str, sub: str | None) -> list[str]:
+    base = ["telegram", "moonshot", "deepseek", "browser", "memory-core", "google"]
+    if tier in ("C", "D") or (tier == "C" and sub in ("talos", None)):
+        base.append("anthropic")
+    if tier == "C" and sub == "talos":
+        base.append("codex")
+    return list(dict.fromkeys(base))  # deduplicate, preserve order
+
+
+# ─── tier 7: systemd ─────────────────────────────────────────────────────────
+
+SYSTEMD_UNIT_TMPL = """\
+[Unit]
+Description=OpenClaw Agent - {name_cap} ({role})
+After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+# Environment baseline (shared DB secrets + global)
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+
+# Agent identity
+Environment=FLEET_AGENT_NAME={name}
+Environment=HOOK_AGENT_ID={name}
+
+# Paths
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-{name}/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-{name}/state
+Environment=NODE_OPTIONS=--max-old-space-size=3072
+
+# systemd-creds: host-bound encrypted secrets (never plaintext on disk)
+LoadCredentialEncrypted=op-sa-token:{credstore}/op-sa-token
+LoadCredentialEncrypted=db-env:{credstore}/db-env
+LoadCredentialEncrypted=gateway-env:{credstore}/gateway-env
+LoadCredentialEncrypted=borg-passphrase:{credstore}/borg-passphrase
+LoadCredentialEncrypted=borg-key:{credstore}/borg-key
+LoadCredentialEncrypted=openai-codex-auth:{credstore}/openai-codex-auth
+
+# Runtime tmpfs directory (0700 — only root can enter)
+RuntimeDirectory=openclaw-{name}
+RuntimeDirectoryMode=0700
+
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-{name}
+
+# Config validation (fast, fails-safe before bootstrap)
+ExecStartPre=/usr/bin/python3 {validate_script} /opt/gcg/openclaw-{name}/openclaw.json
+
+# Secret bootstrap: decrypts credstore → writes /run/openclaw-{name}/env (tmpfs, 0600)
+ExecStartPre=/opt/gcg/shared/bin/gcg-secret-bootstrap.sh {name}
+
+# Main process: sources runtime env, exec openclaw
+ExecStart=/bin/bash -c 'set -a; source /run/openclaw-{name}/env; exec /usr/bin/openclaw gateway'
+
+# Pre-stop flush (best-effort)
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+
+Restart=always
+RestartSec=15
+
+# Logs
+StandardOutput=append:/opt/gcg/openclaw-{name}/logs/gateway.log
+StandardError=append:/opt/gcg/openclaw-{name}/logs/gateway.log
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+MEMORY_DROPIN_CONTENT = "[Service]\nMemoryMax=4G\nMemoryHigh=10G\n"
+
+
+def tier7_systemd(name: str, role: str, dry_run: bool, force: bool,
+                  no_systemd: bool) -> list[str]:
+    """Write systemd unit + MemoryMax drop-in."""
+    touched: list[str] = []
+    if no_systemd:
+        log("  systemd: skipped (--no-systemd)")
+        return touched
+
+    unit_path   = Path(SYSTEMD_DIR) / f"openclaw-{name}.service"
+    dropin_dir  = Path(SYSTEMD_DIR) / f"openclaw-{name}.service.d"
+    dropin_path = dropin_dir / "memory.conf"
+
+    # Unit file
+    if unit_path.exists() and not force:
+        log(f"  systemd: unit already exists, skipping (use --force)")
+    else:
+        unit_content = SYSTEMD_UNIT_TMPL.format(
+            name=name,
+            name_cap=name.capitalize(),
+            role=role or "Agent",
+            credstore=CREDSTORE_DIR,
+            validate_script=VALIDATE_SCRIPT,
+        )
+        log(f"  write: {unit_path}")
+        if dry_run:
+            log(f"  [dry-run] unit content preview:\n" +
+                "\n".join("    " + ln for ln in unit_content.splitlines()[:20]) +
+                "\n    ...")
+        else:
+            if unit_path.exists():
+                backup_file(unit_path)
+            unit_path.write_text(unit_content)
+        touched.append(str(unit_path))
+
+    # MemoryMax drop-in
+    if dropin_path.exists() and not force:
+        log(f"  systemd: MemoryMax drop-in already exists, skipping")
+    else:
+        log(f"  write: {dropin_path}")
+        if not dry_run:
+            dropin_dir.mkdir(parents=True, exist_ok=True)
+            if dropin_path.exists():
+                backup_file(dropin_path)
+            dropin_path.write_text(MEMORY_DROPIN_CONTENT)
+        touched.append(str(dropin_path))
+
+    # daemon-reload (not start)
+    if not dry_run and not no_systemd:
+        log("  systemctl daemon-reload")
+        try:
+            run(["systemctl", "daemon-reload"])
+        except Exception as e:
+            log(f"  daemon-reload failed (not fatal at stage time): {e}", "WARN")
+
+    return touched
+
+
+# ─── bootstrap registration ──────────────────────────────────────────────────
+
+def maybe_add_to_bootstrap(name: str, tier: str, dry_run: bool) -> list[str]:
+    """
+    For Tier A agents: verify or add the agent to the bedrock case statement in bootstrap.
+    For Tier C-talos pattern: ensure OP_SA persistence case includes name.
+    This is advisory only — bootstrap updates are surgical and risky to automate fully.
+    Returns list of actions taken or recommended.
+    """
+    touched: list[str] = []
+    bs = Path(BOOTSTRAP_SCRIPT)
+    if not bs.exists():
+        log(f"  bootstrap script not found at {BOOTSTRAP_SCRIPT}", "WARN")
+        return touched
+
+    content = bs.read_text()
+
+    actions = []
+    if tier == "A":
+        if name not in content:
+            actions.append(
+                f"ADD {name} to Tier-A bedrock case in {BOOTSTRAP_SCRIPT}: "
+                f"  bob|leon|hector|tom|phil|algaib|{name})"
+            )
+    if name in {"daen", "talos"}:
+        pass   # already handled in bootstrap for these critical agents
+
+    # For new DWD-enabled agents (controlled by orchestrator, not base provisioner):
+    # Provisioner logs advisory; provision-integrations handles bootstrap modifications.
+    if actions:
+        log("  bootstrap advisory — manual edits needed:")
+        for a in actions:
+            log(f"    {a}", "WARN")
+    else:
+        log("  bootstrap: no additions needed (or agent is not Tier A)")
+
+    return touched
+
+
+# ─── post-stage QA call ──────────────────────────────────────────────────────
+
+def run_qa_check(name: str) -> bool:
+    """Run gcg-agent-qa and verify Tiers 1-3 + 7 are GREEN. Returns True on pass."""
+    qa_bin = Path(SHARED_BIN) / "gcg-agent-qa"
+    if not qa_bin.exists():
+        log(f"  QA: gcg-agent-qa not found at {qa_bin}, skipping", "WARN")
+        return True   # not installed yet — can't block
+
+    log(f"  running: gcg-agent-qa {name} --check --no-color")
+    result = subprocess.run(
+        [str(qa_bin), name, "--check", "--no-color"],
+        capture_output=True, text=True, timeout=60,
+    )
+    output = result.stdout + result.stderr
+    print(output)
+
+    # Look for FAIL lines in tiers 1, 2, 3, 7
+    tier_patterns = [
+        r"── Tier [1237] ──",
+        r"FAIL.*tier [1237]",
+    ]
+    fail_in_owned = False
+    current_tier = None
+    for line in output.splitlines():
+        m = re.search(r"── Tier (\d+) ──", line)
+        if m:
+            current_tier = int(m.group(1))
+        if current_tier in (1, 2, 3, 7) and "FAIL" in line:
+            fail_in_owned = True
+            break
+
+    if fail_in_owned:
+        log("  QA FAILED on owned tiers (1/2/3/7)", "ERROR")
+        return False
+    log("  QA: owned tiers PASS (or WARN/SKIP only)")
+    return True
+
+
+# ─── main ────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="gcg-provision-base",
+        description="Provision Tiers 1 (identity), 2 (security), 3 (model routing), 7 (systemd) for a new OpenClaw agent.",
+    )
+    p.add_argument("name", help="Agent name (kebab-case, e.g. nova)")
+    p.add_argument("--tier", required=True, choices=list(VALID_TIERS),
+                   help="Fleet tier: A (Bedrock), B (Core), C (Engineering), D (Orchestration)")
+    p.add_argument("--role", default="", help="Human-readable role description")
+    p.add_argument("--tier-sub", default=None, choices=["talos", "vulcan"],
+                   help="Tier C sub-variant: talos (openai-codex OAuth) or vulcan (anthropic direct)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print what would happen without mutating anything")
+    p.add_argument("--no-systemd", action="store_true",
+                   help="Skip systemd unit generation")
+    p.add_argument("--backup-only", action="store_true",
+                   help="Back up all config files for existing agent, then exit")
+    p.add_argument("--force", action="store_true",
+                   help="Overwrite existing tokens + configs (required for critical-6 agents)")
+    p.add_argument("--start", action="store_true",
+                   help="Enable + start the systemd unit after staging (default: stage only)")
+    p.add_argument("--skip-qa", action="store_true",
+                   help="Skip post-stage QA check")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    name      = args.name.lower().strip()
+    tier      = args.tier.upper()
+    role      = args.role
+    dry_run   = args.dry_run
+    force     = args.force
+    tier_sub  = args.tier_sub
+
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    # ── name validation ──────────────────────────────────────────────────────
+    if not NAME_RE.match(name):
+        die(f"Invalid agent name {name!r}. Must be kebab-case, 2–32 chars, start with letter.")
+
+    # ── critical-6 guard ─────────────────────────────────────────────────────
+    if name in CRITICAL_6:
+        if not force:
+            die(
+                f"CRITICAL AGENT: {name!r} is in the critical-6 (always-stable). "
+                f"Pass --force to override. Ensure you have a maintenance window."
+            )
+        log(f"WARNING: provisioning critical-6 agent {name!r} with --force", "WARN")
+
+    # ── dry-run header ───────────────────────────────────────────────────────
+    if dry_run:
+        print("=" * 70)
+        print(f"DRY-RUN: gcg-provision-base {name} --tier {tier}")
+        print(f"         role={role!r}  tier_sub={tier_sub!r}")
+        print("=" * 70)
+        print("Nothing will be written to disk.")
+        print()
+
+    # ── load FLEET.yaml ──────────────────────────────────────────────────────
+    fleet: dict = {}
+    if Path(FLEET_YAML).exists():
+        try:
+            fleet = _load_fleet_yaml()
+        except Exception as e:
+            log(f"Could not load FLEET.yaml: {e}", "WARN")
+    else:
+        log(f"FLEET.yaml not found at {FLEET_YAML} — will create minimal entry", "WARN")
+
+    # ── idempotency check ────────────────────────────────────────────────────
+    agent_dir = Path(AGENT_BASE.format(name=name))
+    cfg_path  = agent_dir / "openclaw.json"
+    existing_cfg: dict | None = None
+    if cfg_path.exists():
+        try:
+            existing_cfg = json.loads(cfg_path.read_text())
+        except Exception:
+            pass
+        if not force:
+            log(f"Agent {name!r} already has openclaw.json. Pass --force to overwrite.")
+            log("Re-running without --force will re-use existing tokens and skip config overwrite.")
+
+    # ── tier C sub-variant prompt ─────────────────────────────────────────────
+    if tier == "C" and tier_sub is None:
+        log("Tier C requires --tier-sub {talos|vulcan}.")
+        log("  talos  = openai-codex/gpt-5.5 (OAuth, shared Plus quota)")
+        log("  vulcan = anthropic/claude-sonnet-4-6 (direct API)")
+        if dry_run:
+            tier_sub = "vulcan"   # default for dry-run demo
+            log(f"  [dry-run] defaulting tier_sub=vulcan for demo")
+        else:
+            die("Pass --tier-sub to specify Tier C variant.")
+
+    # ── backup-only mode ─────────────────────────────────────────────────────
+    if args.backup_only:
+        files_to_backup = [str(cfg_path), str(FLEET_YAML),
+                           f"{SYSTEMD_DIR}/openclaw-{name}.service"]
+        backed = []
+        for f in files_to_backup:
+            bak = backup_file(f)
+            if bak:
+                log(f"  backed up: {f} → {bak}")
+                backed.append(bak)
+        audit_log({"ts": ts, "agent": name, "tier": tier, "action": "backup_only",
+                   "result": "ok", "files_touched": backed})
+        return 0
+
+    # ── execution ─────────────────────────────────────────────────────────────
+    all_touched: list[str] = []
+    log(f"\n{'='*60}")
+    log(f"PROVISION-BASE: {name} (tier={tier}, role={role!r})")
+    log(f"{'='*60}")
+
+    # Tier 1 — Identity
+    log("\n[Tier 1] Identity")
+    touched1 = tier1_identity(name, tier, role, fleet, dry_run, force)
+    all_touched.extend(touched1)
+
+    # Reload fleet (may have been updated in tier1)
+    if not dry_run and Path(FLEET_YAML).exists():
+        try:
+            fleet = _load_fleet_yaml()
+        except Exception:
+            pass
+
+    # Tier 2 — Security
+    log("\n[Tier 2] Security")
+    gateway_token, hooks_token, touched2 = tier2_security(name, dry_run, force, existing_cfg)
+    all_touched.extend(touched2)
+
+    # Tier 3 — Model routing + openclaw.json
+    log("\n[Tier 3] Model routing")
+    cfg, touched3 = tier3_build_openclaw_json(
+        name, tier, role, gateway_token, hooks_token,
+        tier_sub, fleet, existing_cfg, dry_run, force,
+    )
+    all_touched.extend(touched3)
+
+    # Bootstrap advisory
+    log("\n[Tier 2/bootstrap] Advisory")
+    touched_bs = maybe_add_to_bootstrap(name, tier, dry_run)
+    all_touched.extend(touched_bs)
+
+    # Tier 7 — Systemd
+    log("\n[Tier 7] Systemd")
+    touched7 = tier7_systemd(name, role, dry_run, force, args.no_systemd)
+    all_touched.extend(touched7)
+
+    # Optional: enable + start
+    if args.start and not dry_run and not args.no_systemd:
+        log(f"\n[Tier 7] Enabling + starting openclaw-{name}.service")
+        unit = f"openclaw-{name}.service"
+        try:
+            run(["systemctl", "enable", unit])
+            run(["systemctl", "start",  unit])
+            log(f"  started openclaw-{name}.service")
+        except subprocess.CalledProcessError as e:
+            log(f"  start failed: {e}", "WARN")
+    elif not args.start and not dry_run:
+        log(f"\n  Staged only. Enable + start with:")
+        log(f"    systemctl enable openclaw-{name}.service && systemctl start openclaw-{name}.service")
+
+    # ── QA check ─────────────────────────────────────────────────────────────
+    qa_ok = True
+    if not dry_run and not args.skip_qa:
+        log(f"\n[QA] Post-stage check")
+        qa_ok = run_qa_check(name)
+
+    # ── Audit log ─────────────────────────────────────────────────────────────
+    audit_entry = {
+        "ts":            ts,
+        "agent":         name,
+        "tier":          tier,
+        "tier_sub":      tier_sub,
+        "role":          role,
+        "action":        "dry_run" if dry_run else "provision",
+        "result":        "ok" if (qa_ok or dry_run) else "qa_fail",
+        "files_touched": list(dict.fromkeys(all_touched)),   # deduplicate
+    }
+    if not dry_run:
+        audit_log(audit_entry)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    log(f"\n{'='*60}")
+    if dry_run:
+        log(f"DRY-RUN complete. No files written.")
+        log(f"Files that WOULD be created/modified:")
+        for f in dict.fromkeys(all_touched):
+            log(f"  {f}")
+    else:
+        log(f"PROVISION-BASE complete: {name}")
+        log(f"Files written:")
+        for f in dict.fromkeys(all_touched):
+            log(f"  {f}")
+        if not qa_ok:
+            log("QA FAILED on owned tiers. Review output above and re-run gcg-agent-qa.", "ERROR")
+            return 1
+
+    log(f"\nNext steps (parent/orchestrator):")
+    log(f"  1. gcg-provision-memory {name}  (Tier 4: pgvector, recall)")
+    log(f"  2. gcg-provision-integrations {name}  (Tier 5+9+11: FLEET, MCP, Asana, DWD)")
+    log(f"  3. gcg-agent-qa {name} --check --remediate")
+    log(f"  4. Verify stable on canary (Nik) pattern before fleet changes")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1882,6 +1882,59 @@ agents:
       pgvector_enabled: true
       op_sa_runtime: true
       subagents_max_depth: 0
+  sentinel:
+    title: Security Watchdog
+    group: INFRASTRUCTURE
+    tier: B
+    critical: false
+    host: vps-65.21.60.52
+    port: 19000
+    workspace: /opt/gcg/openclaw-sentinel/workspace
+    agents_md: /opt/gcg/openclaw-sentinel/workspace/AGENTS.md
+    model_primary: moonshot/kimi-k2.6
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    expected_model_primary: moonshot/kimi-k2.6
+    heartbeat:
+      every: 30m
+      model: deepseek/deepseek-v4-flash
+      target: last
+    db_role: gcg_sentinel
+    keys:
+    - deepseek
+    - moonshot
+    google_sa: false
+    anthropic_profile: true
+    channel_token_policy: per_agent
+    channel_token_shared_with: []
+    hooks_token_sha: 17f668acb7bf
+    hooks_token_policy: per_agent
+    hooks_token_shared_with: []
+    telegram_bot: '@gcg_sentinel_bot'
+    telegram_bot_id: 8753334141
+    telegram_enabled: true
+    telegram_groups: []
+    telegram_bot_token_plaintext: false
+    subagents: []
+    mcp_servers: []
+    memory_max: 4294967296
+    has_validator: true
+    op_sa_persisted: false
+    serves: Peter
+    human_email: peter@gcgstr.com
+    mission: "Security watchdog — monitors fleet health, runs deep audits, alerts on anomalies. Never sleeps. Trusts nothing."
+    capabilities:
+      broker_allowed: false
+      dwd_enabled: false
+      telegram_enabled: true
+      web_search: true
+      web_search_provider: none
+      audio_transcription: false
+      plugins: []
+      inbox_wired: true
+      pgvector_enabled: false
+      op_sa_runtime: false
+      subagents_max_depth: 0
   tom:
     title: Inbox triage, email drafting, Google Calendar, meeting invites for Vincent Ribes
     group: REAL ESTATE

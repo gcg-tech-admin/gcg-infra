@@ -1,0 +1,11 @@
+[Unit]
+Description=Mirror storagebox backups to Sentinel VPS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/gcg-sentinel-mirror.sh
+User=root
+Nice=19
+IOSchedulingClass=idle

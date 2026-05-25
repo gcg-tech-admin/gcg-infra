@@ -8,3 +8,4 @@ ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
 ff02::3 ip6-allhosts
 2a01:4f9:3090:28ce::2 gcg-ax102
+65.21.60.52 sentinel-gcg

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Sentinel mirror
+Requires=gcg-sentinel-mirror.service
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 Asia/Dubai
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target

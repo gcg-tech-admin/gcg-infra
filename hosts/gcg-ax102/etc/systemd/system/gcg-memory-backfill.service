@@ -7,6 +7,9 @@ After=network.target
 [Service]
 Type=oneshot
 User=root
+Environment="GCG_DB_HOST=10.0.0.2"
+Environment="GCG_DB_PORT=5432"
+Environment="GCG_DB_NAME=gcg_intelligence"
 LoadCredentialEncrypted=deepseek-key:/etc/credstore.encrypted/deepseek-key
 ExecStart=/opt/gcg/shared/gcg_tools/run_memory_backfill.sh
 StandardOutput=journal
