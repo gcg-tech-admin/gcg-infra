@@ -39,6 +39,46 @@ def systemctl_memorymax(agent):
         return None, None
 
 
+_ENVVAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+def systemctl_environment(agent):
+    """Return parsed Environment= dict for openclaw-<agent>.service.
+
+    Returns {} on failure. Used to resolve ${VAR} references in openclaw.json
+    so we don't hash template strings (which falsely collide across agents)."""
+    try:
+        out = subprocess.check_output(
+            ["systemctl", "show", "-p", "Environment", f"openclaw-{agent}.service"],
+            text=True, timeout=5,
+        )
+        env = {}
+        for line in out.splitlines():
+            if not line.startswith("Environment="):
+                continue
+            raw = line.split("=", 1)[1]
+            # Format: "KEY1=val1 KEY2=val2" — split on whitespace, then on first '='
+            for tok in raw.split():
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    env[k] = v
+        return env
+    except Exception:
+        return {}
+
+
+def resolve_token(raw, env):
+    """If raw is a single ${VAR} template, return env[VAR]; else return raw.
+
+    Bare literals pass through unchanged. Unresolved templates return ""
+    (so they hash to None via the empty-check upstream)."""
+    if not raw:
+        return raw
+    m = _ENVVAR_RE.fullmatch(raw)
+    if not m:
+        return raw
+    return env.get(m.group(1), "")
+
+
 def aggregate():
     agents = sorted([
         p.split("openclaw-")[-1]
@@ -70,14 +110,22 @@ def aggregate():
                 rec["timezone"]        = defaults.get("userTimezone")
                 rec["gateway_port"]    = d.get("gateway", {}).get("port")
 
-                gw_token   = d.get("gateway", {}).get("auth", {}).get("token") or ""
-                hooks_tok  = d.get("hooks", {}).get("token") or ""
+                gw_token_raw   = d.get("gateway", {}).get("auth", {}).get("token") or ""
+                hooks_tok_raw  = d.get("hooks", {}).get("token") or ""
                 tg         = d.get("channels", {}).get("telegram", {})
                 tg_token   = tg.get("botToken") or ""
+
+                # Resolve ${VAR} from systemd Environment= so we hash actual tokens, not template strings
+                # (template strings falsely collide across agents — caused 2026-05-25 incident)
+                svc_env = systemctl_environment(a)
+                gw_token  = resolve_token(gw_token_raw, svc_env)
+                hooks_tok = resolve_token(hooks_tok_raw, svc_env)
 
                 # Only hash if token actually has content (avoids sha12("")==e3b0c44298fc false-positives)
                 rec["gateway_token_sha"] = hashlib.sha256(gw_token.encode()).hexdigest()[:12] if gw_token else None
                 rec["hooks_token_sha"]   = hashlib.sha256(hooks_tok.encode()).hexdigest()[:12] if hooks_tok else None
+                rec["gateway_token_source"] = "env" if gw_token_raw.startswith("${") else "literal"
+                rec["hooks_token_source"]   = "env" if hooks_tok_raw.startswith("${") else "literal"
                 rec["gateway_token_empty"] = (gw_token == "")
                 rec["hooks_token_empty"]   = (hooks_tok == "")
                 rec["telegram_bot_id"]   = tg_token.split(":")[0] if ":" in tg_token else None

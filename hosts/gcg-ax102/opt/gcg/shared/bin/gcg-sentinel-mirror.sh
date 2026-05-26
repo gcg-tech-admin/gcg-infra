@@ -1,5 +1,12 @@
 #!/bin/bash
-# Mirror storagebox to Sentinel via AX102 relay
+# DEPRECATED 2026-05-25 — Sentinel is now reachable ONLY from Mac Mini Daen (firewalled
+# off from AX42/AX102 post-Kinsing). The DR mirror is owned by Mac Mini Daen, which pulls
+# the storagebox into its local mirror and replicates onward to Sentinel from there.
+# This script must NOT run from AX102. The corresponding systemd unit is masked.
+# If you need to verify the Sentinel mirror, ask Mac Mini Daen — see project memory
+# project-sentinel-mirror-macmini.
+echo "[$(date -u +%FT%TZ)] gcg-sentinel-mirror.sh is DEPRECATED on AX102; refusing to run." >&2
+exit 1
 set -euo pipefail
 LOG=/var/log/gcg-sentinel-mirror.log
 echo "=== $(date -u) Starting mirror ===" >> $LOG

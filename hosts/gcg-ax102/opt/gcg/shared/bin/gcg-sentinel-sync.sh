@@ -1,5 +1,9 @@
 #!/bin/bash
-# Sync storagebox data to Sentinel mirror via AX102
+# DEPRECATED 2026-05-25 — Sentinel is reachable ONLY from Mac Mini Daen post-Kinsing.
+# DR mirror is owned by Mac Mini Daen (pulls storagebox → local mirror → Sentinel).
+# This script must NOT run from AX102. See project-sentinel-mirror-macmini.
+echo "[$(date -u +%FT%TZ)] gcg-sentinel-sync.sh is DEPRECATED on AX102; refusing to run." >&2
+exit 1
 set -euo pipefail
 SENTINEL_IP=65.21.60.52
 SENTINEL_KEY=/root/.ssh/gcg-sentinel-outbound-20260524

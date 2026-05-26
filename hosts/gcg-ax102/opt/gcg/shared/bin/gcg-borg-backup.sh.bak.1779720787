@@ -41,7 +41,6 @@ borg create --stats --compression zstd,6 --exclude-caches \
   --exclude "/run" --exclude "/tmp" --exclude "/var/cache" \
   "$REPO::${HN}-${STAMP}" \
   /opt/gcg /etc/credstore.encrypted /etc/credstore.holding \
-  /var/lib/gcg-backup-staging \
   /etc/systemd/system/openclaw-*.service /etc/systemd/system/openclaw-*.service.d \
   /etc/systemd/system/gcg-*.service /etc/systemd/system/gcg-*.timer \
   /root/.ssh/storagebox_borg_appendonly.pub 2>&1 | tail -10

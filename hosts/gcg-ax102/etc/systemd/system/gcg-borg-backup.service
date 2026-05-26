@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+ExecStartPre=-/opt/gcg/shared/bin/gcg-ax42-config-sync.sh
 ExecStart=/opt/gcg/shared/bin/gcg-borg-backup.sh
 LoadCredentialEncrypted=borg-passphrase:/etc/credstore.encrypted/borg-passphrase
 LoadCredentialEncrypted=borg-key:/etc/credstore.encrypted/borg-key
