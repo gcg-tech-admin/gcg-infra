@@ -237,7 +237,7 @@ infrastructure:
     - pan_agent
     tailscale: 100.109.177.127
     user: petr
-    ip: 217.165.112.39
+    ip: 100.109.177.127
 shared_inboxes:
 - admin@global-capital-group.com
 - admin@gcg-structuring.com
@@ -1050,12 +1050,12 @@ agents:
     port: 20301
     workspace: /opt/gcg/openclaw-jc/workspace
     agents_md: /opt/gcg/openclaw-jc/workspace/AGENTS.md
-    model_primary: deepseek/deepseek-v4-pro
+    model_primary: claude-cli/claude-sonnet-4-6
     model_fallbacks:
     - deepseek/deepseek-v4-pro
     - moonshot/kimi-k2.6
-    - google/gemini-3.1-pro-preview
-    expected_model_primary: deepseek/deepseek-v4-pro
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
     heartbeat:
       every: 2h
       model: deepseek/deepseek-v4-flash
@@ -1393,12 +1393,12 @@ agents:
     port: 19050
     workspace: /opt/gcg/openclaw-marcus/workspace
     agents_md: /opt/gcg/openclaw-marcus/workspace/AGENTS.md
-    model_primary: deepseek/deepseek-v4-pro
+    model_primary: claude-cli/claude-sonnet-4-6
     model_fallbacks:
     - deepseek/deepseek-v4-pro
     - moonshot/kimi-k2.6
     - google/gemini-3.1-pro-preview
-    expected_model_primary: deepseek/deepseek-v4-pro
+    expected_model_primary: claude-cli/claude-sonnet-4-6
     heartbeat:
       every: 1h
       model: deepseek/deepseek-v4-flash
@@ -1531,10 +1531,11 @@ agents:
     agents_md: /opt/gcg/openclaw-mnemosyne/workspace/AGENTS.md
     model_primary: deepseek/deepseek-v4-pro
     model_fallbacks:
-    - claude-cli/claude-sonnet-4-6
+    - claude-cli/claude-opus-4-7
     - moonshot/kimi-k2.6
-    - google/gemini-3.1-pro-preview
-    expected_model_primary: moonshot/kimi-k2.6
+    - openai-codex/gpt-5.5
+    - google/gemini-3.5-flash
+    expected_model_primary: deepseek/deepseek-v4-pro
     heartbeat:
       every: 4h
       model: deepseek/deepseek-v4-flash
@@ -2295,7 +2296,7 @@ agents:
     tier: D
     critical: false
     host: mac_mini
-    ip: 217.165.112.39
+    ip: 100.109.177.127
     role: architect_secondary
     note: Tailscale mesh active. AX102 at 100.90.34.64. Mac Mini at 100.109.177.127. SSH route active via /root/.ssh/id_ed25519_ax102_to_macmini (tailscale).
     model_primary: claude-cli/claude-opus-4-7
@@ -2333,7 +2334,7 @@ agents:
     tier: D
     critical: false
     host: mac_mini
-    ip: 217.165.112.39
+    ip: 100.109.177.127
     tailscale_ip: 100.109.177.127
     role: personal_assistant
     port: pending
@@ -2348,5 +2349,5 @@ updated_at: '2026-05-25T00:00:00Z'
 change_summary: 'v2.4->v2.5 (2026-05-25): Lane Matrix enforcement. (1) model_primary fleet-wide moved from moonshot/kimi-k2.6   to claude-cli/claude-sonnet-4-6 (Fleet Default per MODEL_ROUTING_MATRIX.md
   2026-05-24). (2) Exceptions applied: daen=claude-cli/claude-opus-4-7,   mnemosyne=deepseek/deepseek-v4-pro (thinking=high), talos=openai-codex/gpt-5.5 (unchanged). (3) Standard fallback chain: deepseek/deepseek-v4-pro   ->
   moonshot/kimi-k2.6 -> google/gemini-3.1-pro-preview. (4) Removed tier_A_bedrock from model_policy (bedrock no longer default).   (5) Agents formerly on tier_A_bedrock (algaib, bob, hector, leon, phil,
-  tom) now on fleet default claude-cli primary. (6) daen_macmini   stub added (pending_ssh_route=true, host unreachable from AX102). Token shas unchanged (all per-agent, unique, verified against systemd   Environment=
+  tom) now on fleet default claude-cli primary. (6) daen_macmini verified active (Tailscale SSH confirmed, Mac Mini at 100.109.177.127). Token shas unchanged (all per-agent, unique, verified against systemd   Environment=
   and openclaw.json via sha256 first 12 chars).'
