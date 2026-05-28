@@ -18,12 +18,14 @@ Usage:
 import argparse
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-PLANS_DIR = Path("/opt/gcg/openclaw-daen/workspace/plans")
-AGENTS_DIR = Path("/opt/gcg/openclaw-daen/workspace/agents")
+PLANS_DIR = Path("/opt/gcg/shared/plans/reviews")
+AGENTS_DIR = Path("/opt/gcg/openclaw-daen/workspace/agents")  # legacy fallback
+COUNCIL_AGENTS_DIR = Path("/opt/gcg")  # standalone agents: /opt/gcg/openclaw-<name>/workspace/memory/
 
 REVIEWERS = {
     "SOCRATES": "socrates",
@@ -39,6 +41,11 @@ REVIEWERS = {
 }
 
 def get_review_log_path(reviewer: str) -> Path:
+    # Standalone agent path (2026-05-27): /opt/gcg/openclaw-<name>/workspace/memory/review-log.md
+    standalone = COUNCIL_AGENTS_DIR / f"openclaw-{reviewer}" / "workspace" / "memory" / "review-log.md"
+    if standalone.parent.exists():
+        return standalone
+    # Fallback to legacy daen/workspace/agents/<name>/ path
     return AGENTS_DIR / reviewer / "memory" / "review-log.md"
 
 def extract_verdict(content: str) -> str:
@@ -183,6 +190,34 @@ def parse_verdict_file(filepath: Path, reviewer: str, plan_name: str, date: str)
     entry = format_log_entry(date, plan_name, verdict, findings, patterns, reviewer)
     append_to_log(reviewer, entry)
     print(f"  {reviewer}: {verdict} | {len(findings)} findings | {len(patterns)} patterns")
+
+    # Embed findings to pgvector so future sessions can recall them
+    embed_to_pgvector(reviewer, date, plan_name, verdict, findings, patterns)
+
+def embed_to_pgvector(reviewer: str, date: str, plan_name: str, verdict: str, findings: list, patterns: list):
+    """Embed council review findings to pgvector for future session recall."""
+    findings_text = " | ".join(findings[:5]) if findings else "no structured findings"
+    patterns_text = " | ".join(patterns[:3]) if patterns else "no new patterns"
+    text = (
+        f"Council review {plan_name} {date}. Reviewer: {reviewer}. Verdict: {verdict}. "
+        f"Key findings: {findings_text}. Watch patterns: {patterns_text}."
+    )
+    try:
+        result = subprocess.run(
+            ["/opt/gcg/shared/bin/memory", "capture",
+             "--agent", reviewer,
+             "--memory-type", "lesson",
+             "--importance", "high",
+             "--scope", "agent_private",
+             text],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            print(f"  → pgvector embed OK ({reviewer})")
+        else:
+            print(f"  → pgvector embed FAILED ({reviewer}): {result.stderr.strip()[:200]}")
+    except Exception as e:
+        print(f"  → pgvector embed ERROR ({reviewer}): {e}")
 
 def detect_reviewer_from_filename(filename: str) -> str | None:
     """Extract reviewer name from verdict filename."""

@@ -213,9 +213,9 @@ def op_store_db_password(name: str, pwd: str) -> bool:
         f"op item edit '{item_title}' --vault '{OP_VAULT}' "
         f"password='{pwd}' 2>&1"
     )
+    op_token_expr = "$(find /run/credentials -name 'op-sa-token' 2>/dev/null | head -1 | xargs cat 2>/dev/null || cat $CREDENTIALS_DIRECTORY/op-sa-token 2>/dev/null)"
     rc, out, _ = run_ax102(
-        f"export OP_SERVICE_ACCOUNT_TOKEN=$(cat $CREDENTIALS_DIRECTORY/op-sa-token 2>/dev/null || "
-        f"systemd-creds --system cat op-sa-token 2>/dev/null); {edit_cmd}"
+        f"export OP_SERVICE_ACCOUNT_TOKEN={op_token_expr}; {edit_cmd}"
     )
     if rc == 0:
         return True
@@ -225,8 +225,7 @@ def op_store_db_password(name: str, pwd: str) -> bool:
         f"--vault '{OP_VAULT}' password='{pwd}' 2>&1"
     )
     rc2, out2, _ = run_ax102(
-        f"export OP_SERVICE_ACCOUNT_TOKEN=$(cat $CREDENTIALS_DIRECTORY/op-sa-token 2>/dev/null || "
-        f"systemd-creds --system cat op-sa-token 2>/dev/null); {create_cmd}"
+        f"export OP_SERVICE_ACCOUNT_TOKEN={op_token_expr}; {create_cmd}"
     )
     return rc2 == 0
 
@@ -237,12 +236,17 @@ def op_read_db_password(name: str) -> str:
     Returns empty string if item does not exist or op call fails.
     """
     item_title = f"db-{name}"
+    op_token_expr = "$(find /run/credentials -name 'op-sa-token' 2>/dev/null | head -1 | xargs cat 2>/dev/null || cat $CREDENTIALS_DIRECTORY/op-sa-token 2>/dev/null)"
     rc, out, _ = run_ax102(
-        f"export OP_SERVICE_ACCOUNT_TOKEN=$(cat $CREDENTIALS_DIRECTORY/op-sa-token 2>/dev/null || "
-        f"systemd-creds --system cat op-sa-token 2>/dev/null); "
+        f"export OP_SERVICE_ACCOUNT_TOKEN={op_token_expr}; "
         f"op read 'op://{OP_VAULT}/{item_title}/password' 2>/dev/null || echo ''"
     )
-    return out.strip() if rc == 0 else ""
+    if rc == 0 and out.strip():
+        return out.strip()
+    # Fallback: read from .pwd file (zero-plaintext legacy path, purge backlog #87)
+    pwd_path = f"/opt/gcg/shared/credentials/db/gcg_{name}.pwd"
+    rc2, out2, _ = run_ax102(f"cat '{pwd_path}' 2>/dev/null || echo ''")
+    return out2.strip() if (rc2 == 0 and out2.strip()) else ""
 
 
 def step_db_role(name: str, dry_run: bool, admin_pwd: str) -> str:

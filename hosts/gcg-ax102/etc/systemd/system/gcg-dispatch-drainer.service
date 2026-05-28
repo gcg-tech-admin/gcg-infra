@@ -1,11 +1,22 @@
 [Unit]
-Description=GCG Dispatch Queue Drainer (dispatch_queue @ AX42 → task.md @ AX102)
+Description=GCG Dispatch Queue Drainer (AX102 local executor — drains dispatch_queue @ AX42 via vSwitch)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
+WorkingDirectory=/var/lib/gcg-dispatch
+
+# DB connection via vSwitch (AX42)
+Environment=GCG_DB_HOST=10.0.0.2
+# db_connect.py + gcg_tools
+Environment=PYTHONPATH=/opt/gcg/shared/gcg_tools
+# Claude OAuth profile for headless claude --print execution
+Environment=HOME=/opt/gcg/claude-profiles/sub-peter
+# Suppress claude telemetry in headless/service mode
+Environment=CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+
 ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/dispatch_drainer.py
 Restart=always
 RestartSec=10

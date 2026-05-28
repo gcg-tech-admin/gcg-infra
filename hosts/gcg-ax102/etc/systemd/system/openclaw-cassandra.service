@@ -1,0 +1,30 @@
+[Unit]
+StartLimitBurst=5
+StartLimitIntervalSec=300
+Description=OpenClaw Agent - Cassandra (Oracle) (GCG Council)
+After=network.target docker.service
+
+[Service]
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/shared/.env.global
+Environment=FLEET_AGENT_NAME=cassandra
+Environment=HOOK_AGENT_ID=cassandra
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-cassandra
+EnvironmentFile=/opt/gcg/openclaw-cassandra/.env
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-cassandra/openclaw.json
+Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-cassandra/state
+Environment=NODE_OPTIONS=--max-old-space-size=3072
+ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-cassandra/openclaw.json
+ExecStart=/usr/bin/openclaw gateway
+ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh
+MemoryMax=4G
+MemoryHigh=3G
+Restart=always
+RestartSec=15
+StandardOutput=append:/opt/gcg/openclaw-cassandra/logs/gateway.log
+StandardError=append:/opt/gcg/openclaw-cassandra/logs/gateway.log
+
+[Install]
+WantedBy=multi-user.target
