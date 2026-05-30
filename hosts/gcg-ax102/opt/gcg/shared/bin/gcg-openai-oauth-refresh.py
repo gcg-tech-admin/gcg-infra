@@ -25,7 +25,7 @@ import logging.handlers
 from datetime import datetime, timezone
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-PROFILE_HASH      = "5595fd4e0a29ef70b2822dfe0cc40593"
+PROFILE_HASH      = "a1fbc551ed577de1e3f176170a5a94ac"
 PROFILE_ID        = "openai-codex:peter@global-capital-group.com"
 PROVIDER          = "openai-codex"
 PROFILE_DIR       = "/root/.openclaw/credentials/auth-profiles"

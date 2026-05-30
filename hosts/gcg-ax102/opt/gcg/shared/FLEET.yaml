@@ -1845,8 +1845,8 @@ agents:
       I don't just write code. I forge systems that run fast, fail gracefully, and
       scale without breaking a sweat.
     model_fallbacks:
-    - claude-cli/claude-sonnet-4-6
-    - moonshot/kimi-k2.6
+    - claude-cli/claude-opus-4-8
+    - deepseek/deepseek-v4-pro
     model_primary: openai-codex/gpt-5.5
     op_sa_persisted: false
     port: 18950

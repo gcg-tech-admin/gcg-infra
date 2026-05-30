@@ -134,4 +134,4 @@ Subsystem	sftp	/usr/lib/openssh/sftp-server
 # Restricted to root@217.165.112.39; per-key restrict,permitlisten="127.0.0.1:1080"
 # further narrows it to a single bind. AllowTcpForwarding=remote means -R only.
 Match User root Address 217.165.112.39
-    AllowTcpForwarding remote
+    AllowTcpForwarding yes
