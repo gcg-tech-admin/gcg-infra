@@ -1734,14 +1734,14 @@ agents:
     channel_token_shared_with: []
     critical: false
     db_role: gcg_sentinel
-    expected_model_primary: moonshot/kimi-k2.6
+    expected_model_primary: deepseek/deepseek-v4-pro
     google_sa: false
     group: INFRASTRUCTURE
     has_validator: true
     heartbeat:
       every: 55m
       isolatedSession: true
-      model: moonshot/kimi-k2.6
+      model: deepseek/deepseek-v4-flash
     hooks_token_policy: per_agent
     hooks_token_sha: 17f668acb7bf
     hooks_token_shared_with: []
@@ -1755,8 +1755,11 @@ agents:
     mission: Security watchdog — monitors fleet health, runs deep audits, alerts on
       anomalies. Never sleeps. Trusts nothing.
     model_fallbacks:
-    - deepseek/deepseek-v4-pro
-    model_primary: moonshot/kimi-k2.6
+    - claude-cli/claude-sonnet-4-6
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    model_primary: deepseek/deepseek-v4-pro
+    note: DS4 Pro thinking=high primary per Peter 2026-05-29 (MODEL_ROUTING_MATRIX.md).
     op_sa_persisted: false
     port: 19600
     serves: Peter
@@ -2468,7 +2471,7 @@ known_drift:
     agents (zero-plaintext violation, task
 - plaintext_db_pwd_files: /opt/gcg/shared/credentials/db/gcg_*.pwd on persistent disk
     (task
-last_updated: '2026-05-27'
+last_updated: '2026-05-30'
 model_policy:
   banned:
   - openrouter/*
