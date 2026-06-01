@@ -1,0 +1,160 @@
+# Infra Fix Registry — Schema
+# Canonical: /opt/gcg/infra-repo/fixes/fix-schema.yaml
+# Version: 1.0.0
+#
+# Every fix entry in fixes/ MUST conform to this schema.
+# See TEMPLATE.md for a ready-to-use template.
+#
+# Schema defined as JSON Schema-compatible YAML.
+
+$schema: "https://json-schema.org/draft-07/schema"
+title: "Infra Fix Entry"
+description: "A structured record of an infrastructure fix"
+type: "object"
+
+required:
+  - id
+  - date
+  - agent
+  - severity
+  - status
+  - systems
+  - symptom
+  - root_cause
+  - solution
+
+properties:
+  id:
+    type: string
+    pattern: "^fix-\\d{4}-\\d{2}-\\d{2}-[a-z0-9-]+$"
+    description: "Unique identifier: fix-YYYY-MM-DD-descriptive-slug"
+    example: "fix-2026-04-13-recall-symlink"
+
+  date:
+    type: string
+    format: date-time
+    description: "ISO 8601 date-time when the fix was applied"
+    example: "2026-04-13T08:46:00Z"
+
+  agent:
+    type: string
+    enum: [daen, vulcan, argus, talos, mnemosyne]
+    description: "Infra agent who performed the fix"
+
+  severity:
+    type: string
+    enum: [crit, warn, info]
+    description: |
+      crit  = Production outage or data loss
+      warn  = Degraded performance or partial outage
+      info  = Minor fix, cleanup, or preventive
+
+  status:
+    type: string
+    enum: [resolved, partial, reverted]
+    description: "Current resolution status"
+
+  systems:
+    type: array
+    items:
+      type: string
+    description: "Affected system(s) — lowercase, dashed"
+    example: ["recall-pipeline", "gcg_tools"]
+
+  tags:
+    type: array
+    items:
+      type: string
+    description: "Freeform search tags"
+    example: ["symlink", "circular-reference", "auto-recall"]
+
+  symptom:
+    type: string
+    maxLength: 1000
+    description: "What broke — one-line summary"
+
+  root_cause:
+    type: string
+    maxLength: 2000
+    description: "Why it broke — single paragraph"
+
+  solution:
+    type: string
+    maxLength: 4000
+    description: "How it was fixed — steps taken"
+
+  files_changed:
+    type: array
+    items:
+      type: object
+      required:
+        - path
+        - action
+      properties:
+        path:
+          type: string
+          description: "Full path to the file changed"
+        action:
+          type: string
+          enum: [created, modified, deleted, recreated, renamed]
+          description: "Type of change"
+        before:
+          type: string
+          maxLength: 500
+          description: "What was there before (optional)"
+        after:
+          type: string
+          maxLength: 500
+          description: "What it became (optional)"
+
+  detection_method:
+    type: string
+    maxLength: 500
+    description: "How the issue was discovered"
+    example: "fleet recall baseline check"
+
+  detection_agent:
+    type: string
+    description: "Agent or person who detected the issue"
+
+  resolution_time_minutes:
+    type: integer
+    minimum: 0
+    description: "Estimated time to resolve in minutes"
+
+  related_fixes:
+    type: array
+    items:
+      type: string
+      pattern: "^fix-"
+    description: "IDs of related fix entries"
+
+  lessons_learned:
+    type: string
+    maxLength: 2000
+    description: "What we learned from this incident"
+
+  prevention:
+    type: string
+    maxLength: 1000
+    description: "What was implemented to prevent recurrence"
+
+  extensions:
+    type: object
+    description: "Extensible metadata — any key-value pairs"
+    additionalProperties: true
+
+  source_session:
+    type: string
+    pattern: "^[0-9a-f-]+$"
+    description: "Session UUID where the fix was performed"
+
+allOf:
+  - if:
+      properties:
+        severity: { const: "crit" }
+    then:
+      required:
+        - resolution_time_minutes
+        - detection_method
+        - prevention
