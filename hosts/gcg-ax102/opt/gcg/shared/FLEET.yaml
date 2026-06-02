@@ -826,6 +826,7 @@ agents:
     channel_token_policy: missing
     channel_token_shared_with: []
     hooks_token_sha: 49c53f7e24e8
+    broker_allowed: true
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
     telegram_bot: "@Gcg_kira_bot"
