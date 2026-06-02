@@ -17,6 +17,7 @@
 | [fix-2026-06-01-task-1-5-stale-agents-fix-attempt-2](fix-2026-06-01-task-1-5-stale-agents-fix-attempt-2.md) | 2026-06-01 | mnemosyne | warn | agent-fleet, embedding-pipeline | Found and re-embedded 1 stale agent (hector at 11 days stale |
 | [fix-2026-06-01-task-1-5-stale-agents-fix](fix-2026-06-01-task-1-5-stale-agents-fix.md) | 2026-06-01 | mnemosyne | warn | agent-fleet, embedding-pipeline | Fixed malformed @tom agent_name entries (2 rows) and archive |
 | [fix-2026-06-01-viktor-broker-alert-fix](fix-2026-06-01-viktor-broker-alert-fix.md) | 2026-06-01 | mnemosyne | crit | infrastructure | Viktor was sending repeated false CRITICAL alerts about the  |
+| [fix-2026-06-02-](fix-2026-06-02-.md) | 2026-06-02 | vulcan | info | ? | Auto-extracted — review required |
 | [fix-2026-06-02-postgres-vswitch-migration](fix-2026-06-02-postgres-vswitch-migration.md) | 2026-06-02 | daen | crit | postgresql, security | Audit checks crashing with 'connection refused' to 95.217.11 |
 
-_15 entries_
+_16 entries_
