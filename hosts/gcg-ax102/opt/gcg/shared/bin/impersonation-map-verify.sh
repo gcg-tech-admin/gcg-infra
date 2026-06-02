@@ -10,7 +10,10 @@ LOG=/opt/gcg/shared/logs/impersonation-verify-$(date +%Y%m%d).log
 mkdir -p /opt/gcg/shared/logs
 
 python3 - <<'PY' 2>&1 | tee -a "$LOG"
-import os, re, sys, yaml, psycopg2
+import os, re, sys, yaml
+
+sys.path.insert(0, "/opt/gcg/shared/gcg_tools")
+from db_config import get_connection
 
 # 1. Read roster agent_emails
 with open("/opt/gcg/shared/config/fleet-roster.yaml") as f:
@@ -25,10 +28,7 @@ if m:
         roster[k] = v.strip()
 
 # 2. Read DB grants
-conn = psycopg2.connect(
-    host="95.217.114.49", port=5432, dbname="gcg_intelligence",
-    user="gcg_admin", password=os.environ["GCG_DB_PASSWORD"], sslmode="require"
-)
+conn = get_connection(admin=True)
 with conn.cursor() as cur:
     cur.execute("SELECT agent_id, email FROM agent_impersonation_allowed WHERE revoked_at IS NULL ORDER BY 1,2")
     db_rows = cur.fetchall()

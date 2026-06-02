@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# post-commit: regenerate fixes/INDEX.md when fixes/ entries change
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+FIXES_DIR="$REPO_ROOT/fixes"
+INDEX_FILE="$FIXES_DIR/INDEX.md"
+
+# Check if last commit touched fixes/ (excluding INDEX.md itself)
+changed_fixes=$(git diff-tree --no-commit-id -r --name-only HEAD \
+  | grep '^fixes/fix-.*\.md$' \
+  | grep -v '^fixes/INDEX\.md$' || true)
+
+if [[ -z "$changed_fixes" ]]; then
+  exit 0
+fi
+
+# Parse YAML frontmatter from a fix file.
+# Outputs: id|date|agent|severity|systems|symptom
+parse_frontmatter() {
+  local file="$1"
+  python3 - "$file" <<'PYEOF'
+import sys, re, yaml
+
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+
+# Extract YAML block between first --- delimiters
+m = re.match(r'^---\s*\n(.*?\n)---', content, re.DOTALL)
+if not m:
+    sys.exit(0)
+
+try:
+    data = yaml.safe_load(m.group(1)) or {}
+except yaml.YAMLError:
+    sys.exit(0)
+
+def cell(v):
+    if isinstance(v, (list, tuple)):
+        v = ', '.join(str(x) for x in v)
+    s = str(v) if v is not None else ''
+    # Markdown table cell: no newlines, escape pipes, collapse whitespace
+    return re.sub(r'\s+', ' ', s.replace('|', r'\|')).strip()
+
+fid      = cell(data.get('id'))
+date     = cell(data.get('date'))[:10]
+agent    = cell(data.get('agent'))
+severity = cell(data.get('severity'))
+systems  = cell(data.get('systems'))
+symptom  = cell(data.get('symptom'))
+
+print("\x1f".join([fid, date, agent, severity, systems, symptom]))
+PYEOF
+}
+
+# Build rows from all fix-*.md files
+declare -A rows
+while IFS= read -r -d '' file; do
+  fname=$(basename "$file")
+  # Skip non-fix files
+  case "$fname" in
+    TEMPLATE.md|CHANGELOG.md|EVENT-VERIFIED.md|ROLLBACK.md|fix-schema.yaml) continue ;;
+  esac
+
+  row=$(parse_frontmatter "$file")
+  if [[ -n "$row" ]]; then
+    # Key by date+id for sorting
+    fid=$(echo "$row" | cut -d$'\x1f' -f1)
+    date=$(echo "$row" | cut -d$'\x1f' -f2)
+    rows["${date}_${fid}"]="$row"
+  fi
+done < <(find "$FIXES_DIR" -maxdepth 1 -name 'fix-*.md' -print0 | sort -z)
+
+# Sort keys descending by date
+sorted_keys=$(printf '%s\n' "${!rows[@]}" | sort -r)
+
+now=$(date -u '+%Y-%m-%d %H:%M')
+
+{
+  echo "# Fix Registry Index"
+  echo ""
+  echo "Last updated: ${now} UTC"
+  echo ""
+  echo "| ID | Date | Agent | Severity | System | Symptom |"
+  echo "|----|------|-------|----------|--------|---------|"
+  while IFS= read -r key; do
+    row="${rows[$key]}"
+    IFS=$'\x1f' read -r fid date agent severity systems symptom <<< "$row"
+    echo "| $fid | $date | $agent | $severity | $systems | $symptom |"
+  done <<< "$sorted_keys"
+  echo ""
+  echo "*Sorted by date descending.*"
+  echo "*Schema: fix-schema.yaml | Template: TEMPLATE.md | Rollback: ROLLBACK.md*"
+} > "$INDEX_FILE"
+
+# Amend commit with updated INDEX.md (retry once on lock)
+git_amend() {
+  git add "$INDEX_FILE"
+  GIT_POST_COMMIT_HOOK_RUNNING=1 git commit --amend --no-edit --allow-empty
+}
+
+if [[ "${GIT_POST_COMMIT_HOOK_RUNNING:-0}" == "1" ]]; then
+  # Prevent infinite recursion if hook fires during amend
+  exit 0
+fi
+
+git_amend || { sleep 1; git_amend; }
+
+echo "[post-commit] INDEX.md regenerated."

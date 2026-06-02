@@ -75,6 +75,7 @@ def load_live(name):
                 "telegram_bot_plaintext": bool(tg_raw) and not tg_raw.startswith("${"),
                 "agents_list_count": len(d.get("agents", {}).get("list", [])),
                 "auth_profiles": list(d.get("auth", {}).get("profiles", {}).keys()),
+                "thinking_default": defaults.get("thinkingDefault"),
             }
         except Exception as e:
             out["openclaw_json_error"] = str(e)
@@ -172,11 +173,16 @@ def validate_agent(name, declared, live, banned_models=None):
     if o.get("telegram_bot_plaintext"):
         findings.append(("WARN", "telegram botToken is plaintext in openclaw.json (zero-plaintext violation, task #87)"))
 
-    # banned model checks
+    # banned model checks — thinking-aware for DS4 Pro
     primary = o.get("model_primary")
     fallbacks = o.get("model_fallbacks", []) or []
+    thinking = o.get("thinking_default")
+    has_thinking = bool(thinking) and thinking != "off"
     for banned in banned_models:
         if primary == banned or (banned.endswith("/*") and primary and primary.startswith(banned[:-1])):
+            # DS4 Pro is allowed when thinking is active (high or max)
+            if primary == "deepseek/deepseek-v4-pro" and has_thinking:
+                continue
             findings.append(("FATAL", f"model_primary {primary} is on banned list"))
         for fb in fallbacks:
             if fb == banned or (banned.endswith("/*") and fb.startswith(banned[:-1])):

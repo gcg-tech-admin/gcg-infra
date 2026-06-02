@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# pre-push: validate YAML frontmatter of any fix-*.md files being pushed
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+FIXES_DIR="$REPO_ROOT/fixes"
+
+remote="$1"
+url="$2"
+
+errors=0
+
+while read local_ref local_sha remote_ref remote_sha; do
+  # Deleted ref — nothing to validate
+  if [[ "$local_sha" == "0000000000000000000000000000000000000000" ]]; then
+    continue
+  fi
+
+  # Determine range to inspect
+  if [[ "$remote_sha" == "0000000000000000000000000000000000000000" ]]; then
+    range="$local_sha"
+  else
+    range="${remote_sha}..${local_sha}"
+  fi
+
+  # Collect fix-*.md files changed in the push range
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    full_path="$REPO_ROOT/$file"
+    [[ ! -f "$full_path" ]] && continue
+
+    result=$(python3 - "$full_path" <<'PYEOF'
+import sys, re, yaml
+
+path = sys.argv[1]
+fname = path.split('/')[-1]
+
+with open(path) as f:
+    content = f.read()
+
+m = re.match(r'^---\s*\n(.*?\n)---', content, re.DOTALL)
+if not m:
+    print(f"FAIL|{fname}|No YAML frontmatter found")
+    sys.exit(0)
+
+try:
+    data = yaml.safe_load(m.group(1)) or {}
+except yaml.YAMLError as e:
+    print(f"FAIL|{fname}|YAML parse error: {e}")
+    sys.exit(0)
+
+if not isinstance(data, dict):
+    print(f"FAIL|{fname}|Frontmatter is not a mapping")
+    sys.exit(0)
+
+# Required fields (present and non-empty)
+required = ['id', 'date', 'agent', 'severity', 'status', 'systems', 'symptom', 'root_cause', 'solution']
+missing = [f for f in required if f not in data]
+if missing:
+    print(f"FAIL|{fname}|Missing required fields: {', '.join(missing)}")
+    sys.exit(0)
+
+fid      = str(data.get('id') or '')
+agent    = str(data.get('agent') or '')
+severity = str(data.get('severity') or '')
+status   = str(data.get('status') or '')
+
+# Validate patterns and enums
+errs = []
+
+if not re.match(r'^fix-\d{4}-\d{2}-\d{2}-[a-z0-9-]+$', fid):
+    errs.append(f"id '{fid}' does not match fix-YYYY-MM-DD-slug pattern")
+
+if agent not in ('daen', 'vulcan', 'argus', 'talos', 'mnemosyne'):
+    errs.append(f"agent '{agent}' not in allowed list [daen, vulcan, argus, talos, mnemosyne]")
+
+if severity not in ('crit', 'warn', 'info'):
+    errs.append(f"severity '{severity}' not in [crit, warn, info]")
+
+if status not in ('resolved', 'partial', 'reverted'):
+    errs.append(f"status '{status}' not in [resolved, partial, reverted]")
+
+if errs:
+    print(f"FAIL|{fname}|" + "; ".join(errs))
+else:
+    print(f"OK|{fname}|")
+PYEOF
+)
+
+    verdict=$(echo "$result" | cut -d'|' -f1)
+    file_name=$(echo "$result" | cut -d'|' -f2)
+    reason=$(echo "$result" | cut -d'|' -f3-)
+
+    if [[ "$verdict" == "FAIL" ]]; then
+      echo "[pre-push] VALIDATION FAILED: $file_name — $reason" >&2
+      errors=$((errors + 1))
+    fi
+
+  done < <(git diff-tree --no-commit-id -r --name-only "$range" 2>/dev/null \
+             | grep '^fixes/fix-.*\.md$' \
+             | grep -v 'INDEX\.md' || true)
+
+done
+
+if [[ $errors -gt 0 ]]; then
+  echo "[pre-push] $errors fix file(s) failed schema validation. Push blocked." >&2
+  exit 1
+fi
+
+exit 0

@@ -1,7 +1,23 @@
-# FLEET_INDEX.md # Boot map for all GCG agents. Load on startup. Fetch only what you need. # Last updated: 2026-05-20 | Owner: Daen 
+# FLEET_INDEX.md # Boot map for all GCG agents. Load on startup. Fetch only what you need. # Last updated: 2026-06-01 | Owner: Daen 
 
 ---
 
+
+## UPDATE LOG — 2026-06-01
+
+### Talos Model Routing
+Talos is now `claude-cli/claude-opus-4-8` primary for engineering sessions, with fallbacks `openai/gpt-5.5` then `deepseek/deepseek-v4-pro`. Runtime compaction is disabled in `/opt/gcg/openclaw-talos/openclaw.json` by Peter request. Anthropic docs still indicate 1M context is Sonnet 4 beta only; Opus 4.x should be treated as 200K unless provider metadata says otherwise.
+
+### Self-Serve Channel Connect (skill now referenced fleet-wide)
+Every agent provisions and heals its OWN channels/services. Canonical SOP: `gcg-channel-connect` skill (`/opt/gcg/shared/skills/gcg-channel-connect/SKILL.md`). Covers Slack, WhatsApp (Beeper MCP), Telegram, Gmail/Google DWD, and gateway self-healing. **Token = identity — never share tokens or bridges across agents.**
+
+**Role chain (binding):**
+- **Owning agent** — wires its own channels, self-heals routine gateway failures (SKILL Section 5). Does NOT route wiring to Daen.
+- **Vulcan** — mandatory QA on every wiring; verifies live `openclaw.json` / DB / systemd state, never the agent's text alone.
+- **Talos** — engineer-of-record; assists when a wiring hits a technical blocker the SOP doesn't cover.
+- **Daen** — escalation backstop + final QA; engaged ONLY on (1) blocked/uncovered case, (2) no SOP exists, (3) authorization required (new DWD grant, prod config change, token-identity collision).
+
+**Flow:** owning agent wires → Vulcan QAs (Talos engineers fixes) → escalate to Daen only on the three triggers.
 
 ## UPDATE LOG — 2026-05-23
 

@@ -26,7 +26,7 @@
 set -euo pipefail
 
 PGUSER_FLEET="gcg_fleet"
-PGHOST="95.217.114.49"
+PGHOST="10.0.0.2"
 PGPORT="5432"
 PGDB="gcg_intelligence"
 PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"

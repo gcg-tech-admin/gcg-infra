@@ -223,7 +223,7 @@ shared_token_groups:
 
     # Carry-through top-level sections from roster that we don't synthesize ourselves.
     # Dropping these was a v2.0 → v2.1 regression (red-team finding).
-    for section in ("humans", "infrastructure", "network", "dispatch", "shared_inboxes", "agent_emails"):
+    for section in ("humans", "infrastructure", "network", "dispatch", "shared_inboxes", "agent_emails", "self_serve_channels"):
         if section in ex_top and ex_top[section]:
             hdr += f"\n{section}:\n"
             # Use ruamel to round-trip structured content; fall back to json indented.

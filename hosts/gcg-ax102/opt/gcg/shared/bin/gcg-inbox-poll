@@ -11,13 +11,32 @@
 
 set -euo pipefail
 
+# ── Error handler ──────────────────────────────────────────────────
+# On any unhandled error (via ERR trap or explicit call), log full
+# traceback to stderr and notify Peter via /opt/gcg/shared/bin/fleet send.
+_fatal() {
+  local rc=$?
+  local line=$1
+  echo "gcg-inbox-poll: FATAL at line ${line} (exit ${rc})" >&2
+  # Print bash stack trace
+  local frame=0
+  while caller $frame >/dev/null 2>&1; do
+    caller $frame >&2
+    frame=$((frame + 1))
+  done
+  # Notify Peter: /opt/gcg/shared/bin/fleet send to daen (daen routes to Peter)
+  /opt/gcg/shared/bin/fleet send daen "gcg-inbox-poll FAILED for ${AGENT:-?}: error at line ${line}, exit ${rc}" 2>/dev/null || true
+  exit ${rc}
+}
+trap '_fatal ${LINENO}' ERR
+
 AGENT="${1:?usage: gcg-inbox-poll <agent>}"
 WS="/opt/gcg/openclaw-${AGENT}/workspace"
 INBOX_DIR="${WS}/inbox"
 PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
 
-[ ! -d "$WS" ] && { echo "gcg-inbox-poll: no workspace for $AGENT" >&2; exit 1; }
-[ ! -r "$PWD_FILE" ] && { echo "gcg-inbox-poll: cannot read $PWD_FILE" >&2; exit 1; }
+[ ! -d "$WS" ] && { echo "gcg-inbox-poll: no workspace for $AGENT" >&2; _fatal 1; }
+[ ! -r "$PWD_FILE" ] && { echo "gcg-inbox-poll: cannot read $PWD_FILE" >&2; _fatal 1; }
 
 mkdir -p "$INBOX_DIR"
 chmod 0750 "$INBOX_DIR" 2>/dev/null || true
@@ -28,7 +47,7 @@ export PGPASSWORD="$PGPW"
 # Atomically claim pending messages: SELECT FOR UPDATE SKIP LOCKED + update to acked.
 # Postgres emits one fully-formed JSON envelope per row — no bash parsing.
 # Output lines: <id>\t<json_envelope>
-ROWS=$(psql "host=95.217.114.49 port=5432 user=gcg_fleet dbname=gcg_intelligence sslmode=require" \
+ROWS=$(psql "host=10.0.0.2 port=5432 user=gcg_fleet dbname=gcg_intelligence sslmode=disable" \
   -v ON_ERROR_STOP=1 -tA -F $'\t' -v agent="$AGENT" <<'SQL'
 WITH claimed AS (
   SELECT id
@@ -89,7 +108,7 @@ if [ "$COUNT" -gt 0 ]; then
     PORT=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print((c.get('gateway') or {}).get('port') or c.get('port') or '')" "$OPENCLAW_CFG" 2>/dev/null)
     TOKEN=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print((c.get('hooks') or {}).get('token') or '')" "$OPENCLAW_CFG" 2>/dev/null)
     if [ -n "$PORT" ] && [ -n "$TOKEN" ]; then
-      MSG="You have ${COUNT} new inbox message(s) at workspace/inbox/ (ids: ${IDS}). Process per /opt/gcg/shared/docs/FLEET_INBOX.md: cat each, act on it, then 'fleet done <id>' and rm the file."
+      MSG="You have ${COUNT} new inbox message(s) at workspace/inbox/ (ids: ${IDS}). Process per /opt/gcg/shared/docs/FLEET_INBOX.md: cat each, act on it, then 'fleet done <id>' and rm the file. Respond in English only."
       # Build JSON payload safely with python (handles quoting)
       BODY=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1]}))" "$MSG")
       curl -fsS --max-time 8 \
