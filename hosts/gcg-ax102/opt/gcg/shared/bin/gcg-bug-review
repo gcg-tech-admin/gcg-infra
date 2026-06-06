@@ -1,0 +1,95 @@
+#!/bin/bash
+# gcg-bug-review — daily bug pattern analysis
+#
+# Usage:
+#   gcg-bug-review                          # today, all agents
+#   gcg-bug-review --date 2026-06-06        # specific date
+#   gcg-bug-review --agent talos            # one agent
+#   gcg-bug-review --patterns               # pattern detection across all history
+
+set -euo pipefail
+BUG_DIR="/opt/gcg/shared/logs/bugs"
+DATE="${DATE:-$(date +%Y-%m-%d)}"
+AGENT="${AGENT:-}"
+PATTERNS=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --date) DATE="$2"; shift 2 ;;
+    --agent) AGENT="$2"; shift 2 ;;
+    --patterns) PATTERNS=true; shift ;;
+    *) echo "Unknown: $1"; exit 1 ;;
+  esac
+done
+
+if $PATTERNS; then
+  echo "=== PATTERN DETECTION (all agents, all dates) ==="
+  echo ""
+  cat "$BUG_DIR"/*/*.jsonl 2>/dev/null | python3 -c "
+import json, sys
+from collections import Counter
+
+bugs = [json.loads(l) for l in sys.stdin if l.strip()]
+print(f'Total bugs logged: {len(bugs)}')
+print()
+
+# By category
+cats = Counter(b['category'] for b in bugs)
+print('By category:')
+for c, n in cats.most_common():
+    print(f'  {c:15s}: {n:4d}')
+print()
+
+# By agent
+agents = Counter(b['agent'] for b in bugs)
+print('By agent:')
+for a, n in agents.most_common():
+    print(f'  {a:15s}: {n:4d}')
+print()
+
+# Find similar patterns (keywords in summary)
+keywords = Counter()
+for b in bugs:
+    s = b['summary'].lower()
+    for kw in ['public ip', 'vswitch', '10.0.0.2', 'url', 'validation', 'truncated', 
+               '404', 'timeout', 'connection refused', 'schema', 'migration', 'auth',
+               'permission denied', 'drain', 'restart', 'crash', 'oom', 'rate limit',
+               '429', '500', 'impersonation', 'scope', 'dwd', 'broker']:
+        if kw in s:
+            keywords[kw] += 1
+print('Keyword patterns:')
+for kw, n in keywords.most_common(15):
+    print(f'  {kw:20s}: {n:4d}')
+"
+  exit 0
+fi
+
+# Daily review
+echo "=== BUG REVIEW: $DATE ==="
+if [ -n "$AGENT" ]; then
+  dirs=("$BUG_DIR/$AGENT")
+else
+  dirs=("$BUG_DIR"/*/)
+fi
+
+total=0
+for dir in "${dirs[@]}"; do
+  agent=$(basename "$dir")
+  [ ! -d "$dir" ] && continue
+  file="$dir/$DATE.jsonl"
+  [ ! -f "$file" ] && continue
+
+  count=$(wc -l < "$file")
+  total=$((total + count))
+  echo ""
+  echo "── $agent ($count bugs) ──"
+  cat "$file" | python3 -c "
+import json, sys
+for l in sys.stdin:
+    b = json.loads(l.strip())
+    print(f'  [{b[\"timestamp\"][11:19]}] {b[\"category\"]:12s} {b[\"summary\"][:100]}')
+"
+done
+
+echo ""
+echo "Total: $total bugs on $DATE"

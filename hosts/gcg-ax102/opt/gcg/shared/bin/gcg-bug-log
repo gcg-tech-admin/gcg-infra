@@ -1,0 +1,36 @@
+#!/bin/bash
+# gcg-bug-log — per-agent bug/error/incident logger
+# 
+# Usage:
+#   gcg-bug-log <agent> "<category>" "<summary>" [<detail>]
+#
+# Categories: connection, timeout, auth, schema, validation, crash, config, api, other
+#
+# Logs to: /opt/gcg/shared/logs/bugs/<agent>/YYYY-MM-DD.jsonl
+# Daily review: gcg-bug-review [--agent <name>] [--date YYYY-MM-DD] [--patterns]
+
+set -euo pipefail
+BUG_DIR="/opt/gcg/shared/logs/bugs"
+
+agent="${1:?Usage: gcg-bug-log <agent> <category> <summary> [detail]}"
+category="${2:-other}"
+summary="${3:?summary required}"
+detail="${4:-}"
+timestamp="$(date -u +%FT%TZ)"
+
+mkdir -p "$BUG_DIR/$agent"
+logfile="$BUG_DIR/$agent/$(date +%Y-%m-%d).jsonl"
+
+entry=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'timestamp': '$timestamp',
+    'agent': '$agent',
+    'category': '$category',
+    'summary': '''${summary//\'/\'\\\'\'}''',
+    'detail': '''${detail//\'/\'\\\'\'}''' if '$detail' else None
+}))
+" 2>/dev/null)
+
+echo "$entry" >> "$logfile"
+echo "logged: $agent/$category: $summary" >&2
