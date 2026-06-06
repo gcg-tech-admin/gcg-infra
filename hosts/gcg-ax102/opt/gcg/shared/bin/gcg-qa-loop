@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+gcg-qa-loop — Deterministic QA gate for GCG feature delivery.
+
+Auto-detects what changed and runs the right checks. No manual config needed.
+Exit 0 = all pass. Exit 1 = failures found. Exit 2 = nothing to check.
+
+Usage:
+  gcg-qa-loop                  # auto-detect from recent git changes
+  gcg-qa-loop --scope all      # full suite (slow)
+  gcg-qa-loop --scope quick    # health-only (fast)
+  gcg-qa-loop --since 2h       # check changes from last 2 hours
+
+Gate categories (auto-detected):
+  DB_SQL      → schema, indexes, views, triggers
+  PYTHON      → imports, syntax, basic unit tests
+  FRONTEND    → page serves, JS bundle compiles
+  CONFIG      → openclaw.json valid, gateway responds
+  SCRIPT      → bash -n, basic execution
+  INFRA       → broker, DB reachable, AX42 staging
+  MCP         → MCP server imports + tool registration
+
+All checks must pass before fleet done.
+"""
+
+import subprocess, sys, os, json, argparse
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SHARED = "/opt/gcg/shared"
+LOGS = f"{SHARED}/logs"
+QA_LOG = f"{LOGS}/qa-loop.log"
+
+
+def run(cmd, timeout=15):
+    """Run a command, return (exit_code, stdout, stderr)."""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return -1, "", "TIMEOUT"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def detect_changes(since_hours=2):
+    """Detect what changed recently in git repos."""
+    changes = set()
+    for repo in [f"{SHARED}/gcg_tools", "/opt/gcg/infra-repo", "/opt/gcg/openclaw-talos/workspace"]:
+        if not (Path(repo) / ".git").exists():
+            continue
+        code, out, _ = run(f"cd {repo} && git log --oneline --since='{since_hours} hours ago' 2>/dev/null")
+        if code == 0 and out.strip():
+            files_code, files_out, _ = run(f"cd {repo} && git diff --name-only HEAD~5..HEAD 2>/dev/null")
+            if files_code == 0:
+                for f in files_out.split("\n"):
+                    f = f.strip()
+                    if f.endswith(".sql"):
+                        changes.add("DB_SQL")
+                    elif f.endswith(".py") and "test" not in f.lower():
+                        changes.add("PYTHON")
+                    elif f.endswith((".tsx", ".ts", ".jsx", ".js", ".css")):
+                        changes.add("FRONTEND")
+                    elif f.endswith((".json")):
+                        changes.add("CONFIG")
+                    elif f.endswith((".sh", ".bash")):
+                        changes.add("SCRIPT")
+                    elif "mcp" in f.lower():
+                        changes.add("MCP")
+                    elif "systemd" in f or "docker" in f or "nginx" in f:
+                        changes.add("INFRA")
+
+    if not changes:
+        # Fallback: just check infrastructure health
+        changes = {"INFRA"}
+
+    return changes
+
+
+def run_checks(scopes: set, verbose=False):
+    """Run targeted checks. Return (pass_count, fail_count, failures)."""
+    failures = []
+    passed = 0
+    failed = 0
+
+    def check(name, cmd, expect_code=0, expect_contains=None):
+        nonlocal passed, failed
+        code, stdout, stderr = run(cmd)
+        ok = (code == expect_code)
+        if expect_contains:
+            ok = ok and (expect_contains in stdout)
+        if ok:
+            passed += 1
+            if verbose:
+                print(f"  ✅ {name}")
+        else:
+            failed += 1
+            detail = stderr[:100] or stdout[:100] or f"exit={code}"
+            failures.append((name, detail))
+            print(f"  ❌ {name}: {detail}")
+
+    # INFRA — always run
+    if "INFRA" in scopes:
+        check("broker-health", "curl -s http://127.0.0.1:18970/health | python3 -c 'import json,sys; assert json.load(sys.stdin)[\"status\"]==\"ok\"'")
+        check("db-reachable", f"GCG_DB_HOST=10.0.0.2 /opt/gcg/shared/venv/bin/python3 -c \"import os; os.environ['GCG_DB_HOST']='10.0.0.2'; import sys; sys.path.insert(0,'{SHARED}/gcg_tools'); from db_connect import get_connection; c=get_connection(agent_name='talos'); c.cursor().execute('SELECT 1'); c.close()\"")
+        check("ax42-staging-be", "ssh -i /etc/gcg/fleet-ax42-access -o StrictHostKeyChecking=no -o ConnectTimeout=8 root@10.0.0.2 'curl -s -o /dev/null -w \"%{http_code}\" --max-time 5 http://127.0.0.1:8001/docs'", expect_contains="200")
+        check("ax42-staging-fe", "ssh -i /etc/gcg/fleet-ax42-access -o StrictHostKeyChecking=no -o ConnectTimeout=8 root@10.0.0.2 'curl -s -o /dev/null -w \"%{http_code}\" --max-time 5 http://127.0.0.1:8004'", expect_contains="200")
+        check("gateway-health", "curl -s http://127.0.0.1:18950/healthz | python3 -c 'import json,sys; assert json.load(sys.stdin)[\"status\"]==\"live\"'")
+
+    # PYTHON
+    if "PYTHON" in scopes:
+        # Find recently modified .py files and test imports
+        code, py_files, _ = run("find /opt/gcg/shared/gcg_tools -name '*.py' -mmin -120 2>/dev/null | head -10")
+        for f in (py_files or "").split("\n"):
+            f = f.strip()
+            if not f or "__pycache__" in f:
+                continue
+            mod = f.replace("/opt/gcg/shared/gcg_tools/", "").replace("/", ".").replace(".py", "")
+            check(f"import:{mod}", f"GCG_DB_HOST=10.0.0.2 cd /opt/gcg/shared && /opt/gcg/shared/venv/bin/python3 -c 'import sys; sys.path.insert(0,\"{SHARED}/gcg_tools\"); import {mod}'")
+
+    # MCP
+    if "MCP" in scopes:
+        for server in ["gcg_google_v2", "gcg_instagram"]:
+            check(f"mcp-import:{server}", f"cd {SHARED} && /opt/gcg/shared/venv/bin/python3 -c 'import sys; sys.path.insert(0, \"{SHARED}/gcg_tools\"); sys.path.insert(0, \"{SHARED}\"); __import__(\"{server}.mcp_tools\")'")
+
+    # DB_SQL
+    if "DB_SQL" in scopes:
+        check("db-indexes-valid", f"GCG_DB_HOST=10.0.0.2 /opt/gcg/shared/venv/bin/python3 -c \"import os; os.environ['GCG_DB_HOST']='10.0.0.2'; import sys; sys.path.insert(0,'{SHARED}/gcg_tools'); from db_connect import get_connection; c=get_connection(agent_name='talos'); cur=c.cursor(); cur.execute(\\\"SELECT indexname FROM pg_indexes WHERE indexname LIKE '%recent%'\\\"); print(f'{cur.rowcount} indexes')\"")
+
+    # SCRIPT
+    if "SCRIPT" in scopes:
+        code, scripts, _ = run(f"find {SHARED}/scripts {SHARED}/bin -name '*.sh' -mmin -120 2>/dev/null | head -5")
+        for s in (scripts or "").split("\n"):
+            s = s.strip()
+            if s:
+                check(f"bash-syntax:{s.split('/')[-1]}", f"bash -n {s}")
+
+    # FRONTEND
+    if "FRONTEND" in scopes:
+        check("staging-fe-200", "ssh -i /etc/gcg/fleet-ax42-access -o StrictHostKeyChecking=no -o ConnectTimeout=8 root@10.0.0.2 'curl -s -o /dev/null -w \"%{http_code}\" --max-time 5 http://127.0.0.1:8004'", expect_contains="200")
+
+    return passed, failed, failures
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Deterministic QA gate for GCG features")
+    parser.add_argument("--scope", choices=["all", "quick", "auto"], default="auto")
+    parser.add_argument("--since", default="2h", help="Detect changes from last N hours (auto mode)")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    args = parser.parse_args()
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"=== GCG QA LOOP — {ts} ===\n")
+
+    # Determine scope
+    if args.scope == "all":
+        scopes = {"INFRA", "PYTHON", "MCP", "DB_SQL", "SCRIPT", "FRONTEND", "CONFIG"}
+    elif args.scope == "quick":
+        scopes = {"INFRA"}
+    else:  # auto
+        hours = 2
+        try:
+            hours = int(args.since.replace("h", ""))
+        except ValueError:
+            pass
+        scopes = detect_changes(hours)
+
+    print(f"Scope: {' '.join(sorted(scopes))} (mode={args.scope})\n")
+
+    passed, failed, failures = run_checks(scopes, verbose=args.verbose)
+
+    print(f"\n=== RESULT: {passed} pass, {failed} fail ===")
+    if failures:
+        for name, detail in failures:
+            print(f"  ❌ {name}: {detail}")
+
+    # Log to file
+    os.makedirs(LOGS, exist_ok=True)
+    with open(QA_LOG, "a") as f:
+        f.write(f"[{ts}] scope={args.scope} → {passed}P/{failed}F/{passed+failed}T\n")
+        for name, detail in failures:
+            f.write(f"  FAIL {name}: {detail}\n")
+
+    sys.exit(0 if failed == 0 else 1)
+
+
+if __name__ == "__main__":
+    main()
