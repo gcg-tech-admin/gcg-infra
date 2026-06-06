@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""
+rate-tool-calls — self-assessment hook for subagent tool call utility.
+
+Called after subagent completion. Rates each tool call on utility:
+  useful  — result directly advanced the task
+  partial — partially helpful but incomplete
+  useless — wasted time, irrelevant, or wrong
+
+Usage:
+  rate-tool-calls <agent> <session_id> [--dry-run]
+
+Reads from tool_call_log for the session, prompts the agent (or uses
+heuristic scoring), writes utility_score/utility_label/utility_reason.
+
+Scoring rubric per tool type:
+  web_search: relevance of top 3 results, presence of direct answer
+  web_fetch:  whether content matched intent, page was accessible
+  read:       whether file had needed info, format was parseable
+  exec:       whether stdout had expected output, exit code 0
+  memory_search: whether recall hit relevant prior work
+"""
+
+import os, sys, json, argparse
+from datetime import datetime, timezone
+
+sys.path.insert(0, '/opt/gcg/shared/gcg_tools')
+from db_connect import get_connection
+
+SCORING_RUBRIC = {
+    'web_search': {
+        'score_hints': ['result_count > 0', 'relevant summary in snippet'],
+        'useless_when': ['no results', 'all results off-topic', 'error/fail'],
+        'partial_when': ['some relevant but need more', 'one good hit, rest noise'],
+        'useful_when': ['top 3 all relevant', 'direct answer in results', 'found what I needed']
+    },
+    'web_fetch': {
+        'useless_when': ['403/404/5xx', 'empty body', 'wrong domain/not the doc I wanted'],
+        'partial_when': ['truncated but useful', 'some content but missing key parts'],
+        'useful_when': ['full content extracted', 'exactly the document I needed']
+    },
+    'exec': {
+        'useless_when': ['exit non-zero on critical cmd', 'permission denied', 'empty output on expected-data cmd'],
+        'partial_when': ['exit non-zero but still informed', 'timeout but partial output'],
+        'useful_when': ['exit 0', 'got expected output', 'command completed successfully']
+    },
+    'read': {
+        'useless_when': ['file not found', 'permission denied', 'empty/truncated with no content'],
+        'partial_when': ['found but not what I expected', 'incomplete read'],
+        'useful_when': ['contained needed info', 'clean parse']
+    },
+    'memory_search': {
+        'useless_when': ['no results', 'all irrelevant', 'wrong domain'],
+        'partial_when': ['some hits but stale', 'related but not exact'],
+        'useful_when': ['hit prior work on this exact topic', 'found relevant context']
+    },
+}
+
+def heuristic_score(tool_name: str, outcome: str, error_text: str, result_count: int, result_summary: str) -> tuple:
+    """Quick heuristic score. Returns (utility_label, utility_score, reason)."""
+    
+    # Always-useless patterns
+    if outcome == 'error':
+        return ('useless', 0.0, f'Tool execution failed: {error_text[:80] if error_text else "unknown error"}')
+    
+    if outcome == 'empty':
+        return ('useless', 0.0, 'Tool returned empty output')
+    
+    if outcome == 'unknown':
+        return ('partial', 0.3, 'Tool outcome unknown — execution may have been interrupted')
+    
+    # Tool-specific heuristics
+    rubric = SCORING_RUBRIC.get(tool_name, {})
+    
+    if tool_name == 'web_search' and result_count == 0:
+        return ('useless', 0.0, 'Search returned zero results')
+    if tool_name == 'web_search' and result_count and result_count >= 3:
+        return ('useful', 0.8, f'Search returned {result_count} results')
+    if tool_name == 'web_search' and result_count == 1:
+        return ('partial', 0.4, 'Only one result from search')
+    
+    if tool_name == 'web_fetch' and result_count and result_count > 0:
+        return ('useful', 0.8, f'Fetched {result_count} chars of content')
+    if tool_name == 'web_fetch':
+        return ('partial', 0.4, 'Fetch completed but content may be incomplete')
+    
+    if tool_name == 'exec' and outcome == 'success':
+        return ('useful', 0.8, 'Command executed successfully')
+    
+    if tool_name == 'read' and result_count and result_count > 0:
+        return ('useful', 0.8, f'Read returned {result_count} lines/chars')
+    
+    if tool_name == 'memory_search' and result_count and result_count > 0:
+        return ('useful', 0.8, f'Memory search returned {result_count} results')
+    if tool_name == 'memory_search':
+        return ('partial', 0.3, 'Memory search returned no matches')
+    
+    # Generic fallback: if success and has output, partial; if success and plenty of output, useful
+    if outcome == 'success' and result_count and result_count > 0:
+        return ('useful', 0.7, f'Tool returned {result_count} items')
+    if outcome == 'success':
+        return ('partial', 0.5, 'Tool succeeded with minimal output')
+    
+    return ('partial', 0.5, 'Could not determine utility')
+
+
+def rate_session_tools(conn, agent: str, session_id: str, dry_run: bool = False):
+    """Rate all tool calls for a given session."""
+    cur = conn.cursor()
+    
+    # Get unrated tool calls for this session
+    cur.execute("""
+        SELECT id, tool_name, outcome, error_text, result_count, result_summary
+        FROM tool_call_log
+        WHERE session_id = %s AND utility_label IS NULL
+        ORDER BY ts
+    """, (session_id,))
+    
+    rows = cur.fetchall()
+    if not rows:
+        print(f"No unrated tool calls for session {session_id}")
+        return []
+    
+    ratings = []
+    for row_id, tool_name, outcome, error_text, result_count, result_summary in rows:
+        label, score, reason = heuristic_score(tool_name, outcome, error_text, result_count or 0, result_summary)
+        
+        if not dry_run:
+            cur.execute("""
+                UPDATE tool_call_log
+                SET utility_score = %s, utility_label = %s, utility_reason = %s, rated_by = %s, rated_at = NOW()
+                WHERE id = %s
+            """, (score, label, reason, agent, row_id))
+        
+        ratings.append((tool_name, label, score, reason))
+    
+    if not dry_run:
+        conn.commit()
+    
+    cur.close()
+    return ratings
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Rate tool call utility for a session')
+    parser.add_argument('agent', help='Agent name doing the rating')
+    parser.add_argument('session_id', help='Session ID to rate')
+    parser.add_argument('--dry-run', action='store_true', help='Show ratings without writing')
+    args = parser.parse_args()
+    
+    conn = get_connection(agent_name=args.agent)
+    ratings = rate_session_tools(conn, args.agent, args.session_id, args.dry_run)
+    
+    useful = sum(1 for r in ratings if r[1] == 'useful')
+    partial = sum(1 for r in ratings if r[1] == 'partial')
+    useless = sum(1 for r in ratings if r[1] == 'useless')
+    
+    print(f"\nSession {args.session_id}: {len(ratings)} tools rated")
+    print(f"  useful:  {useful}")
+    print(f"  partial: {partial}")
+    print(f"  useless: {useless}")
+    print(f"  utility ratio: {useful}/{len(ratings)} = {useful/len(ratings)*100:.0f}%" if ratings else "  no tools to rate")
+    
+    for tool, label, score, reason in ratings:
+        emoji = {'useful': '✅', 'partial': '⚠️', 'useless': '❌'}.get(label, '?')
+        print(f"  {emoji} {tool}: {label} ({score:.1f}) — {reason}")
+    
+    conn.close()
+
+
+if __name__ == '__main__':
+    main()

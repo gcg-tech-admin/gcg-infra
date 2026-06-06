@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""
+Daily tool utility rollup — which tools are productive vs wasteful.
+
+Usage:
+  daily-tool-scoring              # today, all agents
+  daily-tool-scoring --days 7      # last 7 days
+  daily-tool-scoring --agent talos # one agent
+
+Output:
+  - Utility ratio per tool (useful/total)
+  - Waste ratio per tool (useless/total)
+  - Trend: is utility improving or degrading?
+  - Top waste generators — which tools cost the most with least value
+"""
+
+import os, sys, argparse
+from datetime import datetime, timezone, timedelta
+
+sys.path.insert(0, '/opt/gcg/shared/gcg_tools')
+from db_connect import get_connection
+
+QUERY = """
+WITH rated AS (
+    SELECT
+        tool_name,
+        utility_label,
+        COUNT(*) as n
+    FROM tool_call_log
+    WHERE ts >= %(since)s
+      AND ts < %(until)s
+      AND (%(agent)s IS NULL OR agent_name = %(agent)s)
+      AND utility_label IS NOT NULL
+    GROUP BY tool_name, utility_label
+),
+totals AS (
+    SELECT tool_name, SUM(n) as total
+    FROM rated
+    GROUP BY tool_name
+)
+SELECT
+    t.tool_name,
+    t.total,
+    COALESCE(u.n, 0) as useful,
+    COALESCE(p.n, 0) as partial,
+    COALESCE(w.n, 0) as useless,
+    ROUND(COALESCE(u.n, 0)::numeric / NULLIF(t.total, 0) * 100, 1) as pct_useful,
+    ROUND(COALESCE(w.n, 0)::numeric / NULLIF(t.total, 0) * 100, 1) as pct_waste,
+    ROUND(AVG(s.utility_score)::numeric, 2) as avg_score
+FROM totals t
+LEFT JOIN rated u ON u.tool_name = t.tool_name AND u.utility_label = 'useful'
+LEFT JOIN rated p ON p.tool_name = t.tool_name AND p.utility_label = 'partial'
+LEFT JOIN rated w ON w.tool_name = t.tool_name AND w.utility_label = 'useless'
+LEFT JOIN tool_call_log s ON s.tool_name = t.tool_name
+    AND s.ts >= %(since)s AND s.ts < %(until)s
+    AND (%(agent)s IS NULL OR s.agent_name = %(agent)s)
+    AND s.utility_score IS NOT NULL
+GROUP BY t.tool_name, t.total, u.n, p.n, w.n
+ORDER BY t.total DESC
+"""
+
+
+def run(days: int = 1, agent: str = None):
+    conn = get_connection(agent_name='talos')
+    cur = conn.cursor()
+    
+    until = datetime.now(timezone.utc)
+    since = until - timedelta(days=days)
+    
+    params = {'since': since.isoformat(), 'until': until.isoformat(), 'agent': agent}
+    cur.execute(QUERY, params)
+    rows = cur.fetchall()
+    
+    if not rows:
+        print("No rated tool calls found. Run rate-tool-calls on sessions first.")
+        cur.close(); conn.close()
+        return
+    
+    total_all = sum(r[1] for r in rows)
+    total_useful = sum(r[2] for r in rows)
+    total_waste = sum(r[4] for r in rows)
+    
+    print(f"=== TOOL UTILITY SCORECARD ({days}d, {agent or 'all agents'}) ===")
+    print(f"Total rated calls: {total_all}")
+    print(f"Overall utility: {total_useful}/{total_all} = {total_useful/total_all*100:.0f}% useful")
+    print(f"Overall waste:    {total_waste}/{total_all} = {total_waste/total_all*100:.0f}% useless")
+    print()
+    print(f"{'Tool':<20s} {'Total':>6s} {'Useful':>7s} {'Partial':>7s} {'Useless':>7s} {'Util%':>6s} {'Waste%':>7s} {'Avg':>5s}")
+    print("-" * 70)
+    
+    for row in rows:
+        tool, total, useful, partial, useless, pct_u, pct_w, avg = row
+        total = int(total or 0); useful = int(useful or 0); partial = int(partial or 0); useless = int(useless or 0)
+        pct_u = float(pct_u or 0); pct_w = float(pct_w or 0)
+        bar = '█' * int(pct_u / 10) + '░' * (10 - int(pct_u / 10))
+        avg_str = f'{float(avg):.2f}' if avg is not None else 'N/A'
+        print(f"{tool:<20s} {total:>6d} {useful:>7d} {partial:>7d} {useless:>7d} {pct_u:>5.0f}% {bar} {pct_w:>5.0f}% {avg_str:>5s}")
+    
+    # Worst offenders
+    print(f"\n=== 🔴 TOP WASTE GENERATORS ===")
+    waste_sorted = sorted(rows, key=lambda r: r[4], reverse=True)
+    for tool, total, useful, partial, useless, pct_u, pct_w, avg in waste_sorted[:5]:
+        if useless == 0:
+            print("  (no waste tools)")
+            break
+        print(f"  {tool}: {useless} useless calls ({pct_w:.0f}% waste rate)")
+    
+    # Unrated
+    cur.execute("""
+        SELECT COUNT(*) FROM tool_call_log
+        WHERE ts >= %(since)s AND ts < %(until)s
+        AND (%(agent)s IS NULL OR agent_name = %(agent)s)
+        AND utility_label IS NULL
+    """, params)
+    unrated = cur.fetchone()[0]
+    if unrated:
+        print(f"\n⚠️  {unrated} unrated tool calls — run rate-tool-calls to score them")
+    
+    cur.close(); conn.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--days', type=int, default=1)
+    parser.add_argument('--agent', default=None)
+    args = parser.parse_args()
+    run(args.days, args.agent)
