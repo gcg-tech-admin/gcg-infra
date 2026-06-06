@@ -28,7 +28,6 @@ recall flags:
   --top-k N         Number of results (default: 10)
   --json            Output JSON
   --tier0-only      Tier-0 namespace only
-  --client-id <id>  Client ID for tenant isolation (app path)
 
 capture flags:
   --agent <name>       Agent name (default: unknown)
@@ -46,13 +45,13 @@ EOF
 
 _help_recall() {
   cat <<EOF
-memory recall "<query>" [--agent <name>] [--client-id <id>] [--top-k N] [--json] [--tier0-only]
+memory recall "<query>" [--agent <name>] [--top-k N] [--json] [--tier0-only]
 EOF
 }
 
 _help_capture() {
   cat <<EOF
-memory capture "<text>" [--agent <name>] [--client-id <id>] [--source-type X] [--memory-type X] [--importance X] [--scope X] [--file <path>]
+memory capture "<text>" [--agent <name>] [--source-type X] [--memory-type X] [--importance X] [--scope X] [--file <path>]
 EOF
 }
 
@@ -244,7 +243,7 @@ _audit_capture() {
 
 # ── Subcommand: recall ─────────────────────────────────────────────────────────
 cmd_recall() {
-  local query="" agent="" top_k=10 json_flag="" tier0_flag="" client_id=""
+  local query="" agent="" top_k=10 json_flag="" tier0_flag=""
   local extra_args=()
 
   while [[ $# -gt 0 ]]; do
@@ -255,8 +254,6 @@ cmd_recall() {
       --top-k|--top_k)        top_k="$2"; shift 2 ;;
       --top-k=*|--top_k=*)    top_k="${1#*=}"; shift ;;
       --json)                 json_flag="--json"; shift ;;
-      --client-id)            client_id="$2"; shift 2 ;;
-      --client-id=*)          client_id="${1#--client-id=}"; shift ;;
       --tier0-only)           tier0_flag="--tier0-only"; shift ;;
       -*)                     extra_args+=("$1"); shift ;;
       *)
@@ -319,26 +316,12 @@ PYCLIENT
     # Daemon error or socket stale — fall through to recall_v3
   fi
 
-  # ── Standard path: memory_core (unified lib) for client-id; recall_v3 for fleet ──
+  # ── Standard path: shell out to recall_v3.py ────────────────────────────────
   _preflight "$agent"
   _check_db
-
-  if [[ -n "$client_id" ]]; then
-    # App path: use unified recall library with client_id
-    json_output=$($PYTHON -c "
-import sys
-sys.path.insert(0, '/opt/gcg/shared/gcg_tools')
-from memory_core import recall
-import json
-results = recall(query='${query//\'/\\\'}', agent_name='${agent}', client_id='${client_id}', top_k=${top_k})
-print(json.dumps(results))
-" 2>/dev/null) || exit_code=$?
-  else
-    # Fleet path: backward-compat — same as pre-change
-    json_output=$($PYTHON "$RECALL_V3" "$query" --top_k "$top_k" --json \
-      ${tier0_flag:+"$tier0_flag"} \
-      "${extra_args[@]+"${extra_args[@]}"}" 2>/dev/null) || exit_code=$?
-  fi
+  json_output=$($PYTHON "$RECALL_V3" "$query" --top_k "$top_k" --json \
+    ${tier0_flag:+"$tier0_flag"} \
+    "${extra_args[@]+"${extra_args[@]}"}" 2>/dev/null) || exit_code=$?
 
   # Parse memory IDs for the audit log
   local memory_ids_literal="{}"
@@ -361,7 +344,7 @@ print(json.dumps(results))
 cmd_capture() {
   local input="" agent="unknown" source_type="conversation"
   local memory_type="" importance="normal" scope="agent_private"
-  local client_id="" no_supersede="" supersede_threshold="0.85"
+  local no_supersede="" supersede_threshold="0.85"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -380,8 +363,6 @@ cmd_capture() {
       --importance=*)              importance="${1#--importance=}"; shift ;;
       --scope)                     scope="$2"; shift 2 ;;
       --scope=*)                   scope="${1#--scope=}"; shift ;;
-      --client-id)                 client_id="$2"; shift 2 ;;
-      --client-id=*)               client_id="${1#--client-id=}"; shift ;;
       --no-supersede)              no_supersede="1"; shift ;;
       --supersede-threshold)       supersede_threshold="$2"; shift 2 ;;
       --supersede-threshold=*)     supersede_threshold="${1#--supersede-threshold=}"; shift ;;
@@ -419,10 +400,6 @@ cmd_capture() {
   local importance_b64
   importance_b64=$(echo -n "$importance" | base64 -w0)
   local memory_type_b64=""
-  local client_id_b64=""
-  if [[ -n "$client_id" ]]; then
-    client_id_b64=$(echo -n "$client_id" | base64 -w0)
-  fi
   if [[ -n "$memory_type" ]]; then
     memory_type_b64=$(echo -n "$memory_type" | base64 -w0)
   fi
@@ -449,9 +426,6 @@ else:
     mt = None
 no_supersede_flag = (sys.argv[6] == "1") if len(sys.argv) > 6 else False
 threshold_val = float(base64.b64decode(sys.argv[7]).decode("utf-8")) if len(sys.argv) > 7 else 0.85
-cid_val = None
-if len(sys.argv) > 8 and sys.argv[8]:
-    cid_val = base64.b64decode(sys.argv[8]).decode("utf-8")
 
 # Read input from stdin to avoid argv size limits
 input_text = sys.stdin.read()
@@ -469,18 +443,16 @@ rows = embed_text(
     memory_type=mt,
     no_supersede=no_supersede_flag,
     supersede_threshold=threshold_val,
-    client_id=cid_val,
 )
-cid_note = f", client_id={cid_val}" if cid_val else ""
-print(f"[capture] {rows} row(s) written to memories (agent={ag}, source_type={src_type}{cid_note})")
+print(f"[capture] {rows} row(s) written to memories (agent={ag}, source_type={src_type})")
 PYSCRIPT
 )
 
   if [[ -n "${FILE_PATH:-}" ]]; then
     # Large files: pipe via stdin to avoid ARG_MAX
-    cat "$FILE_PATH" | $PYTHON -c "$PYTHON_SCRIPT" "$source_type_b64" "$agent_b64" "$scope_b64" "$importance_b64" "$memory_type_b64" "${no_supersede_flag:-0}" "$threshold_b64" "$client_id_b64" || exit_code=$?
+    cat "$FILE_PATH" | $PYTHON -c "$PYTHON_SCRIPT" "$source_type_b64" "$agent_b64" "$scope_b64" "$importance_b64" "$memory_type_b64" "${no_supersede_flag:-0}" "$threshold_b64" || exit_code=$?
   else
-    echo -n "$input" | $PYTHON -c "$PYTHON_SCRIPT" "$source_type_b64" "$agent_b64" "$scope_b64" "$importance_b64" "$memory_type_b64" "${no_supersede_flag:-0}" "$threshold_b64" "$client_id_b64" || exit_code=$?
+    echo -n "$input" | $PYTHON -c "$PYTHON_SCRIPT" "$source_type_b64" "$agent_b64" "$scope_b64" "$importance_b64" "$memory_type_b64" "${no_supersede_flag:-0}" "$threshold_b64" || exit_code=$?
   fi
 
   _audit_capture "$agent" "$input_trunc" "$exit_code"
