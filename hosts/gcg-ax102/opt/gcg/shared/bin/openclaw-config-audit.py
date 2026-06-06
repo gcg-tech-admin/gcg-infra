@@ -36,7 +36,7 @@ OPERATOR_SIGS = (
 )
 
 # Load DB creds from mnemosyne env
-DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD = "95.217.114.49", 5432, "gcg_intelligence", "gcg_mnemosyne", ""
+DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD = "10.0.0.2", 5432, "gcg_intelligence", "gcg_mnemosyne", ""
 try:
     with open("/run/openclaw-mnemosyne/env") as _f:
         for _line in _f:

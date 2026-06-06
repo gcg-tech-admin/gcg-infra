@@ -238,7 +238,7 @@ def call_deepseek(system: str, user: str, api_key: str) -> tuple[str | None, dic
 
 def write_audit_log(date_str: str, alert_count: int, usage: dict, report_path: str):
     """Write one row to public.audit_log. Read-only on everything else."""
-    db_host = os.environ.get("GCG_DB_HOST", "95.217.114.49")
+    db_host = os.environ.get("GCG_DB_HOST", "10.0.0.2")
     db_port = os.environ.get("GCG_DB_PORT", "5432")
     db_name = os.environ.get("GCG_DB_NAME", "gcg_intelligence")
     db_user = os.environ.get("GCG_DB_USER", "gcg_admin")

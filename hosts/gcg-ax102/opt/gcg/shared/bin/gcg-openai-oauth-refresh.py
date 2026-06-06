@@ -262,7 +262,7 @@ def load_db_env() -> dict:
 def audit_refresh(new_exp: int, skipped: bool = False):
     try:
         db = load_db_env()
-        host    = db.get("GCG_DB_HOST",     "95.217.114.49")
+        host    = db.get("GCG_DB_HOST",     "10.0.0.2")
         port    = db.get("GCG_DB_PORT",     "5432")
         dbname  = db.get("GCG_DB_NAME",     "gcg_intelligence")
         user    = db.get("GCG_DB_USER",     "gcg_admin")
