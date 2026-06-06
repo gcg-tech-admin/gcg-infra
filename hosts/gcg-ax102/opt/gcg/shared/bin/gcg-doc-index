@@ -24,8 +24,8 @@ VIOLATIONS=$(echo "$HEALTH" | python3 -c "import json,sys; d=json.load(sys.stdin
 DEPRECATED=$(cat /opt/gcg/shared/logs/kb_remediation_backlog.jsonl 2>/dev/null | python3 -c "
 import json,sys
 lines=[json.loads(l) for l in sys.stdin if l.strip()]
-dep=[l for l in lines if l.get('type')=='deprecated_bucket' and not l.get('resolved')]
-print(len(dep))
+unique=set(l['path'] for l in lines if l.get('type')=='deprecated_bucket' and not l.get('resolved'))
+print(len(unique))
 " 2>/dev/null || echo '?')
 echo "  docs=$DOCS_COUNT embed_fails=$EMBED_FAILS violations=$VIOLATIONS deprecated_bucket_docs=$DEPRECATED"
 
