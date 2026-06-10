@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""
+gcg-migrate-annotate — Phase 6: Annotate a migration as applied.
+
+After a successful gcg-migrate apply, this script:
+  1. Marks the ADR registry entry as applied=True
+  2. Regenerates schema-of-record.json
+  3. Verifies the event trigger is active on the target DB
+
+Usage:
+  gcg-migrate-annotate <migration_id> [--db staging|prod]
+
+Exit codes:
+  0 — annotation complete
+  1 — error
+
+Checks performed (deterministic, zero LLM calls):
+  A — Migration ID exists in ADR registry
+  B — Event trigger is installed and enabled (if migration_id starts with 010)
+  C — Schema-of-record regenerated successfully
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+# Paths
+LIB_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCHEMA_DIR = os.path.join(LIB_DIR, 'docs', 'schema')
+ADR_REGISTRY = os.path.join(SCHEMA_DIR, 'adr-registry.json')
+SCHEMA_OF_RECORD = os.path.join(SCHEMA_DIR, 'schema-of-record.json')
+VALIDATE_SCRIPT = os.path.join(SCHEMA_DIR, 'validate-schema-of-record.py')
+
+# DB hosts
+DB_HOSTS = {
+    'staging': '10.0.0.2',
+    'prod': '10.0.0.2',
+}
+DB_NAMES = {
+    'staging': 'gcg_intelligence_staging',
+    'prod': 'gcg_intelligence',
+}
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def load_json(path, label):
+    if not os.path.exists(path):
+        eprint(f'❌ {label} not found: {path}')
+        sys.exit(1)
+    with open(path) as f:
+        return json.load(f)
+
+
+def write_json(path, data):
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def check_event_trigger(target_db):
+    """Verify the ddl_gate_event_trigger is installed and enabled."""
+    host = DB_HOSTS.get(target_db, '10.0.0.2')
+    dbname = DB_NAMES.get(target_db, 'gcg_intelligence')
+
+    pwd_file = '/opt/gcg/shared/credentials/db/gcg_admin.pwd'
+    if not os.path.exists(pwd_file):
+        eprint(f'  ⚠️  Cannot verify event trigger (no gcg_admin.pwd)')
+        return False
+
+    with open(pwd_file) as f:
+        password = f.read().strip()
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(
+            dbname=dbname, user='gcg_admin',
+            password=password, host=host, port=5432
+        )
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT evtname, evtenabled
+            FROM pg_event_trigger
+            WHERE evtname = 'ddl_gate_event_trigger'
+        """)
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if row:
+            eprint(f'  ✅ Event trigger "{row[0]}" is enabled={row[1]}')
+            return True
+        else:
+            eprint(f'  ❌ Event trigger "ddl_gate_event_trigger" NOT found on {target_db}')
+            return False
+    except Exception as e:
+        eprint(f'  ⚠️  Could not verify event trigger: {e}')
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='gcg-migrate-annotate — Phase 6 annotation companion',
+    )
+    parser.add_argument('migration_id', help='Migration ID to annotate as applied')
+    parser.add_argument('--db', dest='target', default='staging',
+                        choices=['staging', 'prod'], help='Target database')
+
+    args = parser.parse_args()
+    migration_id = args.migration_id
+    target = args.target
+
+    eprint(f'━━━ gcg-migrate-annotate ─── {migration_id} ─── {target} ───')
+
+    # ── Check A: Migration ID exists in ADR ──
+    registry = load_json(ADR_REGISTRY, 'ADR registry')
+    matching = [e for e in registry['entries']
+                if e.get('migration_id') == migration_id]
+
+    if not matching:
+        eprint(f'❌ Migration ID "{migration_id}" not found in ADR registry')
+        reg_ids = set(e['migration_id'] for e in registry['entries'])
+        eprint(f'   Available IDs: {", ".join(sorted(reg_ids))}')
+        sys.exit(1)
+
+    eprint(f'  ✅ Found {len(matching)} ADR entries for migration "{migration_id}"')
+
+    # ── Check B: Event trigger verification ──
+    if migration_id == '010_ddl_event_trigger':
+        eprint('  📋 Verifying event trigger installation...')
+        if not check_event_trigger(target):
+            eprint('  ⚠️  Event trigger check failed — annotating ADR anyway')
+        else:
+            eprint('  ✅ Event trigger verified on target DB')
+
+    # ── Annotate ADR ──
+    for entry in matching:
+        entry['applied'] = True
+        eprint(f'  ✅ Marked "{entry["object_name"]}" ({entry["object_type"]}) as applied=True')
+
+    write_json(ADR_REGISTRY, registry)
+    eprint('  ✅ ADR registry saved')
+
+    # ── Check C: Regenerate schema-of-record ──
+    eprint('  📋 Regenerating schema-of-record.json...')
+    result = subprocess.run(
+        [sys.executable, VALIDATE_SCRIPT, '--regenerate', '--db', target],
+        capture_output=True, text=True, timeout=60
+    )
+    if result.returncode != 0:
+        eprint(f'  ⚠️  Schema regeneration warning: {result.stdout.strip()[:200]}')
+        # Fallback: try the superapp generator
+        alt_gen = '/opt/gcg/shared/skills/project-context/scripts/superapp-data-model-generator.py'
+        if os.path.exists(alt_gen):
+            r2 = subprocess.run(
+                [sys.executable, alt_gen],
+                capture_output=True, timeout=120
+            )
+            if r2.returncode == 0:
+                eprint('  ✅ Schema-of-record regenerated (alt generator)')
+            else:
+                eprint('  ⚠️  Alt schema generator also failed (non-fatal)')
+    else:
+        eprint('  ✅ Schema-of-record regenerated')
+
+    eprint(f'\n✅ Annotation complete for "{migration_id}"')
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()

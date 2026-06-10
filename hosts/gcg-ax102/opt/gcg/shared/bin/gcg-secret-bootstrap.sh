@@ -101,7 +101,7 @@ esac
 # Rotation: replace the file attachment on the 1Password item, keep the filename stable.
 GOOGLE_SA_OP_REF="op://GCG Agent Fleet/sth5aujsjwj54yu2uvnr6klexa/gcg-agents-19e05d85a38d.json"
 case "$AGENT" in
-  alex|alexa|algaib|angela|anna|argus|bob|daen|goku|hector|kenji|kira|leon|malik|marcus|max|niccolo|nik|phil|talos|tom|varys|vera|viktor|vulcan|yuri)
+  alex|alexa|algaib|angela|anna|argus|bob|daen|goku|hector|jc|kenji|kira|leon|malik|marcus|max|niccolo|nik|phil|talos|tom|varys|vera|viktor|vulcan|yuri)
     GOOGLE_SA_PATH="$RUNTIME_DIR/google-sa.json"
     if op read "$GOOGLE_SA_OP_REF" > "$GOOGLE_SA_PATH" 2>/dev/null && [ -s "$GOOGLE_SA_PATH" ]; then
       chmod 400 "$GOOGLE_SA_PATH"

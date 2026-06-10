@@ -1,5 +1,5 @@
 [Unit]
-Description=GCG inbox janitor (stuck-acked alerts + retention)
+Description=GCG inbox janitor v4 (stuck-acked alerts + retention)
 After=network-online.target
 
 [Service]
@@ -11,3 +11,5 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+StateDirectory=gcg-inbox-janitor
+ReadWritePaths=/var/lib/gcg-inbox-janitor

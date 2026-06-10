@@ -1,0 +1,162 @@
+#!/bin/bash
+# Claude Interactive TMUX Bridge v23 — CLEAN REWRITE
+# Uses paste-buffer for instant delivery, extracts full multi-line responses
+set -e
+
+HOME_DIR="/opt/gcg/claude-profiles/sub-peter"
+WORK_DIR="/opt/gcg/shared"
+TIMEOUT=${GCTB_TIMEOUT:-300}
+CYCLE_EVERY=${GCTB_CYCLE_EVERY:-5}
+STALE_TIMEOUT=${GCTB_STALE_TIMEOUT:-15}
+STATE_DIR="/tmp/gcg-bridge-state"
+
+MODEL="opus-4-7"
+PROMPT=""
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model) MODEL="$2"; shift 2 ;;
+        --prompt) PROMPT="$2"; shift 2 ;;
+        --session-id|--resume) shift 2 ;;
+        --cycle) CYCLE_EVERY="$2"; shift 2 ;;
+        --*) shift ;;
+        *) POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+[[ -z "$PROMPT" && ${#POSITIONAL[@]} -gt 0 ]] && PROMPT="${POSITIONAL[-1]}"
+[[ -z "$PROMPT" ]] && PROMPT=$(cat)
+
+# Strip OpenClaw conversation context — keep ONLY the current user message
+if [[ ${#PROMPT} -gt 300 ]]; then
+    # Remove metadata blocks (JSON)
+    CLEAN=$(echo "$PROMPT" | grep -v "^{\|^#\|^[0-9]\+ \|^{" | grep -v "^$\|^[A-Z][a-z]*:" | grep -v "truncat\|bootstrap\|limit\|warning\|AGENTS" | tail -15)
+    # Remove Daen's messages (start with "Daen" or "The")
+    CLEAN=$(echo "$CLEAN" | grep -v "Daen\|The Architect\|⚠️")
+    # Keep only lines > 15 chars (actual messages, not UI noise)
+    CLEAN=$(echo "$CLEAN" | awk 'length>15')
+    # Take the last line (should be the current message)
+    LAST=$(echo "$CLEAN" | tail -1)
+    if [[ -n "$LAST" && ${#LAST} -gt 10 ]]; then
+        PROMPT="$LAST"
+    fi
+fi
+
+case "$MODEL" in
+    opus*) CLAUDE_MODEL="claude-opus-4-7"; TMUX_BASE="gcg-claude-opus"; STATE_FILE="$STATE_DIR/opus.count" ;;
+    sonnet*) CLAUDE_MODEL="claude-sonnet-4-6"; TMUX_BASE="gcg-claude-sonnet"; STATE_FILE="$STATE_DIR/sonnet.count" ;;
+    *) echo "ERROR: Unknown model $MODEL" >&2; exit 1 ;;
+esac
+
+mkdir -p "$STATE_DIR"
+COUNT=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
+COUNT=${COUNT:-0}
+
+if [[ "$COUNT" -ge "$CYCLE_EVERY" ]]; then
+    tmux kill-session -t "$TMUX_BASE" 2>/dev/null || true
+    COUNT=0
+fi
+
+TMUX_SESSION="$TMUX_BASE"
+
+create_fresh_session() {
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    tmux new-session -d -s "$TMUX_SESSION" -c "$WORK_DIR" -x 200 -y 50
+    tmux send-keys -t "$TMUX_SESSION" "unset ANTHROPIC_API_KEY" C-m
+    sleep 0.5
+    tmux send-keys -t "$TMUX_SESSION" "HOME=$HOME_DIR claude --model $CLAUDE_MODEL" C-m
+    sleep 8
+    PANE=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -10)
+    if echo "$PANE" | grep -qi "trust\|API key\|api key\|authenticate\|login"; then
+        tmux send-keys -t "$TMUX_SESSION" C-m
+        sleep 3
+    fi
+}
+
+if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    create_fresh_session
+    COUNT=0
+fi
+
+# Dismiss any prompts
+TAIL10=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -10)
+if echo "$TAIL10" | grep -q "How is Claude doing this session"; then
+    tmux send-keys -t "$TMUX_SESSION" 0 C-m
+    sleep 3
+elif echo "$TAIL10" | grep -qi "API key\|api key\|authenticate"; then
+    tmux send-keys -t "$TMUX_SESSION" C-m
+    sleep 2
+fi
+
+# Try up to 2 times (retry on stale session)
+for ATTEMPT in 1 2; do
+    BEFORE=$(tmux capture-pane -t "$TMUX_SESSION" -p | grep -c "^●" 2>/dev/null) || BEFORE=0
+    [[ -z "$BEFORE" ]] && BEFORE=0
+
+    # Paste prompt (instant, not character-by-character)
+    SEARCH=$(echo "$PROMPT" | cut -c1-30)
+    echo "$PROMPT" | tmux load-buffer -
+    tmux paste-buffer -t "$TMUX_SESSION"
+    tmux send-keys -t "$TMUX_SESSION" C-m
+
+    COUNT=$((COUNT + 1))
+    echo "$COUNT" > "$STATE_FILE"
+
+    # Wait for response (● count increases)
+    elapsed=0
+    responded=false
+    while [[ $elapsed -lt $STALE_TIMEOUT ]]; do
+        sleep 0.5
+        elapsed=$((elapsed + 1))
+        AFTER=$(tmux capture-pane -t "$TMUX_SESSION" -p | grep -c "^●" 2>/dev/null) || AFTER=0
+        [[ -z "$AFTER" ]] && AFTER=0
+        if [[ "$AFTER" -gt "$BEFORE" ]]; then
+            responded=true
+            break
+        fi
+    done
+
+    if [[ "$responded" == "true" ]]; then
+        # Wait for ❯ to reappear
+        while [[ $elapsed -lt $TIMEOUT ]]; do
+            sleep 0.5
+            elapsed=$((elapsed + 1))
+            tmux capture-pane -t "$TMUX_SESSION" -p -S -3 | grep -q "❯" && break
+        done
+
+        # Extract: everything between prompt and next ❯
+        FULL_PANE=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -150)
+        RESULT=$(echo "$FULL_PANE" | awk -v s="$SEARCH" '
+            index($0,s){found=1;next}
+            found==1 && /^❯/{ if(seen_prompt) exit; seen_prompt=1; next }
+            found==1
+        ' | grep -v "^$\|^─\|^╭\|^╰\|^│\|^╌\|^✻" | sed 's/^● //')
+
+        if [[ -z "$(echo "$RESULT" | tr -d ' ')" ]]; then
+            RESULT=$(echo "$FULL_PANE" | grep "^●" | grep -v "How is Claude" | tail -1 | sed 's/^● //')
+        fi
+
+        echo "$RESULT"
+        exit 0
+    fi
+
+    [[ $ATTEMPT -eq 1 ]] && create_fresh_session
+done
+
+# Final fallback
+elapsed=0
+while [[ $elapsed -lt $TIMEOUT ]]; do
+    sleep 1; elapsed=$((elapsed + 1))
+    AFTER=$(tmux capture-pane -t "$TMUX_SESSION" -p | grep -c "^●" 2>/dev/null) || AFTER=0
+    [[ -z "$AFTER" ]] && AFTER=0
+    [[ "$AFTER" -gt "$BEFORE" ]] && break
+done
+
+while [[ $elapsed -lt $TIMEOUT ]]; do
+    sleep 1; elapsed=$((elapsed + 1))
+    tmux capture-pane -t "$TMUX_SESSION" -p -S -3 | grep -q "❯" && break
+done
+
+FULL_PANE=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -150)
+echo "$FULL_PANE" | awk -v s="$SEARCH" 'index($0,s){found=1;next} found==1 && /^❯/{ if(seen_prompt) exit; seen_prompt=1; next } found==1' | grep -v "^$\|^─\|^╭\|^╰\|^│\|^╌\|^✻" | sed 's/^● //'

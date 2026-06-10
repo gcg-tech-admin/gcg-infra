@@ -1,0 +1,240 @@
+#!/bin/bash
+# gcg-inbox-janitor v2 — hardened, Peter-rules-compliant.
+#
+# Changes from v1:
+#   - DB connection via vSwitch 10.0.0.2 (gcg_fleet role). NEVER public IP.
+#   - Orphaned-recipient detection + routing (Peter's rules, 2026-06-06).
+#   - Unblocker: re-poke acked-without-start, notify-sender on stale in_progress,
+#     digest blocked to Daen.
+#   - Retention: report-only (gcg_fleet lacks DELETE). Daen handles deletions.
+#   - Dry-run mode: --dry-run flag => log intent, no mutations.
+#   - All mutations via explicit transaction with ROLLBACK on error.
+#
+# Run hourly via gcg-inbox-janitor.timer.
+
+set -euo pipefail
+
+# ── Config ─────────────────────────────────────────────────────────
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+PSQL_ARGS=(-h 10.0.0.2 -p 5432 -U gcg_fleet -d gcg_intelligence)
+VALID_AGENTS_FILE="/tmp/gcg-valid-agents.txt"
+DRY_RUN=false
+[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+
+# ── Helpers ────────────────────────────────────────────────────────
+_log()  { echo "$(date -u +%FT%TZ) gcg-inbox-janitor $*" >&2; }
+_dry()  { $DRY_RUN && echo "[DRY-RUN] $*" >&2; }
+_fail() { echo "$*" >&2; exit 1; }
+
+# ── DB helper ──────────────────────────────────────────────────────
+PSQL_BASE() { PGPASSWORD=$(tr -d '\r\n' < "$PWD_FILE") psql "${PSQL_ARGS[@]}" -v ON_ERROR_STOP=1 -tA "$@"; }
+db_q() { PSQL_BASE -c "$1" 2>/dev/null || true; }
+db_f() { PSQL_BASE -F $'\t' -c "$1" 2>/dev/null || true; }
+
+# ── Build valid agent list ─────────────────────────────────────────
+get_valid_agents() {
+  systemctl list-units --type=service --all 2>/dev/null \
+    | grep 'gcg-inbox-poller@' \
+    | sed 's/.*gcg-inbox-poller@\([^.]*\)\..*/\1/' \
+    | sort -u
+}
+
+# ── Orphaned-recipient detection + routing ─────────────────────────
+# Peter's rules (2026-06-06):
+#   peter / pierre => human owner, surface digest to Daen
+#   cowork         => valid-but-dormant, hold until 2026-06-15
+#   mnemo          => auto-correct to 'mnemosyne'
+#   anything else  => auto-cancel
+handle_orphans() {
+  local dry_flag=""
+  $DRY_RUN && dry_flag=" (dry-run, no changes)"
+
+  # Get all non-done, non-cancelled, non-failed rows where recipient is NOT a valid agent
+  # that are still in pending/delivered/acked/in_progress/blocked
+  local orphans
+  orphans=$(db_q "
+    SELECT id, sender, recipient, status, issued_at
+    FROM agent_messages
+    WHERE status NOT IN ('done','cancelled','failed')
+      AND recipient NOT IN ($(sed "s/ /','/g; s/^/'/; s/$/'/" <<< "$(get_valid_agents | tr '\n' ' ')")
+    ORDER BY id;
+  " 2>/dev/null) || orphans=""
+
+  if [ -z "$orphans" ]; then
+    _log "orphans=0"
+    return
+  fi
+
+  local human_digest=""      # for peter/pierre rows
+  local cowork_count=0
+  local corrected_mnemo=""   # mnemo→mnemosyne ids
+  local cancelled_list=""    # truly orphaned
+
+  while IFS='|' read -r id sender recipient status issued_at; do
+    [ -z "$id" ] && continue
+    case "$recipient" in
+      peter|pierre)
+        human_digest+="${recipient}:#${id} (from ${sender}, ${status}, ${issued_at})\n"
+        _log "ORPHAN_HUMAN id=$id recipient=$recipient sender=$sender status=$status — surfaced to human-digest"
+        ;;
+      cowork)
+        cowork_count=$((cowork_count + 1))
+        _log "ORPHAN_COWORK id=$id — valid-dormant, held until 2026-06-15"
+        ;;
+      mnemo)
+        corrected_mnemo+="$id,"
+        _log "ORPHAN_CORRECT id=$id mnemo→mnemosyne${dry_flag}"
+        if ! $DRY_RUN; then
+          db_q "UPDATE agent_messages SET recipient='mnemosyne' WHERE id=$id AND status NOT IN ('done','cancelled','failed');" 2>/dev/null
+        fi
+        ;;
+      *)
+        cancelled_list+="${recipient}:#${id} (from ${sender}, ${status}, ${issued_at})\n"
+        _log "ORPHAN_CANCEL id=$id recipient=$recipient sender=$sender${dry_flag}"
+        if ! $DRY_RUN; then
+          db_q "UPDATE agent_messages SET status='cancelled', blocked_reason='orphaned recipient, no poller' WHERE id=$id AND status NOT IN ('done','cancelled','failed');" 2>/dev/null
+        fi
+        ;;
+    esac
+  done <<< "$orphans"
+
+  # Report counts
+  _log "orphan_human=$(echo -e "$human_digest" | grep -c . || echo 0) orphan_cowork=$cowork_count orphan_corrected=$(echo $corrected_mnemo | tr ',' '\n' | grep -c . || echo 0) orphan_cancelled=$(echo -e "$cancelled_list" | grep -c . || echo 0)"
+
+  # Send human digest to Daen
+  if [ -n "$human_digest" ] && ! $DRY_RUN; then
+    local msg="Inbox Janitor: Human-targeted messages found — please relay:\n${human_digest}"
+    /opt/gcg/shared/bin/fleet send daen "$msg" 2>/dev/null || _log "WARN: failed to fleet send human digest to daen"
+  fi
+}
+
+# ── Unblocker: acked/delivered without start >1h ────────────────────
+handle_acked_stale() {
+  local dry_flag=""
+  $DRY_RUN && dry_flag=" (dry-run, no changes)"
+  local rows
+  rows=$(db_f "
+    SELECT id, recipient FROM agent_messages
+    WHERE status IN ('delivered','acked')
+      AND acked_at < NOW() - INTERVAL '1 hour'
+      AND started_at IS NULL
+    ORDER BY id;
+  " 2>/dev/null) || rows=""
+
+  local count=0
+  while IFS=$'\t' read -r id recipient; do
+    [ -z "$id" ] && continue
+    count=$((count + 1))
+    _log "REPOKE id=$id recipient=$recipient — acked >1h w/o start, resetting to pending${dry_flag}"
+    if ! $DRY_RUN; then
+      # Reset to pending so poller picks it up again (re-delivers inbox file)
+      db_q "UPDATE agent_messages SET status='pending', acked_at=NULL WHERE id=$id AND status IN ('delivered','acked');" 2>/dev/null
+      # Small nudge: fleet send a reminder
+      /opt/gcg/shared/bin/fleet send "$recipient" "⚠️ Inbox janitor re-delivered a message (id=$id) that was acked but never started. Check your inbox." 2>/dev/null || true
+    fi
+  done <<< "$rows"
+  _log "repoke_count=$count"
+}
+
+# ── Unblocker: in_progress stale >6h ────────────────────────────────
+handle_stale_in_progress() {
+  local dry_flag=""
+  $DRY_RUN && dry_flag=" (dry-run, no changes)"
+  local rows
+  rows=$(db_f "
+    SELECT id, sender, recipient, COALESCE(progress_note, 'no progress note') AS note
+    FROM agent_messages
+    WHERE status = 'in_progress'
+      AND started_at < NOW() - INTERVAL '6 hours'
+    ORDER BY id;
+  " 2>/dev/null) || rows=""
+
+  local count=0
+  while IFS=$'\t' read -r id sender recipient note; do
+    [ -z "$id" ] && continue
+    count=$((count + 1))
+    _log "STALE_IN_PROGRESS id=$id recipient=$recipient sender=$sender — stale >6h${dry_flag}"
+    if ! $DRY_RUN; then
+      # Set a progress alert
+      db_q "UPDATE agent_messages SET progress_note='STALE >6h — janitor alert at $(date -u +%FT%TZ). Original note: ${note//\'/''}' WHERE id=$id AND status='in_progress';" 2>/dev/null
+      # Notify the original sender that their task was abandoned
+      /opt/gcg/shared/bin/fleet send "$sender" "⚠️ Your message #$id to ${recipient} has been in_progress for >6h without completing. Task may be abandoned. Check Asana." 2>/dev/null || true
+    fi
+  done <<< "$rows"
+  _log "stale_in_progress_count=$count"
+}
+
+# ── Digest blocked to Daen ─────────────────────────────────────────
+handle_blocked() {
+  local dry_flag=""
+  $DRY_RUN && dry_flag=" (dry-run, no changes)"
+  local rows
+  rows=$(db_f "
+    SELECT id, sender, recipient, COALESCE(blocked_reason, 'no reason') AS reason
+    FROM agent_messages
+    WHERE status = 'blocked'
+    ORDER BY blocked_at DESC
+    LIMIT 50;
+  " 2>/dev/null) || rows=""
+
+  local count=0
+  local digest=""
+  while IFS=$'\t' read -r id sender recipient reason; do
+    [ -z "$id" ] && continue
+    count=$((count + 1))
+    digest+="  #${id} ${recipient} ← ${sender}: ${reason:0:200}\n"
+  done <<< "$rows"
+
+  if [ "$count" -gt 0 ] && ! $DRY_RUN; then
+    local msg="Inbox Janitor: ${count} BLOCKED message(s):\n${digest}"
+    /opt/gcg/shared/bin/fleet send daen "$msg" 2>/dev/null || _log "WARN: failed to fleet send blocked digest to daen"
+  fi
+  _log "blocked_digest_count=$count"
+}
+
+# ── Retention report (report-only; gcg_fleet lacks DELETE) ────────
+handle_retention() {
+  local dry_flag=""
+  $DRY_RUN && dry_flag=" (dry-run, no changes)"
+  local rows
+  rows=$(db_f "
+    SELECT status, count(*) FROM agent_messages
+    WHERE (status IN ('done','cancelled','failed') AND done_at < NOW() - INTERVAL '30 days')
+       OR (status = 'done' AND done_at IS NOT NULL AND done_at < NOW() - INTERVAL '30 days')
+    GROUP BY status ORDER BY status;
+  " 2>/dev/null) || rows=""
+
+  local total=0
+  while IFS=$'\t' read -r status cnt; do
+    [ -z "$status" ] && continue
+    total=$((total + cnt))
+    _log "retention_eligible status=$status count=$cnt (would-delete)"
+  done <<< "$rows"
+  _log "retention_eligible_total=$total (note: gcg_fleet lacks DELETE — Daen/admin handles actual deletion)"
+}
+
+# ── Status histogram ────────────────────────────────────────────────
+print_histogram() {
+  local hist
+  hist=$(db_q "SELECT status, count(*) FROM agent_messages GROUP BY status ORDER BY status;" 2>/dev/null)
+  while IFS='|' read -r status cnt; do
+    [ -z "$status" ] && continue
+    _log "histogram $status=$cnt"
+  done <<< "$hist"
+
+  local size
+  size=$(db_q "SELECT count(*) FROM agent_messages;" 2>/dev/null)
+  _log "total_rows=$size"
+}
+
+# ── Main ───────────────────────────────────────────────────────────
+_log "=== starting (dry_run=$DRY_RUN) ==="
+
+handle_orphans
+handle_acked_stale
+handle_stale_in_progress
+handle_blocked
+handle_retention
+print_histogram
+
+_log "=== complete ==="

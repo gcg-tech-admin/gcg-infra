@@ -312,16 +312,8 @@ def main():
     parser.add_argument("--reviewer", type=str, help="Reviewer name (with --file)")
     parser.add_argument("--plan-name", type=str, help="Plan name (with --file)")
     parser.add_argument("--date", type=str, help="Date (with --file)")
-    parser.add_argument("--plans-dir", type=str, help="Override plans directory")
-    parser.add_argument("--agents-dir", type=str, help="Override agents directory")
 
     args = parser.parse_args()
-
-    global PLANS_DIR, AGENTS_DIR
-    if args.plans_dir:
-        PLANS_DIR = Path(args.plans_dir)
-    if args.agents_dir:
-        AGENTS_DIR = Path(args.agents_dir)
 
     if args.backfill:
         backfill()

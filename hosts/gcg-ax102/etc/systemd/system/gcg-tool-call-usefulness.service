@@ -1,0 +1,19 @@
+[Unit]
+Description=GCG Tool Call Usefulness Classifier — INCREMENT 2: windowed 2nd-pass
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/tool_call_usefulness.py
+WorkingDirectory=/opt/gcg/shared/scripts
+StandardOutput=append:/opt/gcg/shared/logs/tool_call_usefulness.log
+StandardError=append:/opt/gcg/shared/logs/tool_call_usefulness.log
+SyslogIdentifier=tool-call-usefulness
+
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

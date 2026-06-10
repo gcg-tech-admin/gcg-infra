@@ -1,0 +1,92 @@
+#!/bin/bash
+# Claude Interactive TMUX Bridge v29 — SIMPLE extraction
+# Grabs everything between last prompt and ❯ as response
+set -e
+
+HOME_DIR="/opt/gcg/claude-profiles/sub-peter"
+WORK_DIR="/opt/gcg/shared"
+TIMEOUT=${GCTB_TIMEOUT:-120}
+MODEL="sonnet"
+PROMPT=""
+AGENT_ID=""
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model)    MODEL="$2"; shift 2 ;;
+        --prompt)   PROMPT="$2"; shift 2 ;;
+        --agent)    AGENT_ID="$2"; shift 2 ;;
+        --session-id|--resume) shift 2 ;;
+        --*) shift ;;
+        *)          POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+[[ -z "$PROMPT" && ${#POSITIONAL[@]} -gt 0 ]] && PROMPT="${POSITIONAL[-1]}"
+[[ -z "$PROMPT" ]] && PROMPT=$(cat)
+
+if [[ -n "$AGENT_ID" ]]; then
+    AGENT_HOME=$(grep "^Environment=HOME=" "/etc/systemd/system/openclaw-${AGENT_ID}.service.d/20-claude-cli-home.conf" 2>/dev/null | sed 's/.*HOME=//;s/^"//;s/"$//' || echo "")
+    [[ -n "$AGENT_HOME" ]] && HOME_DIR="$AGENT_HOME"
+fi
+
+case "$MODEL" in
+    sonnet*|claude-sonnet*) CLAUDE_MODEL="claude-sonnet-4-6" ;;
+    opus*|claude-opus*)     CLAUDE_MODEL="claude-opus-4-8" ;;
+    haiku*|claude-haiku*)   CLAUDE_MODEL="claude-haiku-4-5" ;;
+    *)       echo "ERROR: Unknown model $MODEL" >&2; exit 1 ;;
+esac
+
+SEAT_NAME=$(basename "$HOME_DIR")
+TMUX_SESSION="gcg-claude-${CLAUDE_MODEL}-${AGENT_ID:-$SEAT_NAME}"
+
+SANITIZED_PROMPT=$(echo "$PROMPT" | tr '\n' ' ' | head -c 4000)
+
+create_fresh_session() {
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    tmux new-session -d -s "$TMUX_SESSION" -c "$WORK_DIR" -x 200 -y 50
+    tmux set-option -t "$TMUX_SESSION" history-limit 5000 2>/dev/null || true
+    tmux send-keys -t "$TMUX_SESSION" "unset ANTHROPIC_API_KEY" C-m
+    sleep 0.5
+    tmux send-keys -t "$TMUX_SESSION" "HOME=$HOME_DIR claude --model $CLAUDE_MODEL" C-m
+    sleep 8
+}
+
+if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    create_fresh_session
+fi
+
+# Send prompt
+echo "$SANITIZED_PROMPT" | tmux load-buffer -
+tmux paste-buffer -t "$TMUX_SESSION"
+tmux send-keys -t "$TMUX_SESSION" C-m
+
+# Wait for Claude to start responding (any ● bullet)
+elapsed=0
+GOT_RESPONSE=false
+while [[ $elapsed -lt $TIMEOUT ]]; do
+    sleep 1; elapsed=$((elapsed + 1))
+    PANE=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -5)
+    if echo "$PANE" | grep -q "^● "; then
+        GOT_RESPONSE=true
+    fi
+    # Break when ● appeared AND prompt ❯ is back
+    if $GOT_RESPONSE && echo "$PANE" | grep -q "❯"; then
+        sleep 2  # let Claude finish typing the last line
+        break
+    fi
+done
+
+# Grab full pane and extract the assistant response
+# Strategy: find the LAST occurrence of text between ● and next ❯
+FULL_PANE=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -200)
+
+# Extract: everything between ● lines (user messages are just text without ●)
+RESULT=$(echo "$FULL_PANE" | awk -v state=0 '{ if(state==1 RESULT=$(echo "$FULL_PANE" | awk 'RESULT=$(echo "$FULL_PANE" | awk ' /^❯/) exit; if(state==1) { sub(/^● /,""); sub(/^✻ /,""); if(length($0)>3) print } } /^● / RESULT=$(echo "$FULL_PANE" | awk 'RESULT=$(echo "$FULL_PANE" | awk ' !/How is Claude doing this session/ RESULT=$(echo "$FULL_PANE" | awk 'RESULT=$(echo "$FULL_PANE" | awk ' !/Fable/ { state=1 }')
+    BEGIN { collecting=0; }
+    /^❯/ { if(collecting) exit; }
+    collecting { sub(/^● /,""); print; }
+    /^● / && !/How is Claude doing this session/ { collecting=1; }
+')
+
+echo "{\"type\":\"result\",\"result\":\"$(echo "$RESULT" | head -20 | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')\"}"

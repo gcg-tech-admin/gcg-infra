@@ -1,0 +1,10 @@
+[Unit]
+Description=Run GCG tool call extractor every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+Unit=gcg-tool-call-extractor.service
+
+[Install]
+WantedBy=timers.target

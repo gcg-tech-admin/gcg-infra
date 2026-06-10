@@ -1,0 +1,146 @@
+#!/bin/bash
+# subagent-spawn — model-fallback-aware subagent launcher
+#
+# Reads /opt/gcg/shared/config/subagent_policy.yaml for fallback chains.
+# Tries primary model → fallback 1 → fallback 2. Reports which model succeeded.
+#
+# Usage:
+#   subagent-spawn --task "..." --type code [--task-name "my-task"]
+#   subagent-spawn --task "..." --type research [--timeout 300]
+#   subagent-spawn --task "..." --model claude-cli/claude-sonnet-4-6 --fallbacks deepseek/deepseek-v4-pro openai/gpt-5.5
+#
+# Returns: exit 0 on spawn success, exit 1 if all models fail
+
+set -euo pipefail
+
+SELF="subagent-spawn"
+POLICY="/opt/gcg/shared/config/subagent_policy.yaml"
+TASK=""
+TASK_NAME=""
+TASK_TYPE=""
+MODEL=""
+FALLBACKS=()
+TIMEOUT="0"
+THINKING=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --task) TASK="$2"; shift 2 ;;
+    --type) TASK_TYPE="$2"; shift 2 ;;
+    --task-name) TASK_NAME="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --fallbacks) shift; while [[ $# -gt 0 && ! "$1" =~ ^-- ]]; do FALLBACKS+=("$1"); shift; done ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --thinking) THINKING="$2"; shift 2 ;;
+    *) echo "Unknown: $1"; exit 1 ;;
+  esac
+done
+
+[ -z "$TASK" ] && { echo "Usage: $SELF --task \"...\" --type <code|research|audit|execution>"; exit 1; }
+
+# Resolve model chain from policy if --model not explicitly set
+if [ -z "$MODEL" ] && [ -n "$TASK_TYPE" ] && [ -f "$POLICY" ]; then
+  # Extract from task_routing section
+  ROUTE_KEY=""
+  case "$TASK_TYPE" in
+    code) ROUTE_KEY="code" ;;
+    research|research_single_shot) ROUTE_KEY="research_single_shot" ;;
+    audit|qa|audit_probe) ROUTE_KEY="audit_probe" ;;
+    execution|parsing|extraction) ROUTE_KEY="parsing_extraction" ;;
+    strategic) ROUTE_KEY="strategic" ;;
+    write|draft) ROUTE_KEY="write_draft" ;;
+  esac
+
+  if [ -n "$ROUTE_KEY" ]; then
+    MODEL=$(python3 -c "
+import yaml, sys
+with open('$POLICY') as f:
+    p = yaml.safe_load(f)
+tr = p.get('task_routing',{}).get('$ROUTE_KEY',{})
+print(tr.get('model',''))
+if '$THINKING' == '':
+    t = tr.get('thinkingDefault','')
+    if t: print(f'THINKING:{t}', file=sys.stderr)
+" 2>/dev/null || echo "")
+    THINKING_FROM_POLICY=$(python3 -c "
+import yaml
+with open('$POLICY') as f:
+    p = yaml.safe_load(f)
+t = p.get('task_routing',{}).get('$ROUTE_KEY',{}).get('thinkingDefault','')
+print(t)
+" 2>/dev/null || echo "")
+    [ -n "$THINKING_FROM_POLICY" ] && [ -z "$THINKING" ] && THINKING="high"
+  fi
+
+  # If no task_routing match, use default_chain
+  if [ -z "$MODEL" ]; then
+    MODEL=$(python3 -c "
+import yaml
+with open('$POLICY') as f:
+    p = yaml.safe_load(f)
+dc = p.get('default_chain',{})
+print(dc.get('primary','claude-cli/claude-sonnet-4-6'))
+" 2>/dev/null || echo "claude-cli/claude-sonnet-4-6")
+    mapfile -t FALLBACKS < <(python3 -c "
+import yaml
+with open('$POLICY') as f:
+    p = yaml.safe_load(f)
+for fb in p.get('default_chain',{}).get('fallbacks',[]):
+    print(fb)
+" 2>/dev/null || echo "")
+  fi
+fi
+
+# Default fallbacks if nothing resolved
+[ -z "$MODEL" ] && MODEL="claude-cli/claude-sonnet-4-6"
+[ ${#FALLBACKS[@]} -eq 0 ] && FALLBACKS=(deepseek/deepseek-v4-pro openai/gpt-5.5)
+
+BUILD_JSON() {
+  local m="$1"
+  local think_flag=""
+  [ -n "$THINKING" ] && think_flag="\"thinking\":\"$THINKING\","
+  local name_flag=""
+  [ -n "$TASK_NAME" ] && name_flag="\"taskName\":\"$TASK_NAME\","
+  cat <<JSONEOF
+{
+  ${name_flag}
+  ${think_flag}
+  "task": "$TASK",
+  "model": "$m",
+  "runTimeoutSeconds": $TIMEOUT,
+  "lightContext": true
+}
+JSONEOF
+}
+
+# Try primary + fallbacks
+ATTEMPT=1
+MAX_ATTEMPTS=$((1 + ${#FALLBACKS[@]}))
+MODELS=("$MODEL" "${FALLBACKS[@]}")
+
+for m in "${MODELS[@]}"; do
+  echo "[$ATTEMPT/$MAX_ATTEMPTS] Spawning with $m..." >&2
+
+  PAYLOAD=$(BUILD_JSON "$m")
+  RESULT=$(curl -s --max-time 10 \
+    -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN:-}" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD" \
+    "http://127.0.0.1:18950/v1/sessions/spawn" 2>&1) || true
+
+  STATUS=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status','error'))" 2>/dev/null || echo "error")
+
+  if [ "$STATUS" = "accepted" ]; then
+    CHILD=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('childSessionKey','?'))" 2>/dev/null)
+    echo "OK: $m → $CHILD" >&2
+    echo "$CHILD"
+    exit 0
+  fi
+
+  echo "FAIL: $m → $STATUS ($(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error','?'))" 2>/dev/null || echo "?"))" >&2
+  ATTEMPT=$((ATTEMPT + 1))
+  sleep 1  # brief cooldown between attempts
+done
+
+echo "ALL_MODELS_FAILED: tried ${MODELS[*]}" >&2
+exit 1

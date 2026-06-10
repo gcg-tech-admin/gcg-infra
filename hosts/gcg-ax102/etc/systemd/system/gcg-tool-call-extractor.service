@@ -1,0 +1,20 @@
+[Unit]
+Description=GCG Tool Call Extractor — nightly fleet-wide session tool call extraction
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/tool_call_extractor.py
+WorkingDirectory=/opt/gcg/shared/scripts
+StandardOutput=append:/opt/gcg/shared/logs/tool_call_extractor.log
+StandardError=append:/opt/gcg/shared/logs/tool_call_extractor.log
+SyslogIdentifier=tool-call-extractor
+
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+Environment=GCG_DB_HOST=10.0.0.2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

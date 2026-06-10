@@ -954,6 +954,7 @@ sg3-utils					install
 sg3-utils-udev					install
 sgml-base					install
 shared-mime-info				install
+socat						install
 software-properties-common			install
 sosreport					install
 ssh-import-id					install

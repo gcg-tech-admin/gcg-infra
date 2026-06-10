@@ -109,8 +109,8 @@ def run_checks(scopes: set, verbose=False):
 
     # PYTHON
     if "PYTHON" in scopes:
-        # Find recently modified .py files and test imports
-        code, py_files, _ = run("find /opt/gcg/shared/gcg_tools -name '*.py' -mmin -120 2>/dev/null | head -10")
+        # Find recently modified .py files and test imports (skip test files)
+        code, py_files, _ = run("find /opt/gcg/shared/gcg_tools -name '*.py' -mmin -120 2>/dev/null | grep -v tests/ | grep -v __pycache__ | head -10")
         for f in (py_files or "").split("\n"):
             f = f.strip()
             if not f or "__pycache__" in f:
@@ -125,7 +125,7 @@ def run_checks(scopes: set, verbose=False):
 
     # DB_SQL
     if "DB_SQL" in scopes:
-        check("db-indexes-valid", f"GCG_DB_HOST=10.0.0.2 /opt/gcg/shared/venv/bin/python3 -c \"import os; os.environ['GCG_DB_HOST']='10.0.0.2'; import sys; sys.path.insert(0,'{SHARED}/gcg_tools'); from db_connect import get_connection; c=get_connection(agent_name='talos'); cur=c.cursor(); cur.execute(\\\"SELECT indexname FROM pg_indexes WHERE indexname LIKE '%recent%'\\\"); print(f'{cur.rowcount} indexes')\"")
+        check("db-indexes-present", f"GCG_DB_HOST=10.0.0.2 /opt/gcg/shared/venv/bin/python3 -c \"import os, sys; os.environ['GCG_DB_HOST']='10.0.0.2'; sys.path.insert(0,'{SHARED}/gcg_tools'); from db_connect import get_connection; c=get_connection(agent_name='talos'); cur=c.cursor(); cur.execute(\\\"SELECT indexname FROM pg_indexes\\\"); rows=cur.fetchall(); print(f'ok: {{len(rows)}} indexes'); cur.close(); c.close()\"")
 
     # SCRIPT
     if "SCRIPT" in scopes:

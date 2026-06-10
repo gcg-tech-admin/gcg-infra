@@ -59,7 +59,7 @@ WITH claimed AS (
 ),
 upd AS (
   UPDATE agent_messages m
-     SET status='acked', acked_at=NOW()
+     SET status='acked', acked_at=NOW(), deliver_count=deliver_count+1
     FROM claimed
    WHERE m.id = claimed.id
   RETURNING m.*

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run GCG tool call usefulness classifier every 15 minutes (after extractor)
+
+[Timer]
+OnCalendar=*:2/15
+Persistent=true
+Unit=gcg-tool-call-usefulness.service
+
+[Install]
+WantedBy=timers.target

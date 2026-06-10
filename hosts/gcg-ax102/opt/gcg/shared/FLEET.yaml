@@ -54,6 +54,10 @@ humans:
   farzan:
     reports_to: ishan
     role: Accountant & Treasury
+  robin:
+    agent: niccolo
+    role: AI Infrastructure Advisor
+    telegram: '5709788868'
   flore_narjoux:
     agents:
       - leon
@@ -539,7 +543,7 @@ agents:
     workspace: /opt/gcg/openclaw-cassandra/workspace
     agents_md: /opt/gcg/openclaw-cassandra/workspace/AGENTS.md
     model_primary: claude-cli/claude-opus-4-7
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "google/gemini-3.1-pro-preview"]
+    model_fallbacks: ["deepseek/deepseek-v4-pro", "google/gemini-3.5-flash"]
     heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
     db_role: gcg_cassandra
     keys: ["anthropic", "deepseek", "gemini", "moonshot"]
@@ -604,7 +608,7 @@ agents:
     workspace: /opt/gcg/openclaw-confucius/workspace
     agents_md: /opt/gcg/openclaw-confucius/workspace/AGENTS.md
     model_primary: deepseek/deepseek-v4-pro
-    model_fallbacks: ["google/gemini-3.1-pro-preview", "claude-cli/claude-opus-4-7"]
+    model_fallbacks: ["google/gemini-3.5-flash", "claude-cli/claude-opus-4-7"]
     heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
     db_role: gcg_confucius
     keys: ["anthropic", "deepseek", "gemini", "moonshot"]
@@ -1029,7 +1033,7 @@ agents:
     workspace: /opt/gcg/openclaw-nemesis/workspace
     agents_md: /opt/gcg/openclaw-nemesis/workspace/AGENTS.md
     model_primary: openai-codex/gpt-5.5
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "google/gemini-3.1-pro-preview", "claude-cli/claude-opus-4-7"]
+    model_fallbacks: ["deepseek/deepseek-v4-pro", "google/gemini-3.5-flash", "claude-cli/claude-opus-4-7"]
     heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
     db_role: gcg_nemesis
     keys: ["anthropic", "deepseek", "gemini", "moonshot"]
@@ -1051,7 +1055,7 @@ agents:
     op_sa_persisted: false
 
   niccolo:
-    title: Strategic Advisor to Peter
+    title: AI Infrastructure Advisor — Robin's Agent
     group: STRATEGY
     tier: D
     critical: false
@@ -1077,14 +1081,14 @@ agents:
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["Niccol\u00f2 - Strategic Advisor"]
+    subagents: ["Niccol\u00f2 - AI Infrastructure Advisor"]
     mcp_servers: ["telegram"]
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
-    serves: Peter
+    serves: Robin (AI Infrastructure Advisor to Peter)
     human_email: peter@gcg-structuring.com
-    mission: "Niccol\u00f2 is Peter's private strategic thinking partner. No meetings. No tasks. No operations. Pure thinking."
+    mission: "Robin's AI partner for fleet visibility, architecture analysis, and infrastructure strategy across GCG's 34-agent fleet."
 
   nik:
     title: Executive Assistant
@@ -1165,7 +1169,7 @@ agents:
     port: 20500
     workspace: /opt/gcg/openclaw-socrates/workspace
     agents_md: /opt/gcg/openclaw-socrates/workspace/AGENTS.md
-    model_primary: google/gemini-3.1-pro-preview
+    model_primary: google/gemini-3.5-flash
     model_fallbacks: ["deepseek/deepseek-v4-pro", "claude-cli/claude-opus-4-7"]
     heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
     db_role: gcg_socrates
@@ -1408,7 +1412,7 @@ agents:
     workspace: /opt/gcg/openclaw-wonhoo/workspace
     agents_md: /opt/gcg/openclaw-wonhoo/workspace/AGENTS.md
     model_primary: moonshot/kimi-k2.6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "google/gemini-3.1-pro-preview", "claude-cli/claude-opus-4-7"]
+    model_fallbacks: ["deepseek/deepseek-v4-pro", "google/gemini-3.5-flash", "claude-cli/claude-opus-4-7"]
     heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
     db_role: gcg_wonhoo
     keys: ["anthropic", "deepseek", "gemini", "moonshot"]

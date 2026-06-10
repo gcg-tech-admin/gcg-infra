@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# gcg-doc-index — nightly 2am UAE doc index + dispatch
+# Runs as systemd service gcg-doc-index.service
+
+set -euo pipefail
+LOG=/var/log/gcg/doc-index.log
+DOCS=/opt/gcg/shared/docs
+FLEET=/opt/gcg/shared/bin/fleet
+MEMORY=/opt/gcg/shared/bin/memory
+VENV=/opt/gcg/shared/venv/bin/python3
+TODAY=$(date +%Y-%m-%d)
+NOW=$(date '+%Y-%m-%d %H:%M UAE')
+
+exec >> "$LOG" 2>&1
+echo ""
+echo "=== gcg-doc-index $NOW ==="
+
+# ── 1. KB health ──────────────────────────────────────────────────────────────
+echo "[1] KB health"
+HEALTH=$(GCG_DB_HOST=10.0.0.2 $VENV /opt/gcg/shared/scripts/knowledge_maintenance.py --health 2>/dev/null || echo '{}')
+DOCS_COUNT=$(echo "$HEALTH" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('index_entries_generated', d.get('docs_scanned','?')))" 2>/dev/null || echo '?')
+EMBED_FAILS=$(echo "$HEALTH" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('embed_failures',0))" 2>/dev/null || echo '?')
+VIOLATIONS=$(echo "$HEALTH" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('taxonomy_violations',[])))" 2>/dev/null || echo '?')
+DEPRECATED=$(cat /opt/gcg/shared/logs/kb_remediation_backlog.jsonl 2>/dev/null | python3 -c "
+import json,sys
+lines=[json.loads(l) for l in sys.stdin if l.strip()]
+unique=set(l['path'] for l in lines if l.get('type')=='deprecated_bucket' and not l.get('resolved'))
+print(len(unique))
+" 2>/dev/null || echo '?')
+echo "  docs=$DOCS_COUNT embed_fails=$EMBED_FAILS violations=$VIOLATIONS deprecated_bucket_docs=$DEPRECATED"
+
+# ── 2. Collect open todos from cowork-sync-*.md ───────────────────────────────
+echo "[2] Collecting todos"
+TODOS_BY_PROJECT=""
+TOTAL_TODOS=0
+for f in $DOCS/reference/cowork-sync-*.md; do
+  [ -f "$f" ] || continue
+  project=$(basename "$f" .md | sed 's/cowork-sync-//')
+  count=$(grep -c '^\- \[ \]' "$f" 2>/dev/null || echo 0)
+  if [ "$count" -gt 0 ]; then
+    TODOS_BY_PROJECT="$TODOS_BY_PROJECT  $project: $count todos\n"
+    TOTAL_TODOS=$((TOTAL_TODOS + count))
+  fi
+done
+echo "  total_todos=$TOTAL_TODOS"
+
+# ── 3. Update DOC_INDEX.md ────────────────────────────────────────────────────
+echo "[3] Updating DOC_INDEX.md"
+GCG_DB_HOST=10.0.0.2 python3 << PYEOF
+import os, datetime, json
+
+DOCS = "/opt/gcg/shared/docs"
+CANONICAL = "/opt/gcg/shared/canonical"
+today = datetime.date.today().isoformat()
+
+def fdate(p):
+    try: return datetime.datetime.fromtimestamp(os.path.getmtime(p)).strftime('%Y-%m-%d')
+    except: return 'missing'
+
+def fstatus(p, days=14):
+    try:
+        age = (datetime.datetime.now() - datetime.datetime.fromtimestamp(os.path.getmtime(p))).days
+        return 'STALE' if age > days else 'OK'
+    except: return 'MISSING'
+
+canonical_docs = {
+    'Fleet machine truth': '/opt/gcg/shared/FLEET.yaml',
+    'Memory binding': f'{CANONICAL}/MEMORY_CANONICAL.md',
+    'Fleet architecture': f'{CANONICAL}/FLEET_ARCHITECTURE.md',
+    'Secrets pipeline': f'{CANONICAL}/SECRETS_PIPELINE_CANONICAL.md',
+    'Dispatch pipeline': f'{CANONICAL}/DISPATCH_PIPELINE_CANONICAL.md',
+    'Doc ontology': f'{DOCS}/architecture/DOC_ONTOLOGY_CANONICAL.md',
+    'Memory ontology': f'{DOCS}/architecture/MEMORY_ONTOLOGY_CANONICAL.md',
+    'Navigation MAP': '/opt/gcg/shared/MAP.md',
+    'Project scope': '/opt/gcg/shared/PROJECT_SCOPE.md',
+}
+
+cowork_sync = {
+    'gcg-memory': f'{DOCS}/reference/cowork-sync-memory.md',
+    'gcg-intelligence': f'{DOCS}/reference/cowork-sync-intelligence.md',
+    'fleet-ops': f'{DOCS}/reference/cowork-sync-fleet.md',
+    'gcg-sales': f'{DOCS}/reference/cowork-sync-sales.md',
+}
+
+lines = [
+    f'# GCG DOC_INDEX\n',
+    f'**Updated:** {today} 02:00 UAE  \n',
+    f'**By:** gcg-doc-index (systemd, nightly AX102)  \n',
+    f'**Agents:** Daen · Talos · Mnemosyne · any building agent  \n',
+    f'**Ontology:** /opt/gcg/shared/docs/architecture/DOC_ONTOLOGY_CANONICAL.md  \n\n---\n\n',
+    '## Canonical Docs\n\n',
+    '| Doc | Path | Modified | Status |\n|---|---|---|---|\n',
+]
+for name, path in canonical_docs.items():
+    lines.append(f'| {name} | `{path}` | {fdate(path)} | {fstatus(path)} |\n')
+
+lines.append('\n## Cowork Session Sync (daily 07:00 UAE)\n\n')
+lines.append('| Project | Last entry | Todos |\n|---|---|---|\n')
+for project, path in cowork_sync.items():
+    todos = 0
+    try:
+        with open(path) as f:
+            todos = sum(1 for l in f if l.strip().startswith('- [ ]'))
+    except: pass
+    lines.append(f'| {project} | {fdate(path)} | {todos} open |\n')
+
+# Open todos
+lines.append('\n## Open Todos\n\n')
+has_todos = False
+for project, path in cowork_sync.items():
+    todos = []
+    try:
+        with open(path) as f:
+            todos = [l.strip()[5:].strip() for l in f if l.strip().startswith('- [ ]')]
+    except: pass
+    if todos:
+        has_todos = True
+        lines.append(f'**{project}**\n')
+        for t in todos[:8]: lines.append(f'- [ ] {t}\n')
+        if len(todos) > 8: lines.append(f'- ...and {len(todos)-8} more\n')
+        lines.append('\n')
+if not has_todos:
+    lines.append('*(populated after first 07:00 cowork-sync run)*\n\n')
+
+# KB stats
+try:
+    with open('/opt/gcg/shared/logs/last_run.json') as f:
+        lr = json.load(f)
+    lines.append(f'\n## KB Stats\n\n')
+    lines.append(f'- Docs indexed: {lr.get("index_entries_generated","?")}\n')
+    lines.append(f'- Last run: {lr.get("timestamp","?")[:19]} UTC\n')
+    lines.append(f'- Embed failures: {lr.get("embed_failures",0)}\n')
+    lines.append(f'- Taxonomy violations: {len(lr.get("taxonomy_violations",[]))}\n')
+except: pass
+
+lines.append(f'\n---\n*knowledge_maintenance.py runs every 15min (cron) — docs auto-indexed to pgvector*  \n')
+lines.append(f'*Mac Mini copy synced by Cowork gcg-cowork-memory-sync (07:00 UAE)*  \n')
+
+with open(f'{DOCS}/DOC_INDEX.md', 'w') as f:
+    f.writelines(lines)
+print("  DOC_INDEX.md written")
+PYEOF
+
+# ── 4. Dispatch to Daen and Talos ─────────────────────────────────────────────
+echo "[4] Dispatching to Daen + Talos"
+MSG="[doc-index $TODAY] KB: $DOCS_COUNT docs indexed. Open todos: $TOTAL_TODOS. Embed failures: $EMBED_FAILS. Deprecated-bucket docs pending migration: $DEPRECATED. See /opt/gcg/shared/docs/DOC_INDEX.md"
+$FLEET send --from cowork daen "$MSG" 2>/dev/null && echo "  → daen ✓" || echo "  → daen failed"
+$FLEET send --from cowork talos "$MSG" 2>/dev/null && echo "  → talos ✓" || echo "  → talos failed"
+
+echo "[done] gcg-doc-index $TODAY complete"

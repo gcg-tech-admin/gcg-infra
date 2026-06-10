@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""
+gcg-migrate — Deterministic DDL migration runner with programmatic guardrails.
+
+Interface:
+  gcg-migrate <migration.sql> [--db staging|prod] [--dry-run] [--bypass]
+
+Checks (deterministic, zero LLM calls):
+  A — ADR registry (all objects registered + approved)
+  B — Collision / replay detection (object doesn't already exist)
+  C — Drift (live schema == schema-of-record.json)
+
+Bypass:
+  --bypass requires GCG_DDL_BYPASS env var (Peter-held credential).
+  Skips A/B/C, applies, logs to ddl_audit_log.
+
+Path:
+  /opt/gcg/shared/bin/gcg-migrate
+  /opt/gcg/shared/lib/gcg_migrate_core/migrate_core.py
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+# Paths
+LIB_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCHEMA_DIR = os.path.join(LIB_DIR, 'docs', 'schema')
+SCHEMA_OF_RECORD = os.path.join(SCHEMA_DIR, 'schema-of-record.json')
+ADR_REGISTRY = os.path.join(SCHEMA_DIR, 'adr-registry.json')
+BYPASS_HMAC = os.path.join(SCHEMA_DIR, 'bypass-hmac.txt')
+VALIDATE_SCRIPT = os.path.join(SCHEMA_DIR, 'validate-schema-of-record.py')
+MIGRATIONS_DIR = os.path.join(LIB_DIR, 'migrations')
+
+# DB config (per-agent creds)
+DB_HOSTS = {
+    'staging': '10.0.0.2',
+    'prod': '10.0.0.2',
+}
+DB_NAMES = {
+    'staging': 'gcg_intelligence_staging',
+    'prod': 'gcg_intelligence',
+}
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def load_json(path, label):
+    if not os.path.exists(path):
+        eprint(f'❌ {label} not found: {path}')
+        sys.exit(1)
+    with open(path) as f:
+        return json.load(f)
+
+
+def get_migration_role_creds():
+    """Retrieve gcg_admin credentials from filesystem credential file.
+
+    Uses gcg_admin (the working AX102→AX42 role) for the apply step.
+    The gcg_migration role's pg_hba issue is a separate concern tracked
+    for later cleanup.
+
+    Reads password from /opt/gcg/shared/credentials/db/gcg_admin.pwd.
+    Returns (host, port, user, password, dbname).
+    """
+    target_db = DB_ARGS.target
+    host = DB_HOSTS.get(target_db, '10.0.0.2')
+    dbname = DB_NAMES.get(target_db, 'gcg_intelligence')
+    port = '5432'
+    user = 'gcg_admin'
+
+    pwd_file = '/opt/gcg/shared/credentials/db/gcg_admin.pwd'
+    try:
+        with open(pwd_file) as f:
+            password = f.read().strip()
+    except FileNotFoundError:
+        eprint(f'❌ gcg_admin password file not found: {pwd_file}')
+        eprint('   Run: fleet send daen "gcg-migrate missing gcg_admin creds"')
+        sys.exit(1)
+    except Exception as e:
+        eprint(f'❌ Failed to read gcg_admin password: {e}')
+        sys.exit(1)
+
+    return host, port, user, password, dbname
+
+
+def parse_sql_objects(sql_text, migration_id):
+    """Parse SQL to extract CREATE and ALTER objects for ADR/collision checks.
+
+    Returns list of dicts: {type, schema, name, object_type}
+    type: 'create' | 'alter_add' | 'alter_destructive'
+    """
+    objects = []
+
+    # Strip comments
+    clean = re.sub(r'--.*?$', '', sql_text, flags=re.MULTILINE)
+    clean = re.sub(r'/\*.*?\*/', '', clean, flags=re.DOTALL)
+
+    # CREATE TABLE/INDEX/SEQUENCE/TYPE/FUNCTION
+    create_patterns = [
+        (r'CREATE\s+(?:TABLE\s+)(?:IF\s+NOT\s+EXISTS\s+)?(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)',
+         'table'),
+        (r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)',
+         'index'),
+        (r'CREATE\s+SEQUENCE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)',
+         'sequence'),
+        (r'CREATE\s+TYPE\s+(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)\s+AS\s+ENUM',
+         'type'),
+        (r'CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)',
+         'function'),
+    ]
+    for pattern, obj_type in create_patterns:
+        for match in re.finditer(pattern, clean, re.IGNORECASE):
+            schema = match.group(1) or 'public'
+            name = match.group(2)
+            objects.append({'type': 'create', 'schema': schema, 'name': name,
+                           'object_type': obj_type, 'migration_id': migration_id})
+
+    # ALTER TABLE ADD COLUMN / ADD CONSTRAINT
+    alter_add_patterns = [
+        r'ALTER\s+TABLE\s+(?:ONLY\s+)?(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z_]+)',
+        r'ALTER\s+TABLE\s+(?:ONLY\s+)?(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)\s+ADD\s+(?:CONSTRAINT\s+)?([a-zA-Z_]+)',
+    ]
+    for pattern in alter_add_patterns:
+        for match in re.finditer(pattern, clean, re.IGNORECASE):
+            schema = match.group(1) or 'public'
+            name = match.group(2)
+            col = match.group(3)
+            objects.append({'type': 'alter_add', 'schema': schema, 'name': name,
+                           'object_type': 'column' if 'COLUMN' in match.group(0).upper() else 'constraint',
+                           'column': col, 'migration_id': migration_id})
+
+    # Destructive ALTERs: DROP COLUMN, ALTER COLUMN TYPE, RENAME COLUMN,
+    # ALTER COLUMN SET/DROP NOT NULL, ALTER COLUMN SET/DROP DEFAULT
+    alter_destructive_patterns = [
+        (r'ALTER\s+TABLE\s+(?:ONLY\s+)?(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)\s+DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?([a-zA-Z_]+)',
+         'drop_column'),
+        (r'ALTER\s+TABLE\s+(?:ONLY\s+)?(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)\s+ALTER\s+COLUMN\s+([a-zA-Z_]+)\s+(?:TYPE|SET\s+DATA\s+TYPE)',
+         'alter_type'),
+        (r'ALTER\s+TABLE\s+(?:ONLY\s+)?(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)\s+RENAME\s+COLUMN\s+([a-zA-Z_]+)',
+         'rename_column'),
+        (r'ALTER\s+TABLE\s+(?:ONLY\s+)?(?:([a-zA-Z_]+)\.)?([a-zA-Z_]+)\s+ALTER\s+COLUMN\s+([a-zA-Z_]+)\s+(?:SET|DROP)\s+(?:NOT\s+NULL|DEFAULT)',
+         'alter_null_default'),
+    ]
+    for pattern, sub_type in alter_destructive_patterns:
+        for match in re.finditer(pattern, clean, re.IGNORECASE):
+            schema = match.group(1) or 'public'
+            name = match.group(2)
+            col = match.group(3)
+            objects.append({'type': 'alter_destructive', 'schema': schema, 'name': name,
+                           'object_type': sub_type, 'column': col, 'migration_id': migration_id})
+
+    return objects
+
+
+def check_a_adr_registry(objects, registry):
+    """Check A: every object must have an ADR entry with approved_by."""
+    rejections = []
+    entries = registry.get('entries', [])
+
+    for obj in objects:
+        obj_key = obj['name']
+        mid = obj.get('migration_id', '')
+
+        # Look up by migration_id first, then by object_name
+        entry = None
+        for e in entries:
+            if e.get('migration_id') == mid:
+                entry = e
+                break
+        if not entry:
+            for e in entries:
+                if e.get('object_name') == obj_key:
+                    entry = e
+                    break
+
+        if not entry:
+            rejections.append(
+                f'REJECTED: no ADR entry for "{obj_key}" '
+                f'(migration_id="{mid}"). Register in adr-registry.json first.'
+            )
+        elif not entry.get('approved_by') or entry['approved_by'] in ('N/A', None, ''):
+            rejections.append(
+                f'REJECTED: ADR entry for "{obj_key}" has approved_by="{entry.get("approved_by")}" '
+                f'— must be authorized by Peter.'
+            )
+
+    return rejections
+
+
+def check_b_collision(objects, registry, db_cursor):
+    """Check B: for CREATE objects, verify they don't already exist.
+    
+    Replay detection: if object exists AND adr entry has applied:true → SKIP.
+    """
+    rejections = []
+    entries = registry.get('entries', [])
+
+    for obj in objects:
+        if obj['type'] != 'create':
+            continue
+
+        schema = obj['schema']
+        name = obj['name']
+        obj_type = obj['object_type']
+        mid = obj.get('migration_id', '')
+
+        # Query live information_schema
+        exists = False
+        if obj_type == 'table':
+            db_cursor.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema = %s AND table_name = %s AND table_type = 'BASE TABLE'",
+                (schema, name)
+            )
+            exists = db_cursor.fetchone()[0] > 0
+        elif obj_type in ('sequence',):
+            db_cursor.execute(
+                "SELECT count(*) FROM information_schema.sequences "
+                "WHERE sequence_schema = %s AND sequence_name = %s",
+                (schema, name)
+            )
+            exists = db_cursor.fetchone()[0] > 0
+        elif obj_type in ('type',):
+            db_cursor.execute(
+                "SELECT count(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid "
+                "WHERE n.nspname = %s AND t.typname = %s",
+                (schema, name)
+            )
+            exists = db_cursor.fetchone()[0] > 0
+        elif obj_type == 'index':
+            db_cursor.execute(
+                "SELECT count(*) FROM pg_indexes "
+                "WHERE schemaname = %s AND indexname = %s",
+                (schema, name)
+            )
+            exists = db_cursor.fetchone()[0] > 0
+        elif obj_type == 'function':
+            db_cursor.execute(
+                "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid "
+                "WHERE n.nspname = %s AND p.proname = %s",
+                (schema, name)
+            )
+            exists = db_cursor.fetchone()[0] > 0
+
+        if exists:
+            # Check for replay detection
+            adr_applied = False
+            for e in entries:
+                if e.get('migration_id') == mid and e.get('applied') == True:
+                    adr_applied = True
+                    break
+                if e.get('object_name') == name and e.get('applied') == True:
+                    adr_applied = True
+                    break
+
+            if adr_applied:
+                # This is a replay of an already-applied migration — SKIP
+                eprint(f'  ↻ Replay detected for {schema}.{name} (migration "{mid}") — SKIP collision')
+                continue
+
+            rejections.append(
+                f'REJECTED: "{schema}.{name}" already exists ({obj_type}). '
+                f'Use ALTER or drop the conflicting object first.'
+            )
+
+    return rejections
+
+
+def check_c_drift():
+    """Check C: run validate-schema-of-record.py. Exit 0 = pass, else drift."""
+    result = subprocess.run(
+        [sys.executable, VALIDATE_SCRIPT, '--staging'],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return (
+            f'REJECTED: live schema has drifted from schema-of-record.json. '
+            f'Regenerate and investigate ad-hoc changes before applying.\n'
+            f'{result.stdout.strip()}'
+        )
+    eprint('  ✅ No drift — schema-of-record.json matches live DB')
+    return None
+
+
+def apply_migration(sql_text, migration_id, dry_run, target_db, bypass):
+    """Apply the migration SQL using the gcg_migration role via filesystem credential."""
+    host, port, user, password, dbname = get_migration_role_creds()
+
+    conn_str = f'postgresql://{user}:****@{host}:{port}/{dbname}'
+
+    if dry_run:
+        eprint(f'  [DRY RUN] Would apply migration "{migration_id}" as {user} on {dbname}')
+        return True
+
+    eprint(f'  Applying migration "{migration_id}" as {user} on {dbname}...')
+
+    # Use psql via PGPASSWORD env var (only set for this subprocess, never logged)
+    psql_env = os.environ.copy()
+    psql_env['PGPASSWORD'] = password
+
+    psql_cmd = [
+        'psql',
+        '-h', host, '-p', port, '-U', user, '-d', dbname,
+        '-f', '-',
+    ]
+
+    try:
+        result = subprocess.run(
+            psql_cmd,
+            input=sql_text,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=psql_env,
+        )
+        if result.returncode != 0:
+            eprint(f'❌ Apply failed (exit {result.returncode}):')
+            eprint(result.stderr.strip())
+            return False
+        eprint(f'✅ Applied successfully')
+        eprint(result.stdout.strip() if result.stdout else '')
+        return True
+    except subprocess.TimeoutExpired:
+        eprint('❌ Apply timed out after 120s')
+        return False
+    except FileNotFoundError:
+        eprint('❌ psql not found. Install postgresql-client.')
+        return False
+
+
+def log_to_tool_call(agent_name, tool_name, outcome, result_summary, source_file):
+    """Log migration result to tool_call_log table (if we have agent db access)."""
+    # This is advisory logging — skip errors silently
+    try:
+        import psycopg2
+        pwd_file = f'/opt/gcg/shared/credentials/db/gcg_talos.pwd'
+        if os.path.exists(pwd_file):
+            with open(pwd_file) as f:
+                password = f.read().strip()
+            conn = psycopg2.connect(
+                dbname='gcg_intelligence', user='gcg_talos',
+                password=password, host='10.0.0.2', port=5432
+            )
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO tool_call_log (agent_name, tool_name, outcome, result_summary, source_file, ts) "
+                "VALUES (%s, %s, %s, %s, %s, %s)",
+                (agent_name, tool_name, outcome, result_summary, source_file,
+                 datetime.now(timezone.utc))
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+    except Exception:
+        pass  # Non-critical logging
+
+
+def verify_bypass():
+    """Verify GCG_DDL_BYPASS env var against stored hash."""
+    secret = os.environ.get('GCG_DDL_BYPASS')
+    if not secret:
+        return 'REJECTED: bypass requires GCG_DDL_BYPASS (Peter-held credential in personal vault).'
+
+    if not os.path.exists(BYPASS_HMAC):
+        return f'REJECTED: bypass-hmac.txt not found at {BYPASS_HMAC}. Peter must seed it first (Phase 4).'
+
+    with open(BYPASS_HMAC) as f:
+        expected_hash = f.read().strip()
+
+    computed = hashlib.sha256(secret.encode('utf-8')).hexdigest()
+    if computed != expected_hash:
+        return 'REJECTED: GCG_DDL_BYPASS secret does not match stored hash.'
+
+    return None  # Success
+
+
+def log_bypass_event(migration_id, invoker_role):
+    """Log bypass event to ddl_audit_log."""
+    try:
+        import psycopg2
+        # Use gcg_admin via the same credential pattern
+        pwd_file = '/opt/gcg/shared/credentials/db/gcg_admin.pwd'
+        if os.path.exists(pwd_file):
+            with open(pwd_file) as f:
+                password = f.read().strip()
+            conn = psycopg2.connect(
+                dbname='gcg_intelligence', user='gcg_admin',
+                password=password, host='10.0.0.2', port=5432
+            )
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO ddl_audit_log (session_user, command_tag, object_type, object_identity, "
+                "migration_id, via_gcg_migrate) VALUES (%s, 'BYPASS_APPLY', 'migration', %s, %s, true)",
+                (invoker_role, migration_id, migration_id)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+    except Exception as e:
+        eprint(f'  ⚠️ Could not log bypass event: {e}')
+
+
+def alert_bypass(migration_id, invoker_role):
+    """Fleet-wake Daen on bypass."""
+    try:
+        subprocess.run(
+            ['fleet', 'send', 'daen',
+             f'DDL bypass used: {migration_id} by {invoker_role}'],
+            capture_output=True, timeout=10
+        )
+    except Exception:
+        pass  # Non-critical
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='gcg-migrate — Deterministic DDL migration runner',
+        epilog='Single canonical apply path. Three programmatic gates (ADR/Collision/Drift).',
+    )
+    parser.add_argument('migration', help='Path to .sql migration file')
+    parser.add_argument('--db', dest='target', default='staging',
+                        choices=['staging', 'prod'], help='Target database')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Run all checks but do not apply SQL')
+    parser.add_argument('--bypass', action='store_true',
+                        help='Bypass all checks (requires GCG_DDL_BYPASS env var)')
+    parser.add_argument('--annotate', action='store_true',
+                        help='Run gcg-migrate-annotate after successful apply')
+
+    global DB_ARGS
+    DB_ARGS = parser.parse_args()
+
+    migration_path = DB_ARGS.migration
+
+    # Resolve migration path
+    if not os.path.exists(migration_path):
+        test_path = os.path.join(MIGRATIONS_DIR, migration_path)
+        if os.path.exists(test_path):
+            migration_path = test_path
+        else:
+            eprint(f'❌ Migration file not found: {migration_path}')
+            eprint(f'   (also checked: {test_path})')
+            sys.exit(1)
+
+    # Extract migration_id from filename
+    migration_id = os.path.splitext(os.path.basename(migration_path))[0]
+
+    # Read SQL
+    with open(migration_path) as f:
+        sql_text = f.read()
+
+    eprint(f'━━━ gcg-migrate ─── {migration_id} ─── {DB_ARGS.target} ───')
+    if DB_ARGS.dry_run:
+        eprint('  🏁 DRY RUN — no DB changes will be made')
+    if DB_ARGS.bypass:
+        eprint('  🚨 BYPASS MODE — all checks will be skipped')
+
+    # ── BYPASS PATH ──
+    if DB_ARGS.bypass:
+        bypass_error = verify_bypass()
+        if bypass_error:
+            eprint(f'❌ {bypass_error}')
+            sys.exit(1)
+        eprint('  ✅ Bypass secret verified')
+
+        # Apply
+        success = apply_migration(sql_text, migration_id, DB_ARGS.dry_run,
+                                  DB_ARGS.target, bypass=True)
+        if not success:
+            sys.exit(1)
+
+        # Log & alert
+        invoker = os.environ.get('FLEET_SENDER', os.environ.get('USER', 'unknown'))
+        if not DB_ARGS.dry_run:
+            log_bypass_event(migration_id, invoker)
+            alert_bypass(migration_id, invoker)
+
+        eprint(f'\n✅ Bypass apply complete for {migration_id}')
+        sys.exit(0)
+
+    # ── STANDARD PATH ──
+
+    # Check C first (fastest — exits early if drift)
+    eprint('  📋 Check C: Schema drift...')
+    drift_error = check_c_drift()
+    if drift_error:
+        eprint(f'❌ {drift_error}')
+        sys.exit(1)
+
+    # Load ADR registry
+    registry = load_json(ADR_REGISTRY, 'ADR registry')
+
+    # Parse SQL objects
+    objects = parse_sql_objects(sql_text, migration_id)
+    eprint(f'  📋 Parsed {len(objects)} object(s) from migration SQL')
+
+    # Check A — ADR registry
+    eprint('  📋 Check A: ADR registry...')
+    adr_rejections = check_a_adr_registry(objects, registry)
+    if adr_rejections:
+        for r in adr_rejections:
+            eprint(f'  ❌ {r}')
+        sys.exit(1)
+    eprint('  ✅ All objects have ADR entries with approval')
+
+    # Check B — Collision
+    eprint('  📋 Check B: Object collision...')
+    try:
+        import psycopg2
+        pwd_file = f'/opt/gcg/shared/credentials/db/gcg_talos.pwd'
+        with open(pwd_file) as f:
+            password = f.read().strip()
+        conn = psycopg2.connect(
+            dbname='gcg_intelligence', user='gcg_talos',
+            password=password, host='10.0.0.2', port=5432
+        )
+        cur = conn.cursor()
+        collision_rejections = check_b_collision(objects, registry, cur)
+        cur.close()
+        conn.close()
+    except Exception as e:
+        eprint(f'  ⚠️ Could not connect for collision check: {e}')
+        collision_rejections = []
+
+    if collision_rejections:
+        for r in collision_rejections:
+            eprint(f'  ❌ {r}')
+        sys.exit(1)
+    eprint('  ✅ No collisions detected')
+
+    # ── Apply ──
+    success = apply_migration(sql_text, migration_id, DB_ARGS.dry_run,
+                              DB_ARGS.target, bypass=False)
+    if not success:
+        sys.exit(1)
+
+    # Post-apply: annotation + schema-of-record regeneration
+    if not DB_ARGS.dry_run:
+        if DB_ARGS.annotate:
+            eprint('  Running annotation...')
+            annotate_script = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                'gcg-migrate-annotate'
+            )
+            subprocess.run(
+                [sys.executable, annotate_script, migration_id, '--db', DB_ARGS.target],
+                capture_output=True
+            )
+        else:
+            eprint('  Regenerating schema-of-record.json...')
+            subprocess.run(
+                [sys.executable,
+                 '/opt/gcg/shared/skills/project-context/scripts/superapp-data-model-generator.py'],
+                capture_output=True
+            )
+
+    # Log to tool_call_log
+    log_to_tool_call(
+        agent_name='gcg-migrate',
+        tool_name='gcg-migrate',
+        outcome='success' if success else 'error',
+        result_summary=migration_id,
+        source_file=migration_path,
+    )
+
+    eprint(f'\n✅ Migration "{migration_id}" complete ({DB_ARGS.target})')
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()

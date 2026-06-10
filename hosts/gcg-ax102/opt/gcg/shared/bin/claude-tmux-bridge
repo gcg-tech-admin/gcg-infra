@@ -1,0 +1,115 @@
+#!/bin/bash
+# Claude Interactive TMUX Bridge v30 — fixed extraction (Atlas, 2026-06-09)
+# v29 was corrupted by a bad in-place edit (awk fragments spliced into line 85).
+# v30: clean awk that captures the LAST ●-response block before the ❯ prompt,
+# with relaxed matching (UI lines may be indented).
+set -e
+
+HOME_DIR="/opt/gcg/claude-profiles/sub-peter"
+WORK_DIR="/opt/gcg/shared"
+TIMEOUT=${GCTB_TIMEOUT:-120}
+MODEL="sonnet"
+PROMPT=""
+AGENT_ID=""
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model)    MODEL="$2"; shift 2 ;;
+        --prompt)   PROMPT="$2"; shift 2 ;;
+        --agent)    AGENT_ID="$2"; shift 2 ;;
+        --session-id|--resume) shift 2 ;;
+        --*) shift ;;
+        *)          POSITIONAL+=("$1"); shift ;;
+    esac
+done
+
+[[ -z "$PROMPT" && ${#POSITIONAL[@]} -gt 0 ]] && PROMPT="${POSITIONAL[-1]}"
+[[ -z "$PROMPT" ]] && PROMPT=$(cat)
+
+if [[ -n "$AGENT_ID" ]]; then
+    AGENT_HOME=$(grep "^Environment=" "/etc/systemd/system/openclaw-${AGENT_ID}.service.d/20-claude-cli-home.conf" 2>/dev/null | grep "HOME=" | sed 's/.*HOME=//;s/^"//;s/"$//' || echo "")
+    [[ -n "$AGENT_HOME" ]] && HOME_DIR="$AGENT_HOME"
+fi
+
+case "$MODEL" in
+    sonnet*|claude-sonnet*) CLAUDE_MODEL="claude-sonnet-4-6" ;;
+    opus*|claude-opus*)     CLAUDE_MODEL="claude-opus-4-8" ;;
+    haiku*|claude-haiku*)   CLAUDE_MODEL="claude-haiku-4-5" ;;
+    fable*|claude-fable*)   CLAUDE_MODEL="claude-fable-5" ;;
+    *)       echo "ERROR: Unknown model $MODEL" >&2; exit 1 ;;
+esac
+
+SEAT_NAME=$(basename "$HOME_DIR")
+TMUX_SESSION="gcg-claude-${CLAUDE_MODEL}-${AGENT_ID:-$SEAT_NAME}"
+
+SANITIZED_PROMPT=$(echo "$PROMPT" | tr '\n' ' ' | head -c 4000)
+
+create_fresh_session() {
+    tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+    tmux new-session -d -s "$TMUX_SESSION" -c "$WORK_DIR" -x 200 -y 50
+    tmux set-option -t "$TMUX_SESSION" history-limit 5000 2>/dev/null || true
+    tmux send-keys -t "$TMUX_SESSION" "unset ANTHROPIC_API_KEY" C-m
+    sleep 0.5
+    tmux send-keys -t "$TMUX_SESSION" "HOME=$HOME_DIR claude --model $CLAUDE_MODEL" C-m
+    sleep 8
+}
+
+if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    create_fresh_session
+fi
+
+# Send prompt
+echo "$SANITIZED_PROMPT" | tmux load-buffer -
+tmux paste-buffer -t "$TMUX_SESSION"
+tmux send-keys -t "$TMUX_SESSION" C-m
+
+# Wait for completion. NOTE: the ❯ input prompt is ALWAYS visible in the UI,
+# so it cannot signal completion. Instead: wait until we have seen a ● bullet,
+# the "esc to interrupt" working indicator is gone, and the pane has been
+# stable (unchanged) for 2 consecutive polls.
+elapsed=0
+GOT_RESPONSE=false
+LAST_HASH=""
+STABLE=0
+while [[ $elapsed -lt $TIMEOUT ]]; do
+    sleep 1; elapsed=$((elapsed + 1))
+    PANE=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -30)
+    echo "$PANE" | grep -q "●" && GOT_RESPONSE=true
+    if $GOT_RESPONSE && ! echo "$PANE" | grep -qi "to interrupt"; then
+        HASH=$(echo "$PANE" | md5sum | cut -d" " -f1)
+        if [[ "$HASH" == "$LAST_HASH" && -n "$HASH" ]]; then
+            STABLE=$((STABLE + 1))
+            [[ $STABLE -ge 2 ]] && break
+        else
+            STABLE=0
+        fi
+        LAST_HASH=$HASH
+    else
+        STABLE=0
+        LAST_HASH=""
+    fi
+done
+
+FULL_PANE=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -200)
+
+# Keep only the LAST ● response block (pane history may hold older turns).
+# Lines may be indented by the UI, so match ● anywhere after leading spaces.
+RESULT=$(echo "$FULL_PANE" | awk '
+    /^[[:space:]]*●/ && !/How is Claude doing this session/ {
+        block = ""; collecting = 1
+    }
+    collecting && /❯/ { collecting = 0; next }
+    collecting {
+        line = $0
+        sub(/^[[:space:]]*●[[:space:]]?/, "", line)
+        sub(/^[[:space:]]*✻[[:space:]]?/, "", line)
+        # drop UI noise: separator rules and spinner status lines like "Sauteed for 2s"
+        if (line ~ /^[[:space:]]*[─━—-]{4,}[[:space:]]*$/) next
+        if (line ~ /^[[:space:]]*[[:alpha:]…]+ for [0-9]+m?s([[:space:]·].*)?$/) next
+        if (line !~ /^[[:space:]]*$/) block = block line "\n"
+    }
+    END { printf "%s", block }
+')
+
+echo "{\"type\":\"result\",\"result\":\"$(echo "$RESULT" | head -40 | tr '\n' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g')\"}"
