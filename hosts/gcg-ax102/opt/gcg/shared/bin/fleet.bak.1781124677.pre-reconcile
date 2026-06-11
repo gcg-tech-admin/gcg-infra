@@ -20,10 +20,6 @@
 #   cancel <id>                   — sender/operator withdraws: status=cancelled
 #   reply <id> <msg>              — reply to a message (preserves correlation_id)
 #   tail [agent] [N]              — last N messages (default 20), optionally filtered
-#   reconcile <agent>             — DB-is-truth heal: re-materialize missing delivered
-#                                   files + remove zombie files (no poke; gcg_fleet)
-#   check --inbox-stale --threshold N [--agent A]
-#                                 — exit 1 + list if any pending/delivered row older than N s
 #
 # DB credentials: /opt/gcg/shared/credentials/db/gcg_fleet.pwd
 
@@ -182,19 +178,7 @@ SQL
 
 cmd_ack()    { local id="${1:?usage: fleet ack <id>}";    _set_status "$id" acked       acked_at;   }
 cmd_done()   { local id="${1:?usage: fleet done <id>}";   _set_status "$id" done        done_at;    }
-# start is idempotent: re-starting an already in_progress row is a no-op success
-# (original started_at preserved); a terminal row (done/failed/cancelled) is never resurrected.
-cmd_start()  {
-  local id="${1:?usage: fleet start <id>}"
-  _psql -tA -v id="$id" <<'SQL'
-UPDATE agent_messages
-   SET status = 'in_progress',
-       started_at = COALESCE(started_at, NOW())
- WHERE id = :'id'::bigint
-   AND status IN ('pending','delivered','acked','in_progress')
-RETURNING id, status, started_at;
-SQL
-}
+cmd_start()  { local id="${1:?usage: fleet start <id>}";  _set_status "$id" in_progress started_at; }
 cmd_fail()   {
   local id="${1:?usage: fleet fail <id> <reason>}"; shift
   local reason="${*:?usage: fleet fail <id> <reason>}"
@@ -238,13 +222,10 @@ _set_status() {
     *) echo "_set_status: invalid tscol '$tscol'" >&2; exit 2;;
   esac
   # id is interpolated as ::bigint via psql var; rejected if non-numeric.
-  # Terminal-state guard: never resurrect a done/cancelled/failed row.
-  # A flip onto a terminal row returns 0 rows but exit 0 (no-op success).
   _psql -tA -v id="$id" -v new="$new" <<SQL
 UPDATE agent_messages
    SET status = :'new', $tscol = NOW()
  WHERE id = :'id'::bigint
-   AND status NOT IN ('done','cancelled','failed')
 RETURNING id, status, $tscol;
 SQL
 }
@@ -295,124 +276,6 @@ SQL
   fi
 }
 
-# Common JSON envelope projection — MUST stay byte-identical to gcg-inbox-poll's
-# ENVELOPE_SELECT so reconcile re-materializes files identical to the poller's.
-_ENVELOPE_SELECT="
-SELECT id,
-  jsonb_build_object(
-    'id', id, 'sender', sender, 'recipient', recipient,
-    'correlation_id', correlation_id, 'parent_id', parent_id,
-    'task_type', task_type, 'priority', priority,
-    'issued_at', to_char(issued_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-    'nonce', nonce, 'payload', payload
-  )::text AS envelope
-FROM src ORDER BY id;"
-
-# fleet reconcile <agent> — DB-is-truth heal pass. Runs as gcg_fleet, NO poke.
-# 1. Re-materialize missing/0-byte inbox files for 'delivered' rows in the window
-#    (heals the crash window: row committed delivered, file never written).
-# 2. Zombie cleanup: rm inbox/<id>.json whose row is in_progress/done/failed/cancelled.
-# Bounded by window + LIMIT; excludes legacy 'acked' backlog and 'pending' (poller's job).
-RECONCILE_WINDOW="${INBOX_RECONCILE_WINDOW:-24 hours}"
-RECONCILE_LIMIT="${INBOX_RECONCILE_LIMIT:-200}"
-cmd_reconcile() {
-  local agent="${1:?usage: fleet reconcile <agent>}"
-  _validate_agent "$agent"
-  local inbox="/opt/gcg/openclaw-${agent}/workspace/inbox"
-  [ -d "$inbox" ] || { echo "fleet reconcile: no inbox for $agent" >&2; exit 1; }
-
-  # --- Pass 1: re-materialize missing/truncated delivered files ---
-  local rows
-  rows=$(_psql -tA -F $'\t' -v agent="$agent" <<SQL
-WITH src AS (
-  SELECT * FROM agent_messages
-   WHERE recipient = :'agent' AND status = 'delivered'
-     AND issued_at > NOW() - INTERVAL '${RECONCILE_WINDOW}'
-   ORDER BY id LIMIT ${RECONCILE_LIMIT}
-)
-${_ENVELOPE_SELECT}
-SQL
-)
-  local rematerialized=0
-  if [ -n "$rows" ]; then
-    while IFS=$'\t' read -r id envelope; do
-      [ -z "$id" ] && continue
-      local f="${inbox}/${id}.json"
-      if [ ! -s "$f" ]; then
-        local tmp="${inbox}/.${id}.json.tmp"
-        printf '%s\n' "$envelope" > "$tmp"
-        chmod 0640 "$tmp" 2>/dev/null || true
-        mv -f "$tmp" "$f"
-        rematerialized=$((rematerialized+1))
-      fi
-    done <<< "$rows"
-  fi
-
-  # --- Pass 2: zombie cleanup — files whose row is closed/in_progress ---
-  local ids=""
-  shopt -s nullglob
-  for f in "${inbox}"/*.json; do
-    local b; b=$(basename "$f" .json)
-    case "$b" in (*[!0-9]*|'') continue;; esac
-    ids="${ids:+$ids,}$b"
-  done
-  shopt -u nullglob
-  local removed=0
-  if [ -n "$ids" ]; then
-    local zombies
-    zombies=$(_psql -tA -v agent="$agent" -v ids="$ids" <<'SQL'
-SELECT id FROM agent_messages
- WHERE recipient = :'agent'
-   AND status IN ('in_progress','done','failed','cancelled')
-   AND id = ANY(string_to_array(:'ids', ',')::bigint[]);
-SQL
-)
-    if [ -n "$zombies" ]; then
-      while read -r zid; do
-        [ -z "$zid" ] && continue
-        rm -f "${inbox}/${zid}.json" && removed=$((removed+1))
-      done <<< "$zombies"
-    fi
-  fi
-  echo "reconcile[$agent]: rematerialized=$rematerialized zombies_removed=$removed"
-}
-
-# fleet check --inbox-stale --threshold N [--agent A]
-# Exit 1 (+ list) if any pending/delivered row older than N seconds; else exit 0.
-# Excludes legacy 'acked' backlog by design. Scheduled by the stale-monitor timer.
-cmd_check() {
-  local mode="" thr=300 agent=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --inbox-stale) mode="inbox-stale"; shift;;
-      --threshold)   thr="$2"; shift 2;;
-      --agent)       agent="$2"; shift 2;;
-      *) echo "fleet check: unknown arg '$1'" >&2; exit 2;;
-    esac
-  done
-  [ "$mode" = "inbox-stale" ] || { echo "usage: fleet check --inbox-stale --threshold N [--agent A]" >&2; exit 2; }
-  case "$thr" in (*[!0-9]*|'') echo "fleet check: --threshold must be integer seconds" >&2; exit 2;; esac
-  [ -n "$agent" ] && _validate_agent "$agent"
-  local out
-  out=$(_psql -tA -v thr="$thr" -v agent="$agent" <<'SQL'
-SELECT id || '  ' || recipient || '  ' || status || '  age=' ||
-       EXTRACT(EPOCH FROM NOW()-issued_at)::int || 's'
-  FROM agent_messages
- WHERE status IN ('pending','delivered')
-   AND issued_at < NOW() - make_interval(secs => :'thr'::int)
-   AND (:'agent' = '' OR recipient = :'agent')
- ORDER BY issued_at ASC
- LIMIT 100;
-SQL
-)
-  if [ -n "$out" ]; then
-    echo "STALE (>${thr}s):"
-    echo "$out"
-    exit 1
-  fi
-  exit 0
-}
-
 # ----- dispatch -----
 
 CMD="${1:-list}"
@@ -434,10 +297,8 @@ case "$CMD" in
   cancel)    cmd_cancel "$@" ;;
   reply)     cmd_reply "$@" ;;
   tail)      cmd_tail "$@" ;;
-  reconcile) cmd_reconcile "$@" ;;
-  check)     cmd_check "$@" ;;
   help|-h|--help)
-    sed -n '2,28p' "$0" ; exit 0 ;;
+    sed -n '2,30p' "$0" ; exit 0 ;;
   *)
     echo "unknown: $CMD (try: fleet help)" >&2 ; exit 2 ;;
 esac

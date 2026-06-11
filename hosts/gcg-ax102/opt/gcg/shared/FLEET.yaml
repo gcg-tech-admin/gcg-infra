@@ -1033,6 +1033,16 @@ agents:
     workspace: /opt/gcg/openclaw-nemesis/workspace
     agents_md: /opt/gcg/openclaw-nemesis/workspace/AGENTS.md
     model_primary: openai-codex/gpt-5.5
+    # CONTEXT CAP (2026-06-10, Peter): gpt-5.5 is capped at 272,000 input tokens in openclaw.json
+    # (contextWindow: 272000). WHY: OpenAI bills 2x input / 1.5x output for the ENTIRE session once
+    # any prompt exceeds 272K. The full 1.05M window exists but is cost-gated — raising the cap
+    # requires Peter approval. Codex/ChatGPT runtime path is 400K max regardless of this cap.
+    # CODEX/OAUTH PATH (2026-06-10, Peter): switching nemesis to openai-codex OAuth (ChatGPT seat)
+    # on 2026-06-11. On the Codex path the window is 400,000 tokens MAX — never assume 1M there.
+    # OAuth is seat-billed (no per-token API cost), so the 272K pricing cliff is an API-key-only
+    # concern; the 272K cap stays as the safe ceiling for any API-key fallback usage.
+    model_context_cap: {"openai/gpt-5.5": 272000}
+    model_context_codex_oauth: {"openai-codex/gpt-5.5": 400000}
     model_fallbacks: ["deepseek/deepseek-v4-pro", "google/gemini-3.5-flash", "claude-cli/claude-opus-4-7"]
     heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
     db_role: gcg_nemesis

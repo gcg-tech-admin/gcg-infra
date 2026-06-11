@@ -1,0 +1,10 @@
+[Unit]
+Description=Run GCG Advisor Ingestion Pipeline every 6 hours
+Documentation=https://docs.gcgstr.com/advisor-ingestion
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

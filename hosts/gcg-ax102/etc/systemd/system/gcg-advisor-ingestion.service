@@ -1,0 +1,35 @@
+[Unit]
+Description=GCG Advisor Ingestion Pipeline (Unified)
+Documentation=https://docs.gcgstr.com/advisor-ingestion
+After=network.target docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH=/opt/gcg/shared:/opt/gcg/shared/gcg_tools"
+# Bootstrap env (tmpfs): GOOGLE_APPLICATION_CREDENTIALS, API keys for consensus panel, DB creds
+EnvironmentFile=/run/openclaw-daen/env
+
+WorkingDirectory=/opt/gcg/shared/superapp/advisor_ingestion
+ExecStart=/opt/gcg/shared/superapp/advisor_ingestion/run_pipeline.sh
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+# op CLI daemon needs writable /tmp/com.agilebits.op.*
+PrivateTmp=true
+# read-only (not true): wrapper must read /root/.openclaw/secrets/daen-1password-token
+ProtectHome=read-only
+# whole dir: pipeline writes checkpoint backups alongside checkpoint.json
+ReadWritePaths=/opt/gcg/shared/superapp/advisor_ingestion
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-advisor-ingestion
+
+[Install]
+WantedBy=multi-user.target

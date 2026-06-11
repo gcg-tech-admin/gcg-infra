@@ -1,0 +1,18 @@
+[Unit]
+Description=GCG inbox stale-delivery monitor (alerts daen on rows unpicked >threshold)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=THRESHOLD=300
+ExecStart=/opt/gcg/shared/bin/gcg-inbox-stale-check
+# exit 1 = stale found + alerted (a normal outcome, not a unit failure)
+SuccessExitStatus=0 1
+Nice=10
+MemoryMax=64M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=gcg-inbox-stale-check
+ReadWritePaths=/var/lib/gcg-inbox-stale-check

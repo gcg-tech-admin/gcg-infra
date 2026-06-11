@@ -41,16 +41,6 @@ _fatal() {
 trap '_fatal ${LINENO}' ERR
 
 AGENT="${1:?usage: gcg-inbox-poll <agent>}"
-
-# Single-poller-per-agent invariant (R3 Finding 5): a tick that overruns the 5s
-# interval must never overlap a concurrent tick (claim is FOR UPDATE SKIP LOCKED,
-# but reconcile/re-poke re-materialization must not race). Non-blocking flock:
-# if another tick for THIS agent holds the lock, exit cleanly and let it finish.
-case "$AGENT" in (*[!a-z0-9_]*|'') echo "gcg-inbox-poll: invalid agent '$AGENT'" >&2; exit 2;; esac
-LOCKDIR="/run/lock"; [ -w "$LOCKDIR" ] || LOCKDIR="/tmp"
-exec 9>"${LOCKDIR}/gcg-inbox-poll.${AGENT}.lock" || { echo "gcg-inbox-poll: cannot open lock" >&2; exit 1; }
-flock -n 9 || { echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] tick overlap — skip" >&2; exit 0; }
-
 WS="/opt/gcg/openclaw-${AGENT}/workspace"
 INBOX_DIR="${WS}/inbox"
 PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run GCG inbox stale-delivery monitor every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Unit=gcg-inbox-stale-check.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
