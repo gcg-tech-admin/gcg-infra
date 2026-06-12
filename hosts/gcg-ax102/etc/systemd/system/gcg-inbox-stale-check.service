@@ -11,8 +11,10 @@ SuccessExitStatus=0 1
 Nice=10
 MemoryMax=64M
 NoNewPrivileges=true
-ProtectSystem=strict
+# ProtectSystem=full (not strict): reconcile must re-materialize inbox files
+# under /opt/gcg/openclaw-*/workspace/inbox. full keeps /usr /etc /boot read-only.
+ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
 StateDirectory=gcg-inbox-stale-check
-ReadWritePaths=/var/lib/gcg-inbox-stale-check
+ReadWritePaths=/var/lib/gcg-inbox-stale-check /opt/gcg

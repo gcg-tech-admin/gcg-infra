@@ -103,7 +103,7 @@ def run_checks(scopes: set, verbose=False):
     if "INFRA" in scopes:
         check("broker-health", "curl -s http://127.0.0.1:18970/health | python3 -c 'import json,sys; assert json.load(sys.stdin)[\"status\"]==\"ok\"'")
         check("db-reachable", f"GCG_DB_HOST=10.0.0.2 /opt/gcg/shared/venv/bin/python3 -c \"import os; os.environ['GCG_DB_HOST']='10.0.0.2'; import sys; sys.path.insert(0,'{SHARED}/gcg_tools'); from db_connect import get_connection; c=get_connection(agent_name='talos'); c.cursor().execute('SELECT 1'); c.close()\"")
-        check("ax42-staging-be", "ssh -i /etc/gcg/fleet-ax42-access -o StrictHostKeyChecking=no -o ConnectTimeout=8 root@10.0.0.2 'curl -s -o /dev/null -w \"%{http_code}\" --max-time 5 http://127.0.0.1:8001/docs'", expect_contains="200")
+        check("ax42-staging-be", "ssh -i /etc/gcg/fleet-ax42-access -o StrictHostKeyChecking=no -o ConnectTimeout=8 root@10.0.0.2 'curl -s -o /dev/null -w \"%{http_code}\" --max-time 5 http://127.0.0.1:8003/docs'", expect_contains="200")
         check("ax42-staging-fe", "ssh -i /etc/gcg/fleet-ax42-access -o StrictHostKeyChecking=no -o ConnectTimeout=8 root@10.0.0.2 'curl -s -o /dev/null -w \"%{http_code}\" --max-time 5 http://127.0.0.1:8004'", expect_contains="200")
         check("gateway-health", "curl -s http://127.0.0.1:18950/healthz | python3 -c 'import json,sys; assert json.load(sys.stdin)[\"status\"]==\"live\"'")
 
