@@ -1,0 +1,115 @@
+#!/bin/bash
+# Claude Interactive TMUX Bridge v40 — warm-session with JSONL extraction (Atlas, 2026-06-12)
+# 
+# Approach: maintain ONE warm Claude Code session per model+sub combo.
+# On first call: launch claude --continue (uses existing accepted session, or creates fresh one)
+# On subsequent calls: reuse the warm session → instant response.
+# JSONL extraction provides the output via /opt/gcg/shared/bin/claude-jsonl-extract.py (v33+)
+#
+# Usage: claude-tmux-bridge --agent <id> --model <model> --prompt <text>
+# Output: {"type":"result","result":"<response text>"}
+
+set -euo pipefail
+
+MODEL="sonnet"
+AGENT=""
+PROMPT=""
+HISTORY=""
+TIMEOUT=${GCTB_TIMEOUT:-120}
+HELPER="/opt/gcg/shared/bin/claude-jsonl-extract.py"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --agent)    AGENT="$2"; shift 2 ;;
+        --model)    MODEL="$2"; shift 2 ;;
+        --prompt)   PROMPT="$2"; shift 2 ;;
+        --history)  HISTORY="$2"; shift 2 ;;
+        *)          shift ;;
+    esac
+done
+
+# Map short model names
+case "$MODEL" in
+    sonnet*|claude-sonnet*) CLAUDE_MODEL="claude-sonnet-4-6" ;;
+    opus*|claude-opus*)     CLAUDE_MODEL="claude-opus-4-8" ;;
+    haiku*|claude-haiku*)   CLAUDE_MODEL="claude-haiku-4-5" ;;
+    fable*|claude-fable*)   CLAUDE_MODEL="claude-fable-5" ;;
+    *)       echo "ERROR: Unknown model $MODEL" >&2; exit 1 ;;
+esac
+
+# Session naming: one session per sub + model combo
+SESSION_KEY="${AGENT:-default}"
+TMUX_SESSION="gcg-claude-${CLAUDE_MODEL}-sub-peter"
+HOME_DIR="/opt/gcg/claude-profiles/sub-peter"
+WORK_DIR="/opt/gcg/shared"
+WORK_SLUG=$(echo "$WORK_DIR" | sed 's#[/.]#-#g')
+PROJECT_DIR="$HOME_DIR/.claude/projects/$WORK_SLUG"
+mkdir -p "$WORK_DIR" 2>/dev/null || true
+
+if [ -n "$HISTORY" ]; then
+    PROMPT="Previous context: $HISTORY
+Current request: $PROMPT"
+fi
+
+# Create or reuse warm session
+if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    tmux new-session -d -s "$TMUX_SESSION" -c "$WORK_DIR" -x 200 -y 50
+    tmux set-option -t "$TMUX_SESSION" history-limit 5000 2>/dev/null || true
+    tmux send-keys -t "$TMUX_SESSION" "unset ANTHROPIC_API_KEY" C-m
+    sleep 0.5
+    # Use --continue to resume bypass-accepted session (no dialog)
+    tmux send-keys -t "$TMUX_SESSION" "HOME=$HOME_DIR IS_SANDBOX=1 DISABLE_AUTOUPDATER=1 claude --continue" C-m
+    sleep 8
+fi
+
+# Clean stale JSONL and set watermark
+rm -f "$PROJECT_DIR"/*.jsonl 2>/dev/null || true
+sleep 1
+SINCE=$(date -u +%s)
+
+# Send prompt via bracketed paste (preserves newlines, cap 16000)
+PROMPT_CAPPED=$(printf '%s' "$PROMPT" | head -c 16000)
+printf '%s' "$PROMPT_CAPPED" | tmux load-buffer -
+tmux paste-buffer -p -t "$TMUX_SESSION"
+sleep 0.3
+tmux send-keys -t "$TMUX_SESSION" C-m
+
+# Wait for completion — Claude idle + new JSONL assistant text since SINCE + stable mtime
+elapsed=0
+STABLE=0
+LAST_MTIME=""
+while [[ $elapsed -lt $TIMEOUT ]]; do
+    sleep 2; elapsed=$((elapsed + 2))
+    
+    # Check if Claude is still working (has the "cooking/thinking" indicator)
+    PANE=$(tmux capture-pane -t "$TMUX_SESSION" -p -S -8 2>/dev/null || true)
+    if echo "$PANE" | grep -qi "Cogitated\|Cooked\|Crunched\|Sautéed\|to interrupt"; then
+        STABLE=0
+        continue
+    fi
+    
+    # Check for new assistant text in JSONL since SINCE
+    if ! python3 "$HELPER" --project-dir "$PROJECT_DIR" --since "$SINCE" --mode check 2>/dev/null; then
+        continue
+    fi
+    
+    # Verify JSONL file is stable (not still being written)
+    MT=$(stat -c %Y "$PROJECT_DIR"/*.jsonl 2>/dev/null | sort -n | tail -1)
+    if [[ -n "$MT" && "$MT" == "$LAST_MTIME" ]]; then
+        STABLE=$((STABLE + 1))
+        [[ $STABLE -ge 2 ]] && break
+    else
+        STABLE=0
+    fi
+    LAST_MTIME="$MT"
+done
+
+# Extract result
+RESULT=$(python3 "$HELPER" --project-dir "$PROJECT_DIR" --since "$SINCE" --mode extract 2>/dev/null || true)
+
+if [[ -z "${RESULT// }" ]]; then
+    RESULT="⚠️ No response extracted from Claude session."
+fi
+
+# Output as JSON
+printf '%s' "$RESULT" | python3 -c 'import sys,json; print(json.dumps({"type":"result","result":sys.stdin.read()}))'

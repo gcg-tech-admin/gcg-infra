@@ -1,0 +1,20 @@
+# /etc/systemd/system/gcg-inbox-evidence-check.service
+[Unit]
+Description=GCG inbox done!=acted drain detector (flags substantive a2a msgs marked done <60s with no reply/progress)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=MINSECS=60
+Environment=LOOKBACK=3600
+ExecStart=/opt/gcg/shared/bin/gcg-inbox-evidence-check
+# exit 1 = suspect drains found + alerted (a normal outcome, not a unit failure)
+SuccessExitStatus=0 1
+Nice=10
+MemoryMax=64M
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=gcg-inbox-evidence-check
+ReadWritePaths=/var/lib/gcg-inbox-evidence-check /opt/gcg

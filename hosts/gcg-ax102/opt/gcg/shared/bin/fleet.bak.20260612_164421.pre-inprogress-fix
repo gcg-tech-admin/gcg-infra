@@ -321,14 +321,12 @@ cmd_reconcile() {
   local inbox="/opt/gcg/openclaw-${agent}/workspace/inbox"
   [ -d "$inbox" ] || { echo "fleet reconcile: no inbox for $agent" >&2; exit 1; }
 
-  # --- Pass 1: re-materialize missing/truncated files for OPEN rows ---
-  # Includes in_progress: a claimed message whose session died still needs its
-  # file restored so the next run can see it (else it's invisible forever).
+  # --- Pass 1: re-materialize missing/truncated delivered files ---
   local rows
   rows=$(_psql -tA -F $'\t' -v agent="$agent" <<SQL
 WITH src AS (
   SELECT * FROM agent_messages
-   WHERE recipient = :'agent' AND status IN ('delivered','in_progress')
+   WHERE recipient = :'agent' AND status = 'delivered'
      AND issued_at > NOW() - INTERVAL '${RECONCILE_WINDOW}'
    ORDER BY id LIMIT ${RECONCILE_LIMIT}
 )
@@ -350,10 +348,7 @@ SQL
     done <<< "$rows"
   fi
 
-  # --- Pass 2: zombie cleanup — files whose row is TERMINAL (done/failed/cancelled) ---
-  # NOTE: in_progress is deliberately EXCLUDED. A claimed-but-unfinished message
-  # must keep its file — removing it (the old behavior) silently lost any message
-  # whose session died mid-work, since nothing re-materializes it.
+  # --- Pass 2: zombie cleanup — files whose row is closed/in_progress ---
   local ids=""
   shopt -s nullglob
   for f in "${inbox}"/*.json; do
@@ -368,7 +363,7 @@ SQL
     zombies=$(_psql -tA -v agent="$agent" -v ids="$ids" <<'SQL'
 SELECT id FROM agent_messages
  WHERE recipient = :'agent'
-   AND status IN ('done','failed','cancelled')
+   AND status IN ('in_progress','done','failed','cancelled')
    AND id = ANY(string_to_array(:'ids', ',')::bigint[]);
 SQL
 )

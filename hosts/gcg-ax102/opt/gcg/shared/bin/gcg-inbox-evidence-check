@@ -1,0 +1,113 @@
+#!/bin/bash
+# gcg-inbox-evidence-check — "done != acted" drain detector.
+# a2a canonical build, behavior rule 2 (done-requires-evidence). Talos 2026-06-12.
+#
+# THE GAP THIS CLOSES: a woken agent run can mechanically drain an inbox message
+# start->done in seconds without actually acting on it. The janitor and stale-check
+# CANNOT catch this — they treat `done` as a healthy terminal state. So a real
+# directive (e.g. Daen's #150291 "ENGINEERING CASCADE LIVE", done in 4s) gets
+# marked done and buried. This monitor flags those suspect fast-drains.
+#
+# SUSPECT = status=done AND substantive-type (or urgent message) AND
+#           time-to-done < MINSECS AND no reply AND no progress_note.
+#
+# Evidence of REAL action (any one) exempts a message:
+#   - a reply exists           (child row with parent_id = msg id)
+#   - a progress_note was set   (agent narrated work)
+#   - time-to-done >= MINSECS   (had time to actually do the work)
+#   - status blocked/failed     (terminal-but-not-drained — not 'done')
+#
+# Scope (high-signal, low-noise): substantive task_types ALWAYS; plain 'message'
+# only when urgent (priority <= 2) and not a system/monitor alert. The ~134k
+# informational broadcasts are excluded by design.
+#
+# Dedup: suspect id-set is hashed; the alert fires only when the set changes
+# (NO-SPAM compliant — a persistent suspect alerts once, not every tick).
+# Routes a single digest to ALERT_TO (default daen, the fleet coordinator), who
+# re-dispatches. Peter is NOT pinged directly (NO-SPAM).
+#
+# Env: MINSECS (default 60), LOOKBACK sec (default 3600), DRYRUN=1,
+#      STATE_DIR, ALERT_TO (default daen).
+set -euo pipefail
+
+MINSECS="${MINSECS:-60}"
+LOOKBACK="${LOOKBACK:-3600}"
+DRYRUN="${DRYRUN:-0}"
+ALERT_TO="${ALERT_TO:-daen}"
+STATE_DIR="${STATE_DIR:-/var/lib/gcg-inbox-evidence-check}"
+FLEET=/opt/gcg/shared/bin/fleet
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+PGHOST=10.0.0.2; PGPORT=5432; PGUSER=gcg_fleet; PGDB=gcg_intelligence
+
+mkdir -p "$STATE_DIR" 2>/dev/null || STATE_DIR=/tmp
+STATE_FILE="${STATE_DIR}/last-alert.hash"
+
+if [ ! -r "$PWD_FILE" ]; then
+  echo "evidence-check: cannot read $PWD_FILE" >&2; exit 2
+fi
+
+_psql() {
+  PGPASSWORD=$(tr -d '\r\n' < "$PWD_FILE") \
+    psql "host=$PGHOST port=$PGPORT user=$PGUSER dbname=$PGDB sslmode=require" \
+    -v ON_ERROR_STOP=1 "$@"
+}
+
+rows=$(_psql -tA -F'|' -v min="$MINSECS" -v look="$LOOKBACK" <<'SQL'
+SELECT m.id, m.sender, m.recipient, m.task_type, m.priority,
+       EXTRACT(EPOCH FROM m.done_at - COALESCE(m.started_at, m.acked_at, m.issued_at))::int,
+       replace(left(m.payload->>'text', 60), E'\n', ' ')
+  FROM agent_messages m
+ WHERE m.status = 'done'
+   AND m.done_at > NOW() - make_interval(secs => :'look'::int)
+   AND (
+        m.task_type IN ('task','review','proposal','qa','directive',
+                        'council_review','feature_request','fix','build','status_check')
+        OR (m.task_type = 'message' AND m.priority <= 2
+            AND m.payload->>'text' NOT LIKE '⚠️%'
+            AND m.payload->>'text' NOT LIKE 'STALE INBOX%')
+       )
+   AND EXTRACT(EPOCH FROM m.done_at - COALESCE(m.started_at, m.acked_at, m.issued_at)) < :'min'::int
+   AND m.progress_note IS NULL
+   AND NOT EXISTS (SELECT 1 FROM agent_messages r WHERE r.parent_id = m.id)
+ ORDER BY m.done_at DESC
+ LIMIT 100;
+SQL
+)
+
+if [ -z "$rows" ]; then
+  echo "$(date -u +%FT%TZ) evidence-check OK (no suspect drains <${MINSECS}s in last ${LOOKBACK}s)"
+  : > "$STATE_FILE" 2>/dev/null || true   # clear state so next suspect alerts fresh
+  exit 0
+fi
+
+# Build digest + dedup hash on the suspect id-set
+hash=$(printf '%s' "$rows" | cut -d'|' -f1 | sort -u | sha1sum | awk '{print $1}')
+last=$(cat "$STATE_FILE" 2>/dev/null || echo "")
+
+n=0
+digest="⚠️ DONE≠ACTED — suspect fast-drains (task-type done <${MINSECS}s, no reply, no progress):"
+while IFS='|' read -r id sender recipient ttype prio secs snip; do
+  [ -z "$id" ] && continue
+  n=$((n+1))
+  digest="${digest}
+  #${id} ${sender}→${recipient} [${ttype} p${prio}] ${secs}s — \"${snip}\""
+done <<< "$rows"
+digest="${digest}
+
+These were marked done without evidence of action. Re-dispatch or verify each."
+
+if [ "$DRYRUN" = "1" ]; then
+  echo "DRYRUN would alert ${ALERT_TO} (${n} suspects):"
+  printf '%s\n' "$digest"
+  exit 1
+fi
+
+if [ "$hash" = "$last" ]; then
+  echo "$(date -u +%FT%TZ) evidence-check: same suspect set (hash ${hash:0:8}) — suppressing dup"
+  exit 1
+fi
+
+"$FLEET" send --priority 2 "$ALERT_TO" "$digest" >/dev/null 2>&1 || true
+printf '%s' "$hash" > "$STATE_FILE" 2>/dev/null || true
+echo "$(date -u +%FT%TZ) evidence-check: alerted ${ALERT_TO} (${n} suspects, hash ${hash:0:8})"
+exit 1

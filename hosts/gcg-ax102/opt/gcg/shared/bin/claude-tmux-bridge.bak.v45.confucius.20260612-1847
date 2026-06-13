@@ -1,5 +1,5 @@
 #!/bin/bash
-# Claude Interactive TMUX Bridge v46-confucius — paste-buffer + full scrollback diff
+# Claude Interactive TMUX Bridge v45 — paste-buffer + full scrollback diff
 # TESTED AND WORKING on sub-peter with bypass accepted.
 set -euo pipefail
 
@@ -49,7 +49,7 @@ tmux send-keys -t "$SESS" Enter
 elapsed=0; STABLE=0
 while [[ $elapsed -lt $TIMEOUT ]]; do
     sleep 2; elapsed=$((elapsed + 2))
-    P=$(tmux capture-pane -t "$SESS" -p -S -5 2>/dev/null || true)
+    P=$(tmux capture-pane -t "$SESS" -p -S -20 2>/dev/null || true)
     if echo "$P" | grep -qiE "Cogitated|Cooked|Crunched|Sautéed|Churned|Brewed|Worked"; then
         STABLE=0; continue
     fi

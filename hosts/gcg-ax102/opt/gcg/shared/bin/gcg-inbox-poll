@@ -162,7 +162,15 @@ fi
 OPENCLAW_CFG="/opt/gcg/openclaw-${AGENT}/openclaw.json"
 [ -r "$OPENCLAW_CFG" ] || exit 0
 PORT=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print((c.get('gateway') or {}).get('port') or c.get('port') or '')" "$OPENCLAW_CFG" 2>/dev/null)
-TOKEN=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print((c.get('hooks') or {}).get('token') or '')" "$OPENCLAW_CFG" 2>/dev/null)
+TOKEN=$(python3 -c "import json,sys; cfg=json.load(open(sys.argv[1])); raw=(cfg.get('hooks') or {}).get('token') or ''; print(raw)" "$OPENCLAW_CFG" 2>/dev/null)
+case "$TOKEN" in
+  *'${'*)
+    DROPIN="/etc/systemd/system/openclaw-${AGENT}.service.d/20-env-secrets.conf"
+    if [ -r "$DROPIN" ]; then
+      TOKEN=$(sed -n 's/^Environment=HOOKS_TOKEN=//p' "$DROPIN")
+    fi
+  ;;
+esac
 [ -n "$PORT" ] && [ -n "$TOKEN" ] || exit 0
 
 ALL_IDS="${NEW_IDS}${NEW_IDS:+${REPOKE_IDS:+, }}${REPOKE_IDS}"
