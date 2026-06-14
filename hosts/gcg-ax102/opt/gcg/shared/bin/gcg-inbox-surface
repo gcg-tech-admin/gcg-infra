@@ -1,0 +1,106 @@
+#!/bin/bash
+# gcg-inbox-surface — surface SUBSTANTIVE inbound a2a to the agent's operator (Telegram).
+#
+# Why: the fleet hook runs a woken drain with deliver:false, so substantive replies
+# (e.g. Daen answering a ping) get marked `done` and never reach the operator.
+# This is the additive, deterministic slice of the a2a-inbox canonical build Rule 3
+# ("rulings/replies from key senders surface to the operator, never silently drained").
+# It does NOT touch the lifecycle/poller/done semantics — read-only notify + dedup.
+#
+# Selective (no spam): only replies (parent_id), task/directive/review/proposal/ruling/qa,
+# urgent (priority<=2), or key senders (daen/peter). Routine 'message'/ghost are skipped.
+# Dedup via a per-agent seen-set so each message surfaces at most once.
+#
+# Usage: gcg-inbox-surface <agent>   (DRYRUN=1 to log without sending)
+set -euo pipefail
+
+AGENT="${1:?usage: gcg-inbox-surface <agent>}"
+case "$AGENT" in (*[!a-z0-9_]*|'') echo "invalid agent '$AGENT'" >&2; exit 2;; esac
+
+WS="/opt/gcg/openclaw-${AGENT}/workspace"
+[ -d "$WS" ] || { echo "no workspace for $AGENT" >&2; exit 1; }
+SEEN="${WS}/.a2a_surfaced_ids"
+CFG="/opt/gcg/openclaw-${AGENT}/openclaw.json"
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+DRYRUN="${DRYRUN:-0}"
+WINDOW="${SURFACE_WINDOW:-45 minutes}"
+
+touch "$SEEN"
+
+# operator chat + bot token from the agent's own config
+# MainPID of the running agent daemon — its environ holds the 1Password-resolved token
+MAINPID=$(systemctl show "openclaw-${AGENT}.service" -p MainPID --value 2>/dev/null || echo "")
+read -r TOKEN CHAT < <(python3 - "$CFG" "$MAINPID" <<'PY'
+import json, sys, os, re
+d = json.load(open(sys.argv[1]))
+tg = d.get('channels', {}).get('telegram', {})
+tok = tg.get('botToken') or ''
+m = re.fullmatch(r'\$\{([A-Z0-9_]+)\}', tok)
+if m:
+    var = m.group(1)
+    val = ''
+    # canonical source: the daemon's resolved process environment
+    pid = sys.argv[2] if len(sys.argv) > 2 else ''
+    if pid and pid != '0' and os.path.exists(f'/proc/{pid}/environ'):
+        try:
+            for kv in open(f'/proc/{pid}/environ', 'rb').read().split(b'\0'):
+                if kv.startswith(var.encode() + b'='):
+                    val = kv.split(b'=', 1)[1].decode(); break
+        except Exception:
+            pass
+    tok = val or tok
+allow = tg.get('allowFrom') or []
+chat = allow[0] if allow else ''
+print(tok + ' ' + str(chat))
+PY
+)
+[ -n "$TOKEN" ] && [ -n "$CHAT" ] || { echo "$(date -u +%FT%TZ) surface[$AGENT] no telegram token/chat — skip" >&2; exit 0; }
+
+PW=$(tr -d '\r\n' < "$PWD_FILE")
+PSQL() { PGPASSWORD="$PW" psql "host=10.0.0.2 port=5432 user=gcg_fleet dbname=gcg_intelligence sslmode=disable" -tA -F $'\t' "$@"; }
+
+# Substantive inbound, recently arrived, already claimed/processed (not pending/ghost).
+ROWS=$(PSQL -c "
+  SELECT id, sender, COALESCE(task_type,'message'), priority, replace(COALESCE(payload->>'text',''), E'\n', ' ')
+  FROM agent_messages
+  WHERE recipient='${AGENT}'
+    AND issued_at > now() - interval '${WINDOW}'
+    AND status IN ('delivered','acked','in_progress','done','blocked')
+    AND COALESCE(payload->>'text','') <> ''
+    AND sender <> '${AGENT}'
+    AND (
+         parent_id IS NOT NULL
+      OR task_type IN ('task','directive','review','proposal','ruling','qa')
+      OR priority <= 2
+      OR sender IN ('daen','peter')
+    )
+  ORDER BY id ASC;" 2>/dev/null || true)
+
+[ -z "$ROWS" ] && exit 0
+
+sent=0
+while IFS=$'\t' read -r id sender ttype prio text; do
+  [ -n "$id" ] || continue
+  grep -qx "$id" "$SEEN" && continue            # already surfaced
+  # trim very long bodies for the notification
+  body=$(printf '%s' "$text" | cut -c1-1200)
+  msg="📨 A2A from ${sender} (#${id}, ${ttype}${prio:+ p${prio}})
+${body}"
+  if [ "$DRYRUN" = "1" ]; then
+    echo "$(date -u +%FT%TZ) surface[$AGENT] DRYRUN would send #$id from $sender"
+  else
+    if curl -fsS --max-time 10 "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+         -d chat_id="${CHAT}" -d disable_web_page_preview=true \
+         --data-urlencode "text=${msg}" >/dev/null 2>&1; then
+      echo "$id" >> "$SEEN"
+      sent=$((sent+1))
+    else
+      echo "$(date -u +%FT%TZ) surface[$AGENT] send FAILED for #$id" >&2
+    fi
+  fi
+done <<< "$ROWS"
+
+# keep seen-set bounded
+if [ "$(wc -l < "$SEEN")" -gt 2000 ]; then tail -1000 "$SEEN" > "${SEEN}.tmp" && mv "${SEEN}.tmp" "$SEEN"; fi
+[ "$sent" -gt 0 ] && echo "$(date -u +%FT%TZ) surface[$AGENT] surfaced=$sent" || true
+exit 0

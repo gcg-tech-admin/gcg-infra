@@ -1,0 +1,9 @@
+[Unit]
+Description=GCG a2a inbox surfacer for agent %i (substantive inbound -> operator Telegram)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/gcg-inbox-surface %i
+# token read from the running daemon's environ; needs root
+User=root

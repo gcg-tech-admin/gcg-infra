@@ -1,0 +1,22 @@
+[Unit]
+Description=GCG cascade driver — advance active plans
+Documentation=https://github.com/Gcg-tech
+After=network-online.target
+Requires=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/cascade_driver.py
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=5m
+MemoryMax=256M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=gcg-cascade-driver
+ReadWritePaths=/opt/gcg/shared /var/log
+
+[Install]
+WantedBy=multi-user.target

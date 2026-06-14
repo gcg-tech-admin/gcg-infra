@@ -1,0 +1,17 @@
+[Unit]
+Description=GCG fleet loop driver — unblocks tasks when dependencies are done
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/gcg-loop-driver
+User=root
+# Hardening (loop driver only needs DB access — no agent workspace needed)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

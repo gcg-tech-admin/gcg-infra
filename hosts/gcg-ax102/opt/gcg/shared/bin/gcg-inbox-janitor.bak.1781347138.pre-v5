@@ -34,12 +34,6 @@ MAX_DIGEST=25
 MAX_RUNTIME_SEC=60
 START_TS=$(date +%s)
 
-# ── v5 self-healing loop (wedged-agent recovery) ───────────────────
-STUCK_INPROGRESS_MIN=15              # in_progress older than this w/o completing = wedged
-MAX_INPROGRESS_RESET=3               # after this many resets, fail the message
-MAX_RESTART=5                        # cap agent process restarts per run (anti-storm)
-RESTART_COOLDOWN_SECS=$((30 * 60))   # never restart the same agent more than once / 30 min
-
 # ── Helpers ────────────────────────────────────────────────────────
 _log()  { echo "$(date -u +%FT%TZ) gcg-inbox-janitor v4 $*" >&2; }
 _dry()  { $DRY_RUN && _log "[DRY-RUN] $*"; }
@@ -244,82 +238,35 @@ handle_acked_stale() {
   _log "acked_stale_total=$count repoke=$repoke_count cancel=$cancel_count"
 }
 
-# ── 3. Wedged-agent recovery: stuck in_progress → reset msg + restart agent ──
-# A message claimed (in_progress) but not completing past STUCK_INPROGRESS_MIN is
-# the signature of a wedged agent process (proven 2026-06-13: Talos held good creds
-# but stopped completing turns; the fix was restart + reset the orphaned claim).
-# This automates that exact fix: reset the orphaned message to pending (pure DB,
-# works under the sandbox) AND restart the owning agent (deduped 30m, capped, best-effort).
-RESTART_STATE="${STATE_DIR}/restart-state.json"
-_restart_allowed() {  # rc0 = allowed, rc1 = on cooldown — READ ONLY (no state write)
-  local agent="$1" now last
-  [ -f "$RESTART_STATE" ] || echo '{}' > "$RESTART_STATE"
-  now=$(date -u +%s)
-  last=$(jq -r --arg k "$agent" '.[$k] // empty' "$RESTART_STATE" 2>/dev/null)
-  [ -n "$last" ] && [ $((now - last)) -lt "$RESTART_COOLDOWN_SECS" ] && return 1
-  return 0
-}
-_record_restart() {  # called ONLY after an actual successful restart
-  local agent="$1" now; now=$(date -u +%s)
-  [ -f "$RESTART_STATE" ] || echo '{}' > "$RESTART_STATE"
-  jq --arg k "$agent" --arg t "$now" '.[$k]=($t|tonumber)' "$RESTART_STATE" > "${RESTART_STATE}.tmp" 2>/dev/null && mv "${RESTART_STATE}.tmp" "$RESTART_STATE"
-}
-
-handle_wedged_inprogress() {
+# ── 3. Stale in_progress >6h → notify sender (capped, deduped) ──
+handle_stale_in_progress() {
   local rows
   rows=$(db_f "
-    SELECT id, recipient, sender, COALESCE(deliver_count,0) AS dc
+    SELECT id, sender, recipient, COALESCE(progress_note, '(none)') AS note
     FROM agent_messages
     WHERE status = 'in_progress'
-      AND started_at < NOW() - INTERVAL '${STUCK_INPROGRESS_MIN} minutes'
+      AND started_at < NOW() - INTERVAL '6 hours'
     ORDER BY id
-    LIMIT 100;
+    LIMIT 50;
   " 2>/dev/null) || rows=""
 
-  local count=0 reset_count=0 fail_count=0 restart_count=0
-  declare -A seen_agent
-  while IFS=$'\t' read -r id recipient sender dc; do
+  local count=0 sent=0
+  while IFS=$'\t' read -r id sender recipient note; do
     [ -z "$id" ] && continue
     count=$((count + 1))
     _runtime_check
+    should_alert "stale:$id" || continue
 
-    # (a) Restart the wedged agent — once per run per agent, valid-agent only, capped, 30m cooldown
-    if [ -n "$recipient" ] && [ -z "${seen_agent[$recipient]:-}" ]; then
-      seen_agent[$recipient]=1
-      if systemctl cat "openclaw-${recipient}.service" >/dev/null 2>&1 && [ "$restart_count" -lt "$MAX_RESTART" ]; then
-        if _restart_allowed "$recipient"; then
-          restart_count=$((restart_count + 1))
-          _log "WEDGE_RESTART agent=$recipient (msg #$id stuck in_progress >${STUCK_INPROGRESS_MIN}m) — restarting openclaw-${recipient}.service"
-          if ! $DRY_RUN; then
-            if systemctl restart "openclaw-${recipient}.service" 2>/dev/null; then
-              _record_restart "$recipient"
-            else
-              _log "WARN: restart openclaw-${recipient}.service failed (check janitor sandbox perms)"
-            fi
-          fi
-        else
-          _log "WEDGE_RESTART_SUPPRESS agent=$recipient — restarted <${RESTART_COOLDOWN_SECS}s ago"
-        fi
-      fi
-    fi
-
-    # (b) Reset the orphaned message (bounded retries) so the fresh process reclaims it
-    if [ "${dc:-0}" -ge "$MAX_INPROGRESS_RESET" ]; then
-      fail_count=$((fail_count + 1))
-      _log "WEDGE_FAIL id=$id recipient=$recipient — exceeded ${MAX_INPROGRESS_RESET} resets, marking failed"
-      if ! $DRY_RUN; then
-        db_q "UPDATE agent_messages SET status='failed', done_at=NOW(), blocked_reason='auto-failed: stuck in_progress >${STUCK_INPROGRESS_MIN}m, exceeded ${MAX_INPROGRESS_RESET} resets (janitor v5)' WHERE id=$id AND status='in_progress';"
-      fi
-    else
-      reset_count=$((reset_count + 1))
-      _log "WEDGE_RESET id=$id recipient=$recipient deliver_count=${dc:-0} — reset to pending for reprocessing"
-      if ! $DRY_RUN; then
-        db_q "UPDATE agent_messages SET status='pending', started_at=NULL, acked_at=NULL, deliver_count=COALESCE(deliver_count,0)+1 WHERE id=$id AND status='in_progress';"
-      fi
+    _log "STALE_IN_PROGRESS id=$id recipient=$recipient sender=$sender — stale >6h"
+    if ! $DRY_RUN; then
+      db_q "UPDATE agent_messages SET progress_note='STALE >6h — janitor alert at $(date -u +%FT%TZ). Original: ${note//\'/''}' WHERE id=$id AND status='in_progress';"
+      # Notify sender their task may be abandoned (one-time, deduped by cooldown)
+      /opt/gcg/shared/bin/fleet send "$sender" "⚠️ Msg #$id to ${recipient} is in_progress >6h without completing. May be abandoned. Check Asana." 2>/dev/null || true
+      sent=$((sent + 1))
     fi
   done <<< "$rows"
 
-  _log "wedged_inprogress_total=$count reset=$reset_count failed=$fail_count restarts=$restart_count"
+  _log "stale_in_progress_total=$count notified=$sent"
 }
 
 # ── 4. Auto-resolve: blocked items whose blocker cleared → unblock ─
@@ -456,7 +403,7 @@ _runtime_check
 handle_acked_stale
 _runtime_check
 
-handle_wedged_inprogress
+handle_stale_in_progress
 _runtime_check
 
 handle_blocked_auto_resolve

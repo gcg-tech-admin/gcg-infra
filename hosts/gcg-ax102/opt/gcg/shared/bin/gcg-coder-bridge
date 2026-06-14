@@ -1,0 +1,290 @@
+#!/bin/bash
+# gcg-coder-bridge — Cascade executor bridge for the coder Claude Code tmux session
+# BRIDGE_VERSION=1 (2026-06-13)
+#
+# Feeds pending 'coder' tasks from the fleet bus to the gcg-bridge-claude-sonnet-4-6 tmux session.
+#
+# Handoff guarantees (Peter's robustness requirements):
+#   1. Confirm-submit     — verify Enter landed; retry up to 3x; alert daen on failure
+#   2. Clear-before-feed  — C-u before typing; no stale brief in buffer
+#   3. Claim-before-feed  — fleet start <id> before feeding; state file persisted atomically
+#   4. Idle-gating        — only feed when pane shows '← for agents'; never while busy
+#   5. Auth completion    — bridge NEVER marks done; session calls fleet done/fail
+#   6. Wedge recovery     — if in_progress > WEDGE_TIMEOUT_MIN, alert daen
+#   7. Crash-safe state   — state file survives restart; never re-feeds same id
+
+set -euo pipefail
+
+BRIDGE_VERSION=1
+TMUX_SESSION="gcg-bridge-claude-sonnet-4-6"
+FLEET="/opt/gcg/shared/bin/fleet"
+STATE_DIR="/var/lib/gcg-coder-bridge"
+STATE_FILE="$STATE_DIR/state"
+LOCK_FILE="/run/lock/gcg-coder-bridge.lock"
+TICK_INTERVAL=10          # seconds between loop iterations
+WEDGE_TIMEOUT_MIN=20      # minutes before alerting on a stuck in_progress task
+CONFIRM_RETRIES=3         # max Enter retries if submission not confirmed
+CONFIRM_POLL_SECS=2       # seconds to wait after each Enter for "esc to interrupt"
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+
+_log() { echo "$(date -u +%FT%TZ) gcg-coder-bridge[v${BRIDGE_VERSION}]: $*" >&2; }
+
+_psql() {
+  local pwd; pwd=$(tr -d '\r\n' < "$PWD_FILE")
+  PGPASSWORD="$pwd" psql "host=10.0.0.2 port=5432 user=gcg_fleet dbname=gcg_intelligence sslmode=disable" \
+    -tA -F '' "$@"
+}
+
+# ── State file ─────────────────────────────────────────────────────────────────
+# Format: IN_FLIGHT_ID=<id|>  LAST_FED_ID=<id|>  FED_AT=<epoch|>
+_state_read() {
+  IN_FLIGHT_ID=""; LAST_FED_ID=""; FED_AT=""
+  [[ -f "$STATE_FILE" ]] && source "$STATE_FILE" 2>/dev/null || true
+}
+
+_state_write() {
+  # _state_write IN_FLIGHT_ID LAST_FED_ID FED_AT  (pass "" to clear)
+  mkdir -p "$STATE_DIR"
+  printf 'IN_FLIGHT_ID=%s\nLAST_FED_ID=%s\nFED_AT=%s\n' \
+    "${1:-}" "${2:-}" "${3:-}" > "${STATE_FILE}.tmp"
+  mv "${STATE_FILE}.tmp" "$STATE_FILE"
+}
+
+# ── Tmux pane state ────────────────────────────────────────────────────────────
+_session_exists() {
+  tmux has-session -t "$TMUX_SESSION" 2>/dev/null
+}
+
+_pane_content() {
+  tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null || true
+}
+
+_pane_is_idle() {
+  # Idle: footer contains "← for agents" and NOT "esc to interrupt"
+  local content; content=$(_pane_content)
+  echo "$content" | grep -q "← for agents" && \
+  ! echo "$content" | grep -q "esc to interrupt"
+}
+
+_pane_is_busy() {
+  _pane_content | grep -q "esc to interrupt"
+}
+
+# ── Task pull ──────────────────────────────────────────────────────────────────
+TASK_ID=""; TASK_TEXT=""
+
+_pull_next_task() {
+  TASK_ID=""; TASK_TEXT=""
+  local sep=$'\x1f'
+  local row
+  row=$(_psql -c "
+SELECT am.id || '${sep}' || COALESCE(am.payload->>'text','(no text)')
+  FROM agent_messages am
+ WHERE am.recipient = 'coder'
+   AND am.status IN ('pending','delivered')
+   AND (
+     am.blocked_by IS NULL
+     OR NOT EXISTS (
+       SELECT 1 FROM agent_messages dep
+        WHERE dep.id = ANY(am.blocked_by)
+          AND dep.status NOT IN ('done','failed','cancelled')
+     )
+   )
+ ORDER BY am.priority ASC, am.issued_at ASC
+ LIMIT 1;" 2>/dev/null) || return 0
+
+  [[ -z "$row" ]] && return 0
+  TASK_ID="${row%%${sep}*}"
+  TASK_TEXT="${row#*${sep}}"
+}
+
+# ── Feed task to tmux ──────────────────────────────────────────────────────────
+_feed_task() {
+  local task_id="$1"
+  local task_text="$2"
+
+  # Build exactly the message the brief specifies
+  local msg
+  msg="CASCADE TASK #${task_id}: ${task_text}. Do the work. Write a result file (no secrets). When finished run:
+  fleet done ${task_id}   (or on failure: fleet fail ${task_id} \"<reason>\"). Do not pick up any other brief."
+
+  # 2. Clear-before-feed: C-u clears any leftover text in the input buffer
+  tmux send-keys -t "$TMUX_SESSION" "C-u" 2>/dev/null || true
+  sleep 0.2
+
+  # Load message into tmux paste buffer (binary-safe; no shell quote issues)
+  printf '%s' "$msg" | tmux load-buffer - 2>/dev/null
+  tmux paste-buffer -p -t "$TMUX_SESSION" 2>/dev/null
+  sleep 0.3
+
+  # 1. Confirm-submit: send Enter then verify the pane went busy
+  local confirmed=0
+  for attempt in $(seq 1 "$CONFIRM_RETRIES"); do
+    tmux send-keys -t "$TMUX_SESSION" "Enter" 2>/dev/null
+    local waited=0
+    while [[ $waited -lt $CONFIRM_POLL_SECS ]]; do
+      sleep 0.5; waited=$((waited + 1))
+      if _pane_is_busy; then confirmed=1; break; fi
+    done
+    [[ $confirmed -eq 1 ]] && break
+    _log "WARN: task #${task_id} Enter not confirmed (attempt $attempt/$CONFIRM_RETRIES)"
+  done
+
+  if [[ $confirmed -eq 0 ]]; then
+    _log "ERROR: task #${task_id} — submit unconfirmed after $CONFIRM_RETRIES retries; alerting daen"
+    "$FLEET" send daen "gcg-coder-bridge ALERT: task #${task_id} Enter unconfirmed after ${CONFIRM_RETRIES} retries on session ${TMUX_SESSION}. Manual check required." 2>/dev/null || true
+    return 1
+  fi
+
+  _log "OK: task #${task_id} submitted and confirmed (session busy)"
+  return 0
+}
+
+# ── Wedge / timeout check ──────────────────────────────────────────────────────
+_check_wedge() {
+  local id="$1"; local fed_at="$2"
+  [[ -z "$id" || -z "$fed_at" ]] && return 0
+  local now; now=$(date +%s)
+  local elapsed_min=$(( (now - fed_at) / 60 ))
+  [[ $elapsed_min -lt $WEDGE_TIMEOUT_MIN ]] && return 0
+
+  # Still in_progress in DB?
+  local st
+  st=$(_psql -c "SELECT status FROM agent_messages WHERE id = ${id};" 2>/dev/null) || st="unknown"
+  if [[ "$st" == "in_progress" ]]; then
+    _log "WEDGE: task #${id} in_progress for ${elapsed_min}min — alerting daen"
+    "$FLEET" send daen "gcg-coder-bridge WEDGE: task #${id} has been in_progress for ${elapsed_min}min on session ${TMUX_SESSION} with no completion. Investigate." 2>/dev/null || true
+    # Advance FED_AT to avoid repeated alerts every tick
+    _state_write "$id" "$id" "$(date +%s)"
+  fi
+}
+
+# ── Single tick ────────────────────────────────────────────────────────────────
+_tick() {
+  _state_read
+
+  # Check if the tmux session exists
+  if ! _session_exists; then
+    _log "WARN: session $TMUX_SESSION not found — skipping tick"
+    return 0
+  fi
+
+  # If we have an in-flight task, check its DB status first
+  if [[ -n "$IN_FLIGHT_ID" ]]; then
+    local st
+    st=$(_psql -c "SELECT status FROM agent_messages WHERE id = ${IN_FLIGHT_ID};" 2>/dev/null) || st="unknown"
+    case "$st" in
+      done|failed|cancelled)
+        _log "task #${IN_FLIGHT_ID} reached terminal status=$st — clearing in-flight"
+        _state_write "" "$IN_FLIGHT_ID" ""
+        IN_FLIGHT_ID=""
+        ;;
+      in_progress)
+        _check_wedge "$IN_FLIGHT_ID" "$FED_AT"
+        _log "task #${IN_FLIGHT_ID} still in_progress — waiting (${FED_AT:+$((( $(date +%s) - FED_AT ) / 60))min})"
+        return 0
+        ;;
+      pending|delivered)
+        # fleet-start never landed (crashed before claim) — reset so normal pull fires
+        _log "RECOVERY: task #${IN_FLIGHT_ID} status=$st (claim never succeeded) — resetting state"
+        _state_write "" "$IN_FLIGHT_ID" ""
+        IN_FLIGHT_ID=""
+        ;;
+      *)
+        _log "task #${IN_FLIGHT_ID} unexpected status=$st — leaving in-flight for next tick"
+        return 0
+        ;;
+    esac
+  fi
+
+  # 4. Idle-gating: only proceed when session shows idle footer
+  if ! _pane_is_idle; then
+    _log "session not idle — skipping"
+    return 0
+  fi
+
+  # Pull the next pending task for coder
+  _pull_next_task
+  if [[ -z "$TASK_ID" ]]; then
+    _log "no pending tasks for coder — idle"
+    return 0
+  fi
+
+  # Double-feed guard: if we already fed this id, check whether it moved forward
+  if [[ "$TASK_ID" = "$LAST_FED_ID" ]]; then
+    local st
+    st=$(_psql -c "SELECT status FROM agent_messages WHERE id = ${TASK_ID};" 2>/dev/null) || st="unknown"
+    case "$st" in
+      in_progress|done|failed|cancelled)
+        _log "GUARD: task #${TASK_ID} already fed (status=$st) — skip"
+        return 0
+        ;;
+    esac
+    _log "GUARD: task #${TASK_ID} matches LAST_FED_ID but status=$st — re-claiming"
+  fi
+
+  # 3. Claim-before-feed: fleet start atomically moves task to in_progress
+  _log "claiming task #${TASK_ID}: ${TASK_TEXT:0:80}"
+  if ! "$FLEET" start "$TASK_ID" 2>/dev/null; then
+    _log "WARN: fleet start #${TASK_ID} failed (race? already claimed?) — skip"
+    return 0
+  fi
+
+  # 7. Persist state BEFORE feeding (crash-safe: restart sees in-flight, won't re-pull)
+  _state_write "$TASK_ID" "$TASK_ID" "$(date +%s)"
+
+  # 2+1. Clear-before-feed + feed + confirm-submit
+  if _feed_task "$TASK_ID" "$TASK_TEXT"; then
+    _log "task #${TASK_ID} successfully handed off to coder session"
+  else
+    _log "ERROR: feed failed for task #${TASK_ID}; daen alerted; task remains in_progress for wedge recovery"
+  fi
+}
+
+# ── Startup recovery ──────────────────────────────────────────────────────────
+# Handles: crash between fleet-start and state-write (task is in_progress but state lost).
+# On every startup, if state file has no IN_FLIGHT_ID, scan DB for orphaned in_progress
+# coder tasks and adopt the most recent one into state so wedge detection fires.
+_startup_recovery() {
+  _state_read
+  [[ -n "$IN_FLIGHT_ID" ]] && return 0   # state intact — nothing to recover
+
+  local orphan
+  orphan=$(_psql -c "
+SELECT id FROM agent_messages
+ WHERE recipient = 'coder'
+   AND status = 'in_progress'
+ ORDER BY started_at DESC NULLS LAST
+ LIMIT 1;" 2>/dev/null) || return 0
+
+  [[ -z "$orphan" ]] && return 0
+
+  _log "RECOVERY: found orphaned in_progress task #${orphan} (bridge probably crashed after fleet-start) — adopting into state"
+  _state_write "$orphan" "$orphan" "$(date +%s)"
+}
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+main() {
+  _log "starting (session=$TMUX_SESSION, tick=${TICK_INTERVAL}s, wedge=${WEDGE_TIMEOUT_MIN}min)"
+  mkdir -p "$STATE_DIR"
+
+  # Singleton: hold exclusive lock for the daemon's lifetime
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    _log "ERROR: another instance is running (lock held) — exiting"
+    exit 1
+  fi
+
+  # Trap for clean exit
+  trap '_log "shutting down"' EXIT INT TERM
+
+  # Recover any orphaned in_progress task from a prior crash
+  _startup_recovery
+
+  while true; do
+    _tick 2>&1 || _log "tick error (non-fatal, continuing)"
+    sleep "$TICK_INTERVAL"
+  done
+}
+
+main "$@"

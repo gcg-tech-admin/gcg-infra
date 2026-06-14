@@ -1,0 +1,11 @@
+[Unit]
+Description=GCG fleet loop driver heartbeat (every 10s)
+After=network-online.target
+
+[Timer]
+OnActiveSec=5
+OnUnitActiveSec=10
+AccuracySec=1
+
+[Install]
+WantedBy=multi-user.target

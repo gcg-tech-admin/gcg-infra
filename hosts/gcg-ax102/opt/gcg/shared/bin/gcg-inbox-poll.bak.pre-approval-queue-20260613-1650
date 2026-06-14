@@ -1,0 +1,271 @@
+#!/bin/bash
+# gcg-inbox-poll — one-shot inbox drain + wake for a single agent.
+#
+# Three passes per tick (poller loops every ~5s, see gcg-inbox-poller@.service):
+#   0. CLASSIFY pending rows BEFORE claiming. Non-task rows (notifications,
+#      ghosts) are auto-closed — never materialized, never poked.
+#      0a. FYI/NOTIFICATION broadcasts: sender='cowork' AND priority>=5 AND
+#          payload text matches one of the notify_patterns set. → done, no file.
+#      0b. GHOST/undeliverable: empty payload OR repeated re-pokes past max
+#          (deliver_count>=2 AND no agent ever moved to in_progress). → failed.
+#      Real rows pass through to Pass 1.
+#   1. CLAIM   pending rows -> write JSON to workspace/inbox/, status -> 'delivered'
+#              (deliver_count+1). One JSON envelope per row, emitted by Postgres.
+#   2. RE-POKE 'delivered'/'acked' rows the agent has NOT started yet, still inside
+#              the active retry window, past the poke backoff -> re-fire the wake.
+#              Bumps acked_at ONLY (never deliver_count) so the janitor's
+#              deliver_count>=2 auto-cancel guard is never tripped by re-pokes.
+#
+# Why: the wake POST is best-effort. If it lands while the agent gateway is mid-
+# restart it fails silently, the row sits 'delivered' with the file on disk, and
+# nothing re-pokes it until the hourly janitor. Pass 2 self-heals that within
+# RETRY_BACKOFF instead of ~1h. Beyond RETRY_WINDOW the row is left for the janitor.
+#
+# Usage: gcg-inbox-poll <agent>   (safe to invoke ad-hoc)
+#
+# Env (optional): DRYRUN=1 -> log intended actions, no file writes / no poke.
+
+set -euo pipefail
+
+# Active retry window: re-poke only while a row is this young. Past it -> Pass 0's
+# zombie_repoke classifier catches it on the next tick.
+RETRY_WINDOW="${INBOX_RETRY_WINDOW:-15 minutes}"
+# Backoff: re-poke at most once per this interval (throttles pass 2).
+RETRY_BACKOFF="${INBOX_RETRY_BACKOFF:-25 seconds}"
+
+# ── Error handler ──────────────────────────────────────────────────
+_fatal() {
+  local rc=$?
+  local line=$1
+  echo "gcg-inbox-poll: FATAL at line ${line} (exit ${rc})" >&2
+  local frame=0
+  while caller $frame >/dev/null 2>&1; do
+    caller $frame >&2
+    frame=$((frame + 1))
+  done
+  /opt/gcg/shared/bin/fleet send daen "gcg-inbox-poll FAILED for ${AGENT:-?}: error at line ${line}, exit ${rc}" 2>/dev/null || true
+  exit ${rc}
+}
+trap '_fatal ${LINENO}' ERR
+
+AGENT="${1:?usage: gcg-inbox-poll <agent>}"
+
+# Single-poller-per-agent invariant (R3 Finding 5): a tick that overruns the 5s
+# interval must never overlap a concurrent tick (claim is FOR UPDATE SKIP LOCKED,
+# but reconcile/re-poke re-materialization must not race). Non-blocking flock:
+# if another tick for THIS agent holds the lock, exit cleanly and let it finish.
+case "$AGENT" in (*[!a-z0-9_]*|'') echo "gcg-inbox-poll: invalid agent '$AGENT'" >&2; exit 2;; esac
+LOCKDIR="/run/lock"; [ -w "$LOCKDIR" ] || LOCKDIR="/tmp"
+exec 9>"${LOCKDIR}/gcg-inbox-poll.${AGENT}.lock" || { echo "gcg-inbox-poll: cannot open lock" >&2; exit 1; }
+flock -n 9 || { echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] tick overlap — skip" >&2; exit 0; }
+
+WS="/opt/gcg/openclaw-${AGENT}/workspace"
+INBOX_DIR="${WS}/inbox"
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+DRYRUN="${DRYRUN:-0}"
+
+[ ! -d "$WS" ] && { echo "gcg-inbox-poll: no workspace for $AGENT" >&2; _fatal 1; }
+[ ! -r "$PWD_FILE" ] && { echo "gcg-inbox-poll: cannot read $PWD_FILE" >&2; _fatal 1; }
+
+mkdir -p "$INBOX_DIR"
+chmod 0750 "$INBOX_DIR" 2>/dev/null || true
+
+PGPW=$(tr -d '\r\n' < "$PWD_FILE")
+export PGPASSWORD="$PGPW"
+
+_psql() {
+  psql "host=10.0.0.2 port=5432 user=gcg_fleet dbname=gcg_intelligence sslmode=disable" \
+    -v ON_ERROR_STOP=1 -tA -F $'\t' -v agent="$AGENT" "$@"
+}
+
+# Common JSON envelope projection used by both passes (operates on a CTE named `src`).
+ENVELOPE_SELECT="
+SELECT id,
+  jsonb_build_object(
+    'id', id, 'sender', sender, 'recipient', recipient,
+    'correlation_id', correlation_id, 'parent_id', parent_id,
+    'task_type', task_type, 'priority', priority,
+    'issued_at', to_char(issued_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+    'nonce', nonce, 'payload', payload
+  )::text AS envelope
+FROM src ORDER BY id;"
+
+# Write one envelope to inbox/<id>.json (atomic). Always overwrite — payload is authoritative.
+_write_file() {
+  local id="$1" envelope="$2"
+  [ "$DRYRUN" = "1" ] && { echo "DRYRUN would write ${INBOX_DIR}/${id}.json" >&2; return 0; }
+  local tmp="${INBOX_DIR}/.${id}.json.tmp" final="${INBOX_DIR}/${id}.json"
+  printf '%s\n' "$envelope" > "$tmp"
+  chmod 0640 "$tmp"
+  mv -f "$tmp" "$final"
+}
+
+# ── Pass 0: classify — auto-close notifications + ghosts ──────────
+# Runs BEFORE Pass 1's FOR UPDATE so non-task rows are never materialized.
+#
+# Batch-close matched notifications + ghosts in one UPDATE per type.
+# Log totals — one line if anything fired.
+#
+# NOTIFICATION PATTERNS — deterministic SQL LIKE, not prompt rules.
+# A row must match sender=cowork, priority>=5, AND payload text starting
+# with one of these tokens to be auto-closed (FYI, not a task).
+#
+# 0a. Notifications: sender=cowork, priority>=5, payload text matches notify_patterns.
+#     status -> done, done_at=NOW, no file written.
+NOTIFY_CLOSED=$(_psql -F '' <<SQL
+WITH src AS (
+  UPDATE agent_messages
+     SET status='done', done_at=NOW()
+   WHERE recipient = :'agent' AND status = 'pending'
+     AND sender = 'cowork' AND priority >= 5
+     AND (
+       payload->>'text' LIKE 'Fleet Sweep%' OR
+       payload->>'text' LIKE 'doc-index%' OR
+       payload->>'text' LIKE 'CASCADE STALL%' OR
+       payload->>'text' LIKE 'Fabrication%' OR
+       payload->>'text' LIKE 'STALE INBOX ALERT%'
+     )
+   RETURNING 1
+)
+SELECT COUNT(*) FROM src;
+SQL
+)
+NOTIFY_CLOSED=${NOTIFY_CLOSED:-0}
+
+# 0b. Ghost/undeliverable: empty payload OR delivered_count>=2 with no in_progress.
+#     status -> failed, reason='undeliverable', done_at=NOW.
+GHOST_CLOSED=$(_psql -F '' <<SQL
+WITH src AS (
+  UPDATE agent_messages
+     SET status='failed', blocked_reason='undeliverable', done_at=NOW()
+   WHERE recipient = :'agent' AND status IN ('pending','delivered')
+     AND (
+       payload IS NULL OR
+       payload = '{}'::jsonb OR
+       (payload->>'text' IS NULL) OR
+       (payload->>'text' = '')
+     )
+   RETURNING 1
+)
+SELECT COUNT(*) FROM src;
+SQL
+)
+GHOST_CLOSED=${GHOST_CLOSED:-0}
+
+# 0c. Zombie re-poke guard: any delivered/acked row with deliver_count>=2
+#     that has NEVER entered in_progress (started_at IS NULL) is stuck.
+#     Auto-fail instead of re-poking forever.
+ZOMBIE_CLOSED=$(_psql -F '' <<SQL
+WITH src AS (
+  UPDATE agent_messages
+     SET status='failed', blocked_reason='undeliverable (repoked>=2, never started)', done_at=NOW()
+   WHERE recipient = :'agent' AND status IN ('delivered','acked')
+     AND deliver_count >= 2
+     AND started_at IS NULL
+     AND issued_at < NOW() - INTERVAL '2 minutes'
+   RETURNING 1
+)
+SELECT COUNT(*) FROM src;
+SQL
+)
+ZOMBIE_CLOSED=${ZOMBIE_CLOSED:-0}
+
+TOTAL_CLOSED=$((NOTIFY_CLOSED + GHOST_CLOSED + ZOMBIE_CLOSED))
+if [ "$TOTAL_CLOSED" -gt 0 ]; then
+  echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] classifier: notify=$NOTIFY_CLOSED ghost=$GHOST_CLOSED zombie_repoke=$ZOMBIE_CLOSED" >&2
+fi
+
+# ── Pass 1: claim pending ──────────────────────────────────────────
+NEW_IDS=""; NEW_COUNT=0
+ROWS=$(_psql <<SQL
+WITH claimed AS (
+  SELECT id FROM agent_messages
+   WHERE recipient = :'agent' AND status = 'pending'
+   ORDER BY priority ASC, issued_at ASC
+   FOR UPDATE SKIP LOCKED LIMIT 50
+),
+src AS (
+  UPDATE agent_messages m
+     SET status='delivered', acked_at=NOW(), deliver_count=deliver_count+1
+    FROM claimed WHERE m.id = claimed.id
+  RETURNING m.*
+)
+${ENVELOPE_SELECT}
+SQL
+)
+if [ -n "$ROWS" ]; then
+  while IFS=$'\t' read -r ID ENVELOPE; do
+    [ -z "$ID" ] && continue
+    _write_file "$ID" "$ENVELOPE"
+    NEW_IDS="${NEW_IDS:+$NEW_IDS, }$ID"
+    NEW_COUNT=$((NEW_COUNT+1))
+  done <<< "$ROWS"
+fi
+
+# ── Pass 2: re-poke un-started rows in the active retry window ──────
+# Bump acked_at ONLY (throttle) — do NOT touch deliver_count.
+REPOKE_IDS=""; REPOKE_COUNT=0
+ROWS2=$(_psql <<SQL
+WITH due AS (
+  SELECT id FROM agent_messages
+   WHERE recipient = :'agent'
+     AND status IN ('delivered','acked')
+     AND issued_at > NOW() - INTERVAL '${RETRY_WINDOW}'
+     AND acked_at  < NOW() - INTERVAL '${RETRY_BACKOFF}'
+   ORDER BY priority ASC, issued_at ASC
+   FOR UPDATE SKIP LOCKED LIMIT 50
+),
+src AS (
+  UPDATE agent_messages m SET acked_at=NOW()
+    FROM due WHERE m.id = due.id
+  RETURNING m.*
+)
+${ENVELOPE_SELECT}
+SQL
+)
+if [ -n "$ROWS2" ]; then
+  while IFS=$'\t' read -r ID ENVELOPE; do
+    [ -z "$ID" ] && continue
+    # Defensive: re-materialize the file if the agent removed it without closing.
+    [ -f "${INBOX_DIR}/${ID}.json" ] || _write_file "$ID" "$ENVELOPE"
+    REPOKE_IDS="${REPOKE_IDS:+$REPOKE_IDS, }$ID"
+    REPOKE_COUNT=$((REPOKE_COUNT+1))
+  done <<< "$ROWS2"
+fi
+
+TOTAL=$((NEW_COUNT + REPOKE_COUNT))
+[ "$TOTAL" -eq 0 ] && exit 0
+echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] new=$NEW_COUNT repoke=$REPOKE_COUNT" >&2
+
+# ── Wake the agent via its /hooks/fleet endpoint ───────────────────
+if [ "$DRYRUN" = "1" ]; then
+  echo "DRYRUN would poke (new: ${NEW_IDS:-none}; repoke: ${REPOKE_IDS:-none})" >&2
+  exit 0
+fi
+OPENCLAW_CFG="/opt/gcg/openclaw-${AGENT}/openclaw.json"
+[ -r "$OPENCLAW_CFG" ] || exit 0
+PORT=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print((c.get('gateway') or {}).get('port') or c.get('port') or '')" "$OPENCLAW_CFG" 2>/dev/null)
+TOKEN=$(python3 -c "import json,sys; cfg=json.load(open(sys.argv[1])); raw=(cfg.get('hooks') or {}).get('token') or ''; print(raw)" "$OPENCLAW_CFG" 2>/dev/null)
+case "$TOKEN" in
+  *'${'*)
+    DROPIN="/etc/systemd/system/openclaw-${AGENT}.service.d/20-env-secrets.conf"
+    if [ -r "$DROPIN" ]; then
+      TOKEN=$(sed -n 's/^Environment=HOOKS_TOKEN=//p' "$DROPIN")
+    fi
+  ;;
+esac
+[ -n "$PORT" ] && [ -n "$TOKEN" ] || exit 0
+
+ALL_IDS="${NEW_IDS}${NEW_IDS:+${REPOKE_IDS:+, }}${REPOKE_IDS}"
+MSG="You have ${TOTAL} inbox message(s) awaiting processing at workspace/inbox/ (ids: ${ALL_IDS}). Process per /opt/gcg/shared/docs/FLEET_INBOX.md: cat each, 'fleet start <id>', act, then 'fleet done <id>' and rm the file. Respond in English only."
+BODY=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1]}))" "$MSG")
+if curl -fsS --max-time 8 \
+     -X POST "http://127.0.0.1:${PORT}/hooks/fleet" \
+     -H "Authorization: Bearer ${TOKEN}" \
+     -H "Content-Type: application/json" \
+     -d "$BODY" >/dev/null 2>&1; then
+  echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] poked port=${PORT} (new=$NEW_COUNT repoke=$REPOKE_COUNT)" >&2
+else
+  # Poke failed (agent likely mid-restart). Row stays 'delivered'; pass 2 retries next tick.
+  echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] poke FAILED port=${PORT} — will retry" >&2
+fi

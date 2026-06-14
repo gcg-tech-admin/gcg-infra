@@ -1,0 +1,118 @@
+#!/bin/bash
+# gcg-loop-driver — W3 loop driver heartbeat
+# LOOP_VERSION=2 (2026-06-13: H5 orphan sweep — auto-fail blocked tasks whose deps are all terminal)
+#
+# Runs every ~10s (gcg-loop-driver.timer). Advances the fleet task queue by:
+#   - Unblocking tasks whose blocked_by dependencies are all done
+#     (status='blocked' → 'pending'; the per-agent poller claims pending rows)
+#   - Auto-failing orphaned tasks whose blocked_by deps are ALL terminal
+#     (done/failed/cancelled) but at least one is failed or cancelled
+#     (i.e. the task can never succeed — fail it rather than leaving it stuck)
+#
+# Guardrails (Council):
+#   - DISPATCHES only (blocked→pending) or auto-fails orphans (blocked→failed).
+#   - Does NOT mutate status behind the poller or mark done/failed/cancelled
+#     except for the orphan sweep above.
+#   - Respects input-required parks: input-required rows are invisible to this
+#     driver — they are owned by the human approval flow.
+#   - Retry-cap compliance: remediation subtasks have retry_count tracked in
+#     artifacts; the reject endpoint (queue_router.py) enforces the cap.
+#   - Single atomic UPDATE per tick — no race with per-agent pollers.
+#
+# Usage: gcg-loop-driver   (safe to invoke ad-hoc for testing)
+
+set -euo pipefail
+
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+[ ! -r "$PWD_FILE" ] && { echo "gcg-loop-driver: cannot read $PWD_FILE" >&2; exit 1; }
+
+export PGPASSWORD
+PGPASSWORD=$(tr -d '\r\n' < "$PWD_FILE")
+
+_psql() {
+  psql "host=10.0.0.2 port=5432 user=gcg_fleet dbname=gcg_intelligence sslmode=disable" \
+    -v ON_ERROR_STOP=1 -tA -F $'\t' "$@"
+}
+
+# ── Unblock tasks whose blocked_by deps are all done ──────────────────────────
+# blocked_by <@ done_ids uses the "contained-by" array operator: all elements
+# of blocked_by must appear in the done IDs set. Empty blocked_by is NOT matched
+# here (those tasks are already pending/delivered by normal flow).
+UNBLOCKED=$(_psql -F '' <<'SQL'
+WITH done_ids AS (
+  SELECT ARRAY_AGG(id) AS ids FROM agent_messages WHERE status = 'done'
+),
+ready AS (
+  SELECT m.id
+  FROM agent_messages m, done_ids d
+  WHERE m.status = 'blocked'
+    AND m.blocked_by != '{}'
+    AND m.blocked_by <@ COALESCE(d.ids, ARRAY[]::bigint[])
+  FOR UPDATE SKIP LOCKED
+),
+unblocked AS (
+  UPDATE agent_messages m
+     SET status = 'pending'
+    FROM ready
+   WHERE m.id = ready.id
+  RETURNING m.id, m.recipient
+)
+SELECT COUNT(*) FROM unblocked;
+SQL
+)
+UNBLOCKED=${UNBLOCKED:-0}
+
+if [ "$UNBLOCKED" -gt 0 ]; then
+  echo "$(date -u +%FT%TZ) gcg-loop-driver unblocked=$UNBLOCKED" >&2
+fi
+
+# ── Orphan sweep: auto-fail blocked tasks stuck on terminal (failed/cancelled) deps ──
+# A task is orphaned if ALL its blocked_by entries are terminal (done/failed/cancelled)
+# AND at least one is failed or cancelled. Such a task can never run — fail it.
+# This handles the gap where a blocked task waits forever on a failed dependency.
+ORPHANED=$(_psql -F '' <<'SQL'
+WITH
+-- Aggregate all terminal IDs by status category
+terminal_done AS (
+  SELECT ARRAY_AGG(id) AS ids FROM agent_messages WHERE status = 'done'
+),
+terminal_bad AS (
+  SELECT ARRAY_AGG(id) AS ids FROM agent_messages WHERE status IN ('failed','cancelled')
+),
+-- Find blocked tasks where ALL deps are terminal AND at least one is bad (failed/cancelled)
+orphaned AS (
+  SELECT m.id,
+         m.blocked_by,
+         terminal_bad.ids AS bad_ids
+  FROM agent_messages m, terminal_done, terminal_bad
+  WHERE m.status = 'blocked'
+    AND m.blocked_by != '{}'
+    -- All deps must be terminal (done OR failed/cancelled)
+    AND m.blocked_by <@ (COALESCE(terminal_done.ids, ARRAY[]::bigint[]) ||
+                         COALESCE(terminal_bad.ids,  ARRAY[]::bigint[]))
+    -- At least one dep must be bad (failed/cancelled) — otherwise unblock sweep handles it
+    AND m.blocked_by && COALESCE(terminal_bad.ids, ARRAY[]::bigint[])
+),
+failed AS (
+  UPDATE agent_messages m
+     SET status        = 'failed',
+         done_at       = NOW(),
+         blocked_reason = 'dependency failed: ' ||
+                          (SELECT STRING_AGG(dep::text, ', ')
+                             FROM UNNEST(orphaned.blocked_by) dep
+                            WHERE dep = ANY(orphaned.bad_ids))
+    FROM orphaned
+   WHERE m.id = orphaned.id
+     AND m.status = 'blocked'
+  RETURNING m.id
+)
+SELECT COUNT(*) FROM failed;
+SQL
+)
+ORPHANED=${ORPHANED:-0}
+
+if [ "$ORPHANED" -gt 0 ]; then
+  echo "$(date -u +%FT%TZ) gcg-loop-driver orphan_failed=$ORPHANED" >&2
+fi
+
+exit 0

@@ -34,14 +34,15 @@ MAX_DIGEST=25
 MAX_RUNTIME_SEC=60
 START_TS=$(date +%s)
 
-# ── v5 self-healing loop (wedged-agent recovery) ───────────────────
-STUCK_INPROGRESS_MIN=15              # in_progress older than this w/o completing = wedged
+# ── a2a-watcher self-healing loop (busy-vs-wedged by SESSION progress) ──
+STUCK_MIN=12                         # msg open (delivered/acked/in_progress) this long w/o progress = suspect
+PROGRESS_MIN=5                       # agent session file touched within this = BUSY (working); else WEDGED
 MAX_INPROGRESS_RESET=3               # after this many resets, fail the message
 MAX_RESTART=5                        # cap agent process restarts per run (anti-storm)
 RESTART_COOLDOWN_SECS=$((30 * 60))   # never restart the same agent more than once / 30 min
 
 # ── Helpers ────────────────────────────────────────────────────────
-_log()  { echo "$(date -u +%FT%TZ) gcg-inbox-janitor v4 $*" >&2; }
+_log()  { echo "$(date -u +%FT%TZ) a2a-watcher v6 $*" >&2; }
 _dry()  { $DRY_RUN && _log "[DRY-RUN] $*"; }
 _fail() { echo "$*" >&2; exit 1; }
 
@@ -265,61 +266,72 @@ _record_restart() {  # called ONLY after an actual successful restart
   jq --arg k "$agent" --arg t "$now" '.[$k]=($t|tonumber)' "$RESTART_STATE" > "${RESTART_STATE}.tmp" 2>/dev/null && mv "${RESTART_STATE}.tmp" "$RESTART_STATE"
 }
 
-handle_wedged_inprogress() {
-  local rows
-  rows=$(db_f "
-    SELECT id, recipient, sender, COALESCE(deliver_count,0) AS dc
-    FROM agent_messages
-    WHERE status = 'in_progress'
-      AND started_at < NOW() - INTERVAL '${STUCK_INPROGRESS_MIN} minutes'
-    ORDER BY id
-    LIMIT 100;
-  " 2>/dev/null) || rows=""
+# Busy-vs-wedged signal = SESSION GROWTH (not CPU). A busy agent's newest session
+# file was touched within PROGRESS_MIN; a wedged one (hung turn / not claiming) is frozen.
+_agent_session_fresh() {  # rc0 = fresh (BUSY), rc1 = stale/none (WEDGED)
+  local agent="$1" sess
+  sess=$(ls -t /opt/gcg/openclaw-"${agent}"/state/agents/main/sessions/*.jsonl 2>/dev/null | grep -v '\.bak' | head -1)
+  [ -z "$sess" ] && return 1
+  [ -n "$(find "$sess" -newermt "-${PROGRESS_MIN} min" 2>/dev/null)" ] && return 0
+  return 1
+}
 
-  local count=0 reset_count=0 fail_count=0 restart_count=0
-  declare -A seen_agent
-  while IFS=$'\t' read -r id recipient sender dc; do
-    [ -z "$id" ] && continue
-    count=$((count + 1))
+handle_wedged_agents() {
+  local agents
+  agents=$(db_q "
+    SELECT DISTINCT recipient FROM agent_messages
+    WHERE status IN ('delivered','acked','in_progress')
+      AND issued_at < NOW() - INTERVAL '${STUCK_MIN} minutes'
+    ORDER BY recipient LIMIT 50;
+  " 2>/dev/null) || agents=""
+
+  local restart_count=0 busy=0 wedged=0 reset_count=0 fail_count=0
+  while IFS= read -r agent; do
+    [ -z "$agent" ] && continue
     _runtime_check
+    systemctl cat "openclaw-${agent}.service" >/dev/null 2>&1 || continue   # real agents only
 
-    # (a) Restart the wedged agent — once per run per agent, valid-agent only, capped, 30m cooldown
-    if [ -n "$recipient" ] && [ -z "${seen_agent[$recipient]:-}" ]; then
-      seen_agent[$recipient]=1
-      if systemctl cat "openclaw-${recipient}.service" >/dev/null 2>&1 && [ "$restart_count" -lt "$MAX_RESTART" ]; then
-        if _restart_allowed "$recipient"; then
-          restart_count=$((restart_count + 1))
-          _log "WEDGE_RESTART agent=$recipient (msg #$id stuck in_progress >${STUCK_INPROGRESS_MIN}m) — restarting openclaw-${recipient}.service"
-          if ! $DRY_RUN; then
-            if systemctl restart "openclaw-${recipient}.service" 2>/dev/null; then
-              _record_restart "$recipient"
-            else
-              _log "WARN: restart openclaw-${recipient}.service failed (check janitor sandbox perms)"
-            fi
-          fi
-        else
-          _log "WEDGE_RESTART_SUPPRESS agent=$recipient — restarted <${RESTART_COOLDOWN_SECS}s ago"
-        fi
-      fi
+    # BUSY: session progressing → it's working through its queue; leave it, just surface visibility
+    if _agent_session_fresh "$agent"; then
+      busy=$((busy + 1))
+      local qd; qd=$(db_q "SELECT count(*) FROM agent_messages WHERE recipient='${agent}' AND status IN ('delivered','acked','in_progress');" 2>/dev/null | head -1)
+      _log "BUSY agent=$agent — session active (<${PROGRESS_MIN}m); ${qd:-?} msg(s) queued, waiting (NO restart)"
+      continue
     fi
 
-    # (b) Reset the orphaned message (bounded retries) so the fresh process reclaims it
-    if [ "${dc:-0}" -ge "$MAX_INPROGRESS_RESET" ]; then
-      fail_count=$((fail_count + 1))
-      _log "WEDGE_FAIL id=$id recipient=$recipient — exceeded ${MAX_INPROGRESS_RESET} resets, marking failed"
+    # WEDGED: session frozen but has stuck work → restart (deduped/capped) + reset its stuck msgs
+    wedged=$((wedged + 1))
+    if [ "$restart_count" -lt "$MAX_RESTART" ] && _restart_allowed "$agent"; then
+      restart_count=$((restart_count + 1))
+      _log "WEDGE_RESTART agent=$agent — session frozen >${PROGRESS_MIN}m with stuck msgs; restarting openclaw-${agent}.service"
       if ! $DRY_RUN; then
-        db_q "UPDATE agent_messages SET status='failed', done_at=NOW(), blocked_reason='auto-failed: stuck in_progress >${STUCK_INPROGRESS_MIN}m, exceeded ${MAX_INPROGRESS_RESET} resets (janitor v5)' WHERE id=$id AND status='in_progress';"
+        if systemctl restart "openclaw-${agent}.service" 2>/dev/null; then _record_restart "$agent"
+        else _log "WARN: restart openclaw-${agent}.service failed"; fi
       fi
     else
-      reset_count=$((reset_count + 1))
-      _log "WEDGE_RESET id=$id recipient=$recipient deliver_count=${dc:-0} — reset to pending for reprocessing"
-      if ! $DRY_RUN; then
-        db_q "UPDATE agent_messages SET status='pending', started_at=NULL, acked_at=NULL, deliver_count=COALESCE(deliver_count,0)+1 WHERE id=$id AND status='in_progress';"
-      fi
+      _log "WEDGE_RESTART_SUPPRESS agent=$agent — cooldown(<${RESTART_COOLDOWN_SECS}s) or cap(${MAX_RESTART})"
     fi
-  done <<< "$rows"
 
-  _log "wedged_inprogress_total=$count reset=$reset_count failed=$fail_count restarts=$restart_count"
+    local rows
+    rows=$(db_f "SELECT id, COALESCE(deliver_count,0) FROM agent_messages
+                 WHERE recipient='${agent}' AND status IN ('delivered','acked','in_progress')
+                   AND issued_at < NOW() - INTERVAL '${STUCK_MIN} minutes'
+                 ORDER BY id LIMIT 100;" 2>/dev/null) || rows=""
+    while IFS=$'\t' read -r id dc; do
+      [ -z "$id" ] && continue
+      if [ "${dc:-0}" -ge "$MAX_INPROGRESS_RESET" ]; then
+        fail_count=$((fail_count + 1))
+        _log "WEDGE_FAIL id=$id agent=$agent — exceeded ${MAX_INPROGRESS_RESET} resets, failing"
+        $DRY_RUN || db_q "UPDATE agent_messages SET status='failed', done_at=NOW(), blocked_reason='auto-failed: agent wedged, exceeded ${MAX_INPROGRESS_RESET} resets (a2a-watcher)' WHERE id=$id AND status IN ('delivered','acked','in_progress');"
+      else
+        reset_count=$((reset_count + 1))
+        _log "WEDGE_RESET id=$id agent=$agent dc=${dc:-0} — reset to pending for reprocessing"
+        $DRY_RUN || db_q "UPDATE agent_messages SET status='pending', started_at=NULL, acked_at=NULL, deliver_count=COALESCE(deliver_count,0)+1 WHERE id=$id AND status IN ('delivered','acked','in_progress');"
+      fi
+    done <<< "$rows"
+  done <<< "$agents"
+
+  _log "wedged_agents busy=$busy wedged=$wedged restarts=$restart_count reset=$reset_count failed=$fail_count"
 }
 
 # ── 4. Auto-resolve: blocked items whose blocker cleared → unblock ─
@@ -456,7 +468,7 @@ _runtime_check
 handle_acked_stale
 _runtime_check
 
-handle_wedged_inprogress
+handle_wedged_agents
 _runtime_check
 
 handle_blocked_auto_resolve

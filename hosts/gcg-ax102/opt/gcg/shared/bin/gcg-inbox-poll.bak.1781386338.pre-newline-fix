@@ -482,11 +482,11 @@ SELECT am.id,
        COALESCE(am.accountable_owner, 'NONE') AS accountable_owner,
        am.qa_tier,
        am.plan_authorized,
-       replace(COALESCE(am.payload->>'text','(no text)'), E'\n', ' ') AS task_text,
-       replace(COALESCE(NULLIF(COALESCE(am.payload->>'acceptance',''), ''), '(none)'), E'\n', ' ') AS acceptance,
+       COALESCE(am.payload->>'text','(no text)') AS task_text,
+       COALESCE(NULLIF(COALESCE(am.payload->>'acceptance',''), ''), '(none)') AS acceptance,
        COALESCE(NULLIF(am.correlation_id::text, ''), gen_random_uuid()::text) AS corr_id,
-       replace(COALESCE(am.artifacts::text, '{}'), E'\n', ' ') AS artifacts_json,
-       replace(COALESCE(NULLIF(COALESCE(am.input_prompt, ''), ''), '(none)'), E'\n', ' ') AS input_prompt
+       COALESCE(am.artifacts::text, '{}') AS artifacts_json,
+       COALESCE(NULLIF(COALESCE(am.input_prompt, ''), ''), '(none)') AS input_prompt
   FROM agent_messages am
  WHERE am.status           = 'input-required'
    AND am.qa_tier          IN ('standard','high_stakes')

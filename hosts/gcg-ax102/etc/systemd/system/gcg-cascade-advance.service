@@ -1,0 +1,21 @@
+[Unit]
+Description=GCG Cascade Advance — systemd timer driver for task_cascade.py
+Documentation=https://github.com/Gcg-tech/cascade/docs/cascade-advance.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/scripts/cascade-advance.sh
+# ExecStopPost: cleanup stale locks on abnormal exit
+ExecStopPost=/bin/sh -c 'rm -rf /run/gcg-cascade-advance/locks 2>/dev/null || true'
+SuccessExitStatus=0
+Nice=10
+MemoryMax=128M
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+RuntimeDirectory=gcg-cascade-advance
+RuntimeDirectoryMode=0755
+StateDirectory=gcg-cascade-advance
+ReadWritePaths=/var/lib/gcg-cascade-advance /opt/gcg /run/gcg-cascade-advance

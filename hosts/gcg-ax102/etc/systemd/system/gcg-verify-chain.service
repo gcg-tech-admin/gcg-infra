@@ -1,0 +1,10 @@
+[Unit]
+Description=GCG Audit Log Chain Verifier
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/verify-chain
+User=root
+StandardOutput=journal
+StandardError=journal

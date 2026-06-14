@@ -1,0 +1,12 @@
+[Unit]
+Description=Run GCG Cascade Advance every 5 minutes
+Documentation=https://github.com/Gcg-tech/cascade/docs/cascade-advance.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=gcg-cascade-advance.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

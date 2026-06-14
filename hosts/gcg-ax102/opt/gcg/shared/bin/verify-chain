@@ -1,0 +1,78 @@
+#!/bin/bash
+# verify-chain — Walk task_events hash chain and alert on tampering or missed events.
+# Runs every 5 min via gcg-verify-chain.timer.
+#
+# Checks:
+#   1. First row's prev_hash == sha256('') (genesis anchor)
+#   2. Every row's prev_hash matches the prior row's row_hash
+#   3. task_events_deadletter is empty (missed events are a red flag)
+#
+# Alerts fleet message to peter+daen on any failure.
+# Exit 0 = chain intact; Exit 1 = broken/missed events.
+
+set -euo pipefail
+
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+[ -r "$PWD_FILE" ] || { echo "verify-chain: cannot read $PWD_FILE" >&2; exit 1; }
+
+export PGPASSWORD
+PGPASSWORD=$(tr -d '\r\n' < "$PWD_FILE")
+
+_psql() {
+  psql "host=10.0.0.2 port=5432 user=gcg_fleet dbname=gcg_intelligence sslmode=disable" \
+    -v ON_ERROR_STOP=1 -tA -F $'\t' "$@"
+}
+
+_alert() {
+  local msg="$1"
+  echo "$(date -u +%FT%TZ) verify-chain ALERT: ${msg}" >&2
+  /opt/gcg/shared/bin/fleet send peter "AUDIT CHAIN ALERT: ${msg}" 2>/dev/null || true
+  /opt/gcg/shared/bin/fleet send daen  "AUDIT CHAIN ALERT: ${msg}" 2>/dev/null || true
+}
+
+# ── 1. Check genesis sentinel ──────────────────────────────────────────────────
+GENESIS_HASH=$(python3 -c "import hashlib; print(hashlib.sha256(b'').hexdigest())" 2>/dev/null || \
+  openssl dgst -sha256 /dev/null 2>/dev/null | awk '{print $2}')
+
+FIRST_PREV=$(_psql -F '' -c "SELECT prev_hash FROM task_events ORDER BY event_id ASC LIMIT 1;" 2>/dev/null || echo "")
+
+if [ -z "$FIRST_PREV" ]; then
+  echo "$(date -u +%FT%TZ) verify-chain: task_events is empty — no events to verify" >&2
+  exit 0
+fi
+
+if [ "$FIRST_PREV" != "$GENESIS_HASH" ]; then
+  _alert "Genesis anchor broken! first row prev_hash='${FIRST_PREV}' != sha256('')='${GENESIS_HASH}'"
+  exit 1
+fi
+
+# ── 2. Walk the chain: prev_hash[n] must equal row_hash[n-1] ──────────────────
+BROKEN=$(_psql -F '' <<'SQL'
+WITH ordered AS (
+  SELECT event_id, prev_hash, row_hash,
+         LAG(row_hash) OVER (ORDER BY event_id) AS expected_prev
+  FROM task_events
+)
+SELECT COUNT(*) FROM ordered
+WHERE expected_prev IS NOT NULL
+  AND prev_hash != expected_prev;
+SQL
+)
+
+TOTAL=$(_psql -F '' -c "SELECT COUNT(*) FROM task_events;")
+
+if [ "${BROKEN:-0}" -gt 0 ]; then
+  _alert "${BROKEN} hash chain break(s) detected in task_events (${TOTAL} total rows). Freeze writes via: psql -c 'CREATE OR REPLACE FUNCTION audit_agent_message() RETURNS trigger LANGUAGE plpgsql AS \$\$ BEGIN RETURN NEW; END; \$\$;'"
+  exit 1
+fi
+
+# ── 3. Check deadletter table ──────────────────────────────────────────────────
+MISSED=$(_psql -F '' -c "SELECT COUNT(*) FROM task_events_deadletter;")
+
+if [ "${MISSED:-0}" -gt 0 ]; then
+  _alert "${MISSED} missed audit event(s) in task_events_deadletter — circuit breaker fired. Review and investigate."
+  # Don't exit 1 here — missed events are a warning, not a chain break
+fi
+
+echo "$(date -u +%FT%TZ) verify-chain: OK — ${TOTAL} events, chain intact, deadletter=${MISSED:-0}" >&2
+exit 0

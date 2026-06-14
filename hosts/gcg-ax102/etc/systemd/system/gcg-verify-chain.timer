@@ -1,0 +1,11 @@
+[Unit]
+Description=GCG Audit Log Chain Verifier — runs every 5 minutes
+Requires=gcg-verify-chain.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=gcg-verify-chain.service
+
+[Install]
+WantedBy=timers.target

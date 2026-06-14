@@ -1,0 +1,21 @@
+[Unit]
+Description=GCG Coder Bridge — Cascade executor for the coder Claude Code session
+Documentation=file:///opt/gcg/shared/fleet-workspace/CODER-BRIDGE-RESULT.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/gcg/shared/bin/gcg-coder-bridge
+Restart=always
+RestartSec=5
+# State persists in /var/lib/gcg-coder-bridge (survives service restart)
+StateDirectory=gcg-coder-bridge
+StateDirectoryMode=0750
+# Log to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-coder-bridge
+
+[Install]
+WantedBy=multi-user.target
