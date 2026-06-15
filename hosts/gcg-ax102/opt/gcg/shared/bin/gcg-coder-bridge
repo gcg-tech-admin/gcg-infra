@@ -1,8 +1,10 @@
 #!/bin/bash
-# gcg-coder-bridge — Cascade executor bridge for the coder Claude Code tmux session
-# BRIDGE_VERSION=1 (2026-06-13)
+# gcg-coder-bridge — Cascade executor bridge for Claude Code tmux sessions
+# BRIDGE_VERSION=2 (2026-06-14: templated multi-instance; instance name as $1 or $BRIDGE_INSTANCE)
 #
-# Feeds pending 'coder' tasks from the fleet bus to the gcg-bridge-claude-sonnet-4-6 tmux session.
+# Usage: gcg-coder-bridge <instance>
+#   instance: matches /etc/gcg/coder-bridge/<instance>.conf
+#   Config vars: AGENT_NAME, TMUX_SESSION, PROFILE_HOME, AGENT_ALSO_SERVES
 #
 # Handoff guarantees (Peter's robustness requirements):
 #   1. Confirm-submit     — verify Enter landed; retry up to 3x; alert daen on failure
@@ -12,22 +14,59 @@
 #   5. Auth completion    — bridge NEVER marks done; session calls fleet done/fail
 #   6. Wedge recovery     — if in_progress > WEDGE_TIMEOUT_MIN, alert daen
 #   7. Crash-safe state   — state file survives restart; never re-feeds same id
+#   8. OAuth-only assert  — aborts if ANTHROPIC_API_KEY is set in environment
 
 set -euo pipefail
 
-BRIDGE_VERSION=1
-TMUX_SESSION="gcg-bridge-claude-sonnet-4-6"
+BRIDGE_VERSION=2
 FLEET="/opt/gcg/shared/bin/fleet"
-STATE_DIR="/var/lib/gcg-coder-bridge"
-STATE_FILE="$STATE_DIR/state"
-LOCK_FILE="/run/lock/gcg-coder-bridge.lock"
 TICK_INTERVAL=10          # seconds between loop iterations
 WEDGE_TIMEOUT_MIN=20      # minutes before alerting on a stuck in_progress task
 CONFIRM_RETRIES=3         # max Enter retries if submission not confirmed
-CONFIRM_POLL_SECS=2       # seconds to wait after each Enter for "esc to interrupt"
+CONFIRM_POLL_SECS=12      # ~6s window per Enter (loop = 0.5s/iter); Claude Code can take 2-4s to go busy
 PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
 
-_log() { echo "$(date -u +%FT%TZ) gcg-coder-bridge[v${BRIDGE_VERSION}]: $*" >&2; }
+# ── Instance config ────────────────────────────────────────────────────────────
+INSTANCE="${1:-${BRIDGE_INSTANCE:-}}"
+if [[ -z "$INSTANCE" ]]; then
+  echo "gcg-coder-bridge: usage: gcg-coder-bridge <instance>" >&2
+  exit 2
+fi
+
+CONF_FILE="/etc/gcg/coder-bridge/${INSTANCE}.conf"
+if [[ ! -f "$CONF_FILE" ]]; then
+  echo "gcg-coder-bridge: config not found: $CONF_FILE" >&2
+  exit 2
+fi
+
+# Defaults (overridden by conf)
+AGENT_NAME=""
+TMUX_SESSION=""
+PROFILE_HOME=""
+AGENT_ALSO_SERVES=""
+
+# shellcheck source=/dev/null
+source "$CONF_FILE"
+
+if [[ -z "$AGENT_NAME" || -z "$TMUX_SESSION" || -z "$PROFILE_HOME" ]]; then
+  echo "gcg-coder-bridge: $CONF_FILE missing required vars (AGENT_NAME, TMUX_SESSION, PROFILE_HOME)" >&2
+  exit 2
+fi
+
+# ── OAuth-only assertion ────────────────────────────────────────────────────────
+# Bridges must never use an API key — OAuth sub accounts only.
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  echo "gcg-coder-bridge[$INSTANCE]: ABORT — ANTHROPIC_API_KEY is set in environment." \
+       "Bridges must use OAuth only (no API keys)." >&2
+  exit 3
+fi
+
+# Instance-scoped runtime paths
+STATE_DIR="/var/lib/gcg-coder-bridge-${INSTANCE}"
+STATE_FILE="$STATE_DIR/state"
+LOCK_FILE="/run/lock/gcg-coder-bridge-${INSTANCE}.lock"
+
+_log() { echo "$(date -u +%FT%TZ) gcg-coder-bridge[${INSTANCE}/v${BRIDGE_VERSION}]: $*" >&2; }
 
 _psql() {
   local pwd; pwd=$(tr -d '\r\n' < "$PWD_FILE")
@@ -59,15 +98,22 @@ _pane_content() {
   tmux capture-pane -t "$TMUX_SESSION" -p 2>/dev/null || true
 }
 
+_pane_footer() {
+  # ONLY the footer (last non-empty line). Greping the whole pane catches
+  # scrollback text (incl. our own docs that mention "esc to interrupt"),
+  # which falsely reads as busy forever. The status footer is the last line.
+  _pane_content | grep -v '^[[:space:]]*$' | tail -1
+}
+
 _pane_is_idle() {
-  # Idle: footer contains "← for agents" and NOT "esc to interrupt"
-  local content; content=$(_pane_content)
-  echo "$content" | grep -q "← for agents" && \
-  ! echo "$content" | grep -q "esc to interrupt"
+  # Idle: footer shows "for agents" and NOT "esc to interrupt" / "paste again to expand"
+  local f; f=$(_pane_footer)
+  echo "$f" | grep -q "for agents" && ! echo "$f" | grep -qE "esc to interrupt|to interrupt|paste again to expand"
 }
 
 _pane_is_busy() {
-  _pane_content | grep -q "esc to interrupt"
+  local f; f=$(_pane_footer)
+  echo "$f" | grep -qE "esc to interrupt|to interrupt|paste again to expand"
 }
 
 # ── Task pull ──────────────────────────────────────────────────────────────────
@@ -76,11 +122,18 @@ TASK_ID=""; TASK_TEXT=""
 _pull_next_task() {
   TASK_ID=""; TASK_TEXT=""
   local sep=$'\x1f'
+
+  # Build recipient list: AGENT_NAME + any AGENT_ALSO_SERVES entries
+  local names="'${AGENT_NAME}'"
+  for extra in $AGENT_ALSO_SERVES; do
+    names="${names},'${extra}'"
+  done
+
   local row
   row=$(_psql -c "
 SELECT am.id || '${sep}' || COALESCE(am.payload->>'text','(no text)')
   FROM agent_messages am
- WHERE am.recipient = 'coder'
+ WHERE am.recipient IN (${names})
    AND am.status IN ('pending','delivered')
    AND (
      am.blocked_by IS NULL
@@ -107,6 +160,10 @@ _feed_task() {
   local msg
   msg="CASCADE TASK #${task_id}: ${task_text}. Do the work. Write a result file (no secrets). When finished run:
   fleet done ${task_id}   (or on failure: fleet fail ${task_id} \"<reason>\"). Do not pick up any other brief."
+
+  # Plant task ID for capture_usage.sh Stop hook (token+latency logger #153893)
+  mkdir -p "${PROFILE_HOME}/.cache" 2>/dev/null || true
+  printf '%s' "$task_id" > "${PROFILE_HOME}/.cache/fleet_current_task" 2>/dev/null || true
 
   # 2. Clear-before-feed: C-u clears any leftover text in the input buffer
   tmux send-keys -t "$TMUX_SESSION" "C-u" 2>/dev/null || true
@@ -177,6 +234,8 @@ _tick() {
       done|failed|cancelled)
         _log "task #${IN_FLIGHT_ID} reached terminal status=$st — clearing in-flight"
         _state_write "" "$IN_FLIGHT_ID" ""
+        # Clear task ID so capture_usage.sh stops crediting this task
+        rm -f "${PROFILE_HOME}/.cache/fleet_current_task" 2>/dev/null || true
         IN_FLIGHT_ID=""
         ;;
       in_progress)
@@ -203,10 +262,10 @@ _tick() {
     return 0
   fi
 
-  # Pull the next pending task for coder
+  # Pull the next pending task
   _pull_next_task
   if [[ -z "$TASK_ID" ]]; then
-    _log "no pending tasks for coder — idle"
+    _log "no pending tasks for ${AGENT_NAME}${AGENT_ALSO_SERVES:+ or $AGENT_ALSO_SERVES} — idle"
     return 0
   fi
 
@@ -235,7 +294,7 @@ _tick() {
 
   # 2+1. Clear-before-feed + feed + confirm-submit
   if _feed_task "$TASK_ID" "$TASK_TEXT"; then
-    _log "task #${TASK_ID} successfully handed off to coder session"
+    _log "task #${TASK_ID} successfully handed off to ${TMUX_SESSION}"
   else
     _log "ERROR: feed failed for task #${TASK_ID}; daen alerted; task remains in_progress for wedge recovery"
   fi
@@ -244,34 +303,40 @@ _tick() {
 # ── Startup recovery ──────────────────────────────────────────────────────────
 # Handles: crash between fleet-start and state-write (task is in_progress but state lost).
 # On every startup, if state file has no IN_FLIGHT_ID, scan DB for orphaned in_progress
-# coder tasks and adopt the most recent one into state so wedge detection fires.
+# tasks and adopt the most recent one into state so wedge detection fires.
 _startup_recovery() {
   _state_read
   [[ -n "$IN_FLIGHT_ID" ]] && return 0   # state intact — nothing to recover
 
+  # Build recipient list for orphan scan
+  local names="'${AGENT_NAME}'"
+  for extra in $AGENT_ALSO_SERVES; do
+    names="${names},'${extra}'"
+  done
+
   local orphan
   orphan=$(_psql -c "
 SELECT id FROM agent_messages
- WHERE recipient = 'coder'
+ WHERE recipient IN (${names})
    AND status = 'in_progress'
  ORDER BY started_at DESC NULLS LAST
  LIMIT 1;" 2>/dev/null) || return 0
 
   [[ -z "$orphan" ]] && return 0
 
-  _log "RECOVERY: found orphaned in_progress task #${orphan} (bridge probably crashed after fleet-start) — adopting into state"
+  _log "RECOVERY: found orphaned in_progress task #${orphan} — adopting into state"
   _state_write "$orphan" "$orphan" "$(date +%s)"
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 main() {
-  _log "starting (session=$TMUX_SESSION, tick=${TICK_INTERVAL}s, wedge=${WEDGE_TIMEOUT_MIN}min)"
+  _log "starting (instance=$INSTANCE, agent=$AGENT_NAME, session=$TMUX_SESSION, profile=$PROFILE_HOME, tick=${TICK_INTERVAL}s)"
   mkdir -p "$STATE_DIR"
 
-  # Singleton: hold exclusive lock for the daemon's lifetime
+  # Singleton per instance: hold exclusive lock for the daemon's lifetime
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
-    _log "ERROR: another instance is running (lock held) — exiting"
+    _log "ERROR: another instance of $INSTANCE is running (lock held) — exiting"
     exit 1
   fi
 

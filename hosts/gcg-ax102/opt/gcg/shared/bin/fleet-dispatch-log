@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+fleet-dispatch-log — Thin a2a wrapper: tokens + wall-clock per dispatch → CSV.
+
+Phase 0.0 of the Fleet Determinism Program.
+Wraps `fleet send`, polls for completion, captures target agent token delta
+via openclaw session-store snapshot diffing, and appends to CSV.
+
+Token capture: uses `openclaw sessions list --store <agent_path> --json` to snapshot
+the agent's session store before dispatch and after completion, computing token delta
+across all sessions. Waits up to 30s post-completion for the session file to flush.
+
+Usage:
+  fleet-dispatch-log [--task-type TYPE] [--timeout SEC] <agent> <message>
+"""
+import argparse, csv, json, os, subprocess, sys, time
+from datetime import datetime, timezone
+from pathlib import Path
+
+CSV_PATH = "/opt/gcg/shared/logs/fleet-token-log.csv"
+FLEET_BIN = "/opt/gcg/shared/bin/fleet"
+FLEET_DB = {
+    "host": "10.0.0.2", "port": "5432", "user": "gcg_fleet",
+    "dbname": "gcg_intelligence", "sslmode": "require"
+}
+OPENCLAW_BIN = "openclaw"
+
+def _fleet_pwd():
+    p = Path("/opt/gcg/shared/credentials/db/gcg_fleet.pwd")
+    return p.read_text().strip() if p.exists() else ""
+
+def _db_query(sql, timeout=10):
+    pwd = _fleet_pwd()
+    r = subprocess.run(
+        ["psql", "-h", FLEET_DB["host"], "-p", FLEET_DB["port"],
+         "-U", FLEET_DB["user"], "-d", FLEET_DB["dbname"],
+         "--no-align", "--tuples-only", "-c", sql],
+        env={**os.environ, "PGPASSWORD": pwd, "PGSSLMODE": "require"},
+        capture_output=True, text=True, timeout=timeout,
+    )
+    return r.stdout.strip()
+
+def _session_store_path(agent):
+    return f"/opt/gcg/openclaw-{agent}/state/agents/main/sessions/sessions.json"
+
+def _snapshot(agent):
+    """Return {session_key: {total, input, output, model}} via openclaw CLI."""
+    store = _session_store_path(agent)
+    if not os.path.exists(store):
+        return {}
+    r = subprocess.run(
+        [OPENCLAW_BIN, "sessions", "list", "--store", store, "--json", "--limit", "all"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode != 0:
+        return {}
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}
+    snap = {}
+    for s in data.get("sessions", []):
+        key = s.get("key", "")
+        total = s.get("totalTokens", 0) or 0
+        if key and total > 0:
+            snap[key] = {
+                "total": total,
+                "input": s.get("inputTokens", 0),
+                "output": s.get("outputTokens", 0),
+                "model": s.get("model", "?"),
+            }
+    return snap
+
+def _snapshot_total(snap):
+    return sum(v["total"] for v in snap.values())
+
+def _fleet_send(agent, message, task_type="message", priority=5):
+    cmd = [FLEET_BIN, "send", "--type", task_type, "--priority", str(priority), agent, message]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    for line in r.stdout.strip().split("\n"):
+        parts = line.split("|")
+        if len(parts) >= 2 and parts[0].strip().isdigit():
+            return int(parts[0].strip())
+    return None
+
+TERMINAL = ("done", "failed", "cancelled", "blocked", "input-required")
+
+def _wait_done(msg_id, timeout_s=600):
+    """Poll until terminal status. Returns (status, started_at, done_at)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        row = _db_query(
+            f"SELECT status, started_at, done_at FROM agent_messages WHERE id={msg_id}"
+        )
+        if not row:
+            time.sleep(2); continue
+        parts = [x.strip() for x in row.split("|")]
+        status = parts[0]
+        if status in TERMINAL:
+            return status, parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else ""
+        time.sleep(2)
+    return "timeout", "", ""
+
+def main():
+    parser = argparse.ArgumentParser(description="fleet-dispatch-log — a2a token logger")
+    parser.add_argument("agent", help="target agent name")
+    parser.add_argument("message", help="message / task description")
+    parser.add_argument("--task-type", default="message", help="task type for CSV")
+    parser.add_argument("--priority", type=int, default=5)
+    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    if args.dry_run:
+        snap = _snapshot(args.agent)
+        print(f"[dry-run] agent={args.agent} task_type={args.task_type}")
+        print(f"  sessions: {len(snap)}, total_tokens: {_snapshot_total(snap)}")
+        return
+
+    # 1. Pre-snapshot
+    pre_snap = _snapshot(args.agent)
+    pre_total = _snapshot_total(pre_snap)
+    print(f"  pre_snapshot: {len(pre_snap)} sessions, {pre_total} totalTokens")
+
+    # 2. Dispatch
+    msg_id = _fleet_send(args.agent, args.message, args.task_type, args.priority)
+    if msg_id is None:
+        print("ERROR: fleet send failed", file=sys.stderr)
+        sys.exit(1)
+    t0 = time.time()
+    print(f"  dispatched msg_id={msg_id}")
+
+    # 3. Wait for completion
+    status, started_at, done_at = _wait_done(msg_id, args.timeout)
+    t1 = time.time()
+    print(f"  status={status} wall={t1-t0:.1f}s")
+
+    # 4. Post-snapshot — wait for session file to flush (up to 30s)
+    post_snap = {}
+    for attempt in range(15):
+        time.sleep(2)
+        post_snap = _snapshot(args.agent)
+        post_total = _snapshot_total(post_snap)
+        # Check if total changed from pre (new session data flushed)
+        if post_total != pre_total or len(post_snap) != len(pre_snap):
+            break
+
+    post_total = _snapshot_total(post_snap)
+    print(f"  post_snapshot: {len(post_snap)} sessions, {post_total} totalTokens (waited {(attempt+1)*2}s)")
+
+    # 5. Compute token delta — sum increases across all sessions
+    token_delta = 0
+    all_keys = set(list(pre_snap.keys()) + list(post_snap.keys()))
+    new_sessions = []
+    for key in all_keys:
+        pre_t = pre_snap.get(key, {}).get("total", 0)
+        post_t = post_snap.get(key, {}).get("total", 0)
+        if post_t > pre_t:
+            token_delta += post_t - pre_t
+        if key not in pre_snap and key in post_snap:
+            new_sessions.append((key, post_t))
+
+    wall_s = round(t1 - t0, 2)
+
+    # Determine model from new/changed sessions
+    model = "?"
+    for key in new_sessions:
+        m = post_snap.get(key, {}).get("model", "?")
+        if m and m != "?":
+            model = m; break
+    if model == "?":
+        for v in post_snap.values():
+            if v.get("model", "?") != "?":
+                model = v["model"]; break
+
+    row = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "msg_id": msg_id,
+        "agent": args.agent,
+        "task_type": args.task_type,
+        "status": status,
+        "wall_clock_s": wall_s,
+        "token_delta": token_delta,
+        "pre_total_tokens": pre_total,
+        "post_total_tokens": post_total,
+        "new_sessions": len(new_sessions),
+        "model": model,
+        "db_started_at": started_at,
+        "db_done_at": done_at,
+    }
+
+    # Write CSV — use fixed field order
+    FIELDS = ["timestamp", "msg_id", "agent", "task_type", "status",
+              "wall_clock_s", "token_delta", "pre_total_tokens", "post_total_tokens",
+              "model", "db_started_at", "db_done_at"]
+    file_exists = os.path.exists(CSV_PATH)
+    with open(CSV_PATH, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
+        if not file_exists:
+            w.writeheader()
+        w.writerow(row)
+
+    print(f"  LOGGED: msg_id={msg_id} agent={args.agent} status={status} "
+          f"wall={wall_s}s token_delta={token_delta} new_sessions={len(new_sessions)}")
+
+if __name__ == "__main__":
+    main()

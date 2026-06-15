@@ -1,0 +1,149 @@
+#!/bin/bash
+# claude-sub-bridge v1 — Stdin-to-tmux-to-stdout OpenClaw cliBackend bridge
+# Routes OpenClaw turns through persistent interactive claude (bridge-isolated tmux session)
+# OAuth sub-peter — subscription billing, NOT claude -p credit pool.
+#
+# Interface expected by openclaw cliBackend with input:"stdin" output:"text":
+#   prompt -> stdin | ./claude-sub-bridge | assistant reply -> stdout
+#
+# Proven techniques reused from claude-tmux-bridge v46 (paste-buffer + scrollback diff)
+# Council gotchas heeded: diff extraction, 3x stable prompt, spinner detection, flock serialization.
+
+set -euo pipefail
+
+SESS="bridge-isolated"
+TIMEOUT=180
+LOG_FILE="/var/log/gcg/claude-sub-bridge.log"
+LOCK_FILE="/run/lock/claude-sub-bridge-${SESS}.lock"
+
+_ts() { date -u +%FT%TZ; }
+_log() { echo "$(_ts) claude-sub-bridge: $*" >> "$LOG_FILE" 2>/dev/null || true; }
+
+# OAuth-only assertion
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    _log "ABORT -- ANTHROPIC_API_KEY set in environment; bridge requires OAuth only"
+    echo "ERROR: Bridge requires OAuth (no API key)" >&2
+    exit 3
+fi
+
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+
+# Read prompt from stdin
+PROMPT=$(cat)
+
+if [[ -z "${PROMPT// }" ]]; then
+    _log "WARN: empty prompt received"
+    exit 0
+fi
+
+_log "turn start: chars=${#PROMPT}"
+
+# Serialize per session (only one send at a time to this tmux pane)
+exec 9>"$LOCK_FILE"
+if ! flock -w 120 9; then
+    _log "ERROR: could not acquire lock within 120s"
+    echo "ERROR: bridge lock timeout" >&2
+    exit 1
+fi
+
+# Verify session exists
+if ! tmux has-session -t "$SESS" 2>/dev/null; then
+    _log "ERROR: session $SESS missing -- start it first"
+    echo "ERROR: tmux session not found" >&2
+    exit 1
+fi
+
+# Wait for session to be idle (prompt visible, no spinner)
+wait_idle() {
+    local max_wait="${1:-30}" waited=0
+    while [[ $waited -lt $max_wait ]]; do
+        local p
+        p=$(tmux capture-pane -t "$SESS" -p -S -8 2>/dev/null || true)
+        if echo "$p" | grep -qE ">|❯" && \
+           ! echo "$p" | grep -qiE "Cogitat|Cooked|Crunched|Churned|Brewed|Baked|Worked|Thinking|Sauteed"; then
+            return 0
+        fi
+        sleep 2; waited=$((waited + 2))
+    done
+    return 1
+}
+
+if ! wait_idle 30; then
+    _log "ERROR: session not idle after 30s wait"
+    echo "ERROR: session busy" >&2
+    exit 1
+fi
+
+# Snapshot scrollback before sending
+BEFORE_FILE=$(mktemp /tmp/csb-before.XXXXXX)
+AFTER_FILE=$(mktemp /tmp/csb-after.XXXXXX)
+trap 'rm -f "$BEFORE_FILE" "$AFTER_FILE"' EXIT
+
+tmux capture-pane -t "$SESS" -p -S -10000 > "$BEFORE_FILE" 2>/dev/null || true
+
+T_START=$(date +%s)
+
+# Send prompt via paste-buffer (binary-safe: handles quotes, newlines, special chars)
+# C-u first to clear any partial input
+tmux send-keys -t "$SESS" "C-u" 2>/dev/null || true
+sleep 0.2
+printf '%s' "$PROMPT" | tmux load-buffer - 2>/dev/null
+tmux paste-buffer -p -t "$SESS" 2>/dev/null
+sleep 0.3
+tmux send-keys -t "$SESS" Enter 2>/dev/null
+
+# Wait for completion: prompt (>) stable 3x consecutive checks, no spinner active
+elapsed=0
+STABLE=0
+while [[ $elapsed -lt $TIMEOUT ]]; do
+    sleep 2
+    elapsed=$((elapsed + 2))
+    P=$(tmux capture-pane -t "$SESS" -p -S -5 2>/dev/null || true)
+    # Spinner = still processing
+    if echo "$P" | grep -qiE "Cogitat|Cooked|Crunched|Churned|Brewed|Baked|Worked|Thinking|Sauteed"; then
+        STABLE=0
+        continue
+    fi
+    # Prompt visible = idle
+    if echo "$P" | grep -qE ">|❯"; then
+        STABLE=$((STABLE + 1))
+        [[ $STABLE -ge 3 ]] && break
+    else
+        STABLE=0
+    fi
+done
+
+T_END=$(date +%s)
+ELAPSED=$((T_END - T_START))
+[[ $elapsed -ge $TIMEOUT ]] && _log "WARN: response timed out after ${TIMEOUT}s"
+
+# Snapshot scrollback after
+tmux capture-pane -t "$SESS" -p -S -10000 > "$AFTER_FILE" 2>/dev/null || true
+
+# Extract: lines that appeared in AFTER but not BEFORE, strip UI chrome
+RESULT=$(diff "$BEFORE_FILE" "$AFTER_FILE" 2>/dev/null \
+    | grep "^>" \
+    | sed 's/^> //' \
+    | sed 's/\x1b\[[0-9;]*[mGKHF]//g' \
+    | grep -v -E "^[[:space:]]*$" \
+    | grep -v -E "bypass permission|for agents|Tips for|What.s new|Added|Fixed|Meet Fable|Included in|Welcome back|Run /init|How is Claude|esc to interrupt|shift.tab" \
+    | grep -v -E "^[-]+$|^[=]+$" \
+    | sed 's/^[[:space:]]*[*][[:space:]]*//' \
+    | sed 's/^[[:space:]]*//' \
+    | grep -v "^[[:space:]]*$" \
+    | head -200 \
+    || true)
+
+# Fallback: grab last non-chrome lines from pane if diff was empty
+if [[ -z "${RESULT// }" ]]; then
+    _log "WARN: empty diff extraction; using pane tail fallback"
+    RESULT=$(tmux capture-pane -t "$SESS" -p -S -100 2>/dev/null \
+        | grep -v -E "bypass|for agents|Tips|What.s new|Run /init|How is Claude|^[[:space:]]*$" \
+        | sed 's/\x1b\[[0-9;]*[mGKHF]//g' \
+        | grep -v "^[[:space:]]*$" \
+        | tail -20 \
+        || true)
+fi
+
+_log "turn done: elapsed=${ELAPSED}s outChars=${#RESULT}"
+printf '%s\n' "$RESULT"

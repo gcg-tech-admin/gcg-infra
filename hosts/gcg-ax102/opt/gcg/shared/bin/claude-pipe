@@ -1,0 +1,10 @@
+#!/bin/bash
+# claude-pipe — stdin → claude (interactive, no -p) → stdout
+# Goal: hit subscription billing, not credit pool
+
+PROMPT=$(cat)
+if [ -z "$PROMPT" ]; then
+  exit 0
+fi
+
+echo "$PROMPT" | claude 2>/dev/null

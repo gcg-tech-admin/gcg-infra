@@ -1,0 +1,23 @@
+[Unit]
+Description=GCG Coder Bridge — Cascade executor for %i Claude Code session
+Documentation=file:///opt/gcg/shared/fleet-workspace/TWO-CODERS-RESULT.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/gcg/shared/bin/gcg-coder-bridge %i
+Restart=always
+RestartSec=5
+# Instance-scoped state directory under /var/lib/gcg-coder-bridge-<instance>/
+StateDirectory=gcg-coder-bridge-%i
+StateDirectoryMode=0750
+# Log to journald with instance-scoped identifier
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-coder-bridge-%i
+# Pass instance name via env as fallback (script also reads $1 from ExecStart)
+Environment=BRIDGE_INSTANCE=%i
+
+[Install]
+WantedBy=multi-user.target

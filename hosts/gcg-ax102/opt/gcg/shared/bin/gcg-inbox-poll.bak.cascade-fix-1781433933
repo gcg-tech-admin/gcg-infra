@@ -1,7 +1,5 @@
 #!/bin/bash
 # gcg-inbox-poll — one-shot inbox drain + wake for a single agent.
-# POLLER_VERSION=13.7 (2026-06-15: DELIVERY-RACE FIX — zombie-guard grace 2min->12min + re-poke window 15min->30min, so slow/degrading-OAuth agents (Vulcan) are not false-failed as 'undeliverable' before they start. Effective deadline ~42min; genuinely-dead tasks still cleaned.)
-# POLLER_VERSION=13.6 (2026-06-14: QA-DISPATCH-GATE — Pass 6 only dispatches QA for task_type IN ('standard','decision'). Fixes reply/result/message/notification types wrongly getting qa_review subtasks.
 # POLLER_VERSION=13.5 (2026-06-14: CASCADE-AUTO-ADVANCE — Pass 3b exempts plan_authorized tasks
 #                      from 30-min approval timeout. Pass 3d auto-dones plan_authorized parents
 #                      when QA subtask wedges. Fixes chain-break where plan_authorized tasks
@@ -42,7 +40,7 @@ set -euo pipefail
 
 # Active retry window: re-poke only while a row is this young. Past it -> Pass 0's
 # zombie_repoke classifier catches it on the next tick.
-RETRY_WINDOW="${INBOX_RETRY_WINDOW:-30 minutes}"
+RETRY_WINDOW="${INBOX_RETRY_WINDOW:-15 minutes}"
 # Backoff: re-poke at most once per this interval (throttles pass 2).
 RETRY_BACKOFF="${INBOX_RETRY_BACKOFF:-25 seconds}"
 
@@ -188,7 +186,7 @@ WITH src AS (
    WHERE recipient = :'agent' AND status IN ('delivered','acked')
      AND deliver_count >= 2
      AND started_at IS NULL
-     AND acked_at < NOW() - INTERVAL '12 minutes'
+     AND acked_at < NOW() - INTERVAL '2 minutes'
    RETURNING 1
 )
 SELECT COUNT(*) FROM src;
@@ -300,11 +298,11 @@ WITH src AS (
        OR needs_review = true
        OR task_type IN ('money', 'wire', 'payment', 'payout', 'wire_transfer')
        -- Real work needing QA: bounce only non-utility task types
-       -- Utility types (message, notification, qa_review, ack, fyi, reply, result) go straight to done.
+       -- Utility types (message, notification, qa_review, ack, fyi) go straight to done.
        OR (
          qa_tier IN ('standard', 'high_stakes')
          AND task_type IS NOT NULL
-         AND task_type NOT IN ('message', 'notification', 'qa_review', 'ack', 'fyi', 'reply', 'result')
+         AND task_type NOT IN ('message', 'notification', 'qa_review', 'ack', 'fyi')
        )
      )
    RETURNING 1
@@ -538,7 +536,7 @@ SELECT am.id,
    AND am.agent_qa_by      IS NULL
    AND am.qa_dispatched    = false
    AND (am.owner_type      IS DISTINCT FROM 'human')
-   AND (am.task_type       IN ('standard', 'decision'))
+   AND (am.task_type       NOT IN ('decision','revert_request','qa_review'))
    AND NOT (am.task_type = 'deploy_approval' AND am.plan_authorized = false)
    AND (am.accountable_owner = :'agent' OR am.sender = :'agent' OR am.recipient = :'agent')
  ORDER BY am.id

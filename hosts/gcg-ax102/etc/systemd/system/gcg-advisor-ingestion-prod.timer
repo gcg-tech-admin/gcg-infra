@@ -1,0 +1,9 @@
+[Unit]
+Description=Run GCG Advisor Ingestion Pipeline (PROD) every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 03,09,15,21:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,272 @@
+#!/bin/bash
+# gcg-misroute-check — reconciliation check for fleet message routing
+# Verifies no misroutes over the configured replay window (default 24h).
+# Source: ROOTCAUSE_misroute-daen-atlas-2026-06-14
+#
+# Usage: gcg-misroute-check [--window <interval>] [--agent <name>] [--since <timestamp>]
+#        gcg-misroute-check --repair [--dry-run]
+#   --window:   PostgreSQL interval (default: '24 hours')
+#   --agent:    filter to one agent's messages
+#   --since:    only check messages after ISO timestamp (e.g. '2026-06-14 14:50:00')
+#   --repair:   fix stuck (non-terminal) misroutes by re-routing to canonical recipient
+#   --dry-run:  with --repair, show what would change without committing
+#   --quiet:    exit 0 silently if clean, exit 1 with report if misroutes found
+#
+# Exit codes:
+#   0 — no misroutes found (or repair succeeded)
+#   1 — misroutes found (printed to stdout)
+#   2 — config or DB error
+
+set -euo pipefail
+
+WINDOW="${MISROUTE_CHECK_WINDOW:-24 hours}"
+AGENT_FILTER=""
+QUIET=0
+REPAIR=0
+DRY_RUN=0
+SINCE=""
+MAP_FILE="/opt/gcg/shared/fleet-workspace/config/sender-map.json"
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --window)  WINDOW="$2"; shift 2;;
+    --agent)   AGENT_FILTER="$2"; shift 2;;
+    --since)   SINCE="$2"; shift 2;;
+    --repair)  REPAIR=1; shift;;
+    --dry-run) DRY_RUN=1; shift;;
+    --quiet)   QUIET=1; shift;;
+    *) echo "Unknown arg: $1" >&2; exit 2;;
+  esac
+done
+
+# --repair implies --quiet (just do the work, report via exit code)
+[ "$REPAIR" -eq 1 ] && QUIET=1
+
+if [ ! -r "$PWD_FILE" ]; then
+  echo "ERROR: cannot read $PWD_FILE" >&2
+  exit 2
+fi
+
+PGPW=$(tr -d '\r\n' < "$PWD_FILE")
+export PGPASSWORD="$PGPW"
+
+_psql() {
+  psql "host=10.0.0.2 port=5432 user=gcg_fleet dbname=gcg_intelligence sslmode=disable" \
+    -v ON_ERROR_STOP=1 -tA -F '|' "$@"
+}
+
+# ── Load canonical sender map ──────────────────────────────────────
+CANONICAL_PAIRS=""
+if [ -r "$MAP_FILE" ]; then
+  CANONICAL_PAIRS=$(python3 -c "
+import json
+m = json.load(open('$MAP_FILE')).get('map', {})
+for alias, canonical in m.items():
+    print(f\"{alias}={canonical}\")
+" 2>/dev/null)
+fi
+
+if [ -z "$CANONICAL_PAIRS" ]; then
+  [ "$QUIET" -eq 0 ] && echo "MISROUTE-CHECK: no sender-map configured — skipping"
+  exit 0
+fi
+
+# Build SQL filter for known aliases + canonical lookup table
+ALIAS_LIST=""
+CANONICAL_MAP=""
+declare -A CANONICAL_OF  # bash assoc: alias → canonical
+while IFS='=' read -r alias canonical; do
+  ALIAS_LIST="${ALIAS_LIST:+$ALIAS_LIST, }'$alias'"
+  CANONICAL_MAP="${CANONICAL_MAP}WHEN '$alias' THEN '$canonical' "
+  CANONICAL_OF["$alias"]="$canonical"
+done <<< "$CANONICAL_PAIRS"
+
+_canonical_for() {
+  local a="$1"
+  [ -n "${CANONICAL_OF[$a]:-}" ] && echo "${CANONICAL_OF[$a]}" || echo "$a"
+}
+
+if [ -z "$ALIAS_LIST" ]; then
+  exit 0
+fi
+
+# ── Time filter: --since takes precedence over --window ────────────
+TIME_CLAUSE=""
+if [ -n "$SINCE" ]; then
+  TIME_CLAUSE="AND issued_at > '$SINCE'::timestamp"
+else
+  TIME_CLAUSE="AND issued_at > NOW() - INTERVAL '${WINDOW}'"
+fi
+
+# ── Agent filter clause ────────────────────────────────────────────
+AGENT_CLAUSE=""
+if [ -n "$AGENT_FILTER" ]; then
+  AGENT_CLAUSE="AND (sender = '$AGENT_FILTER' OR recipient = '$AGENT_FILTER')"
+fi
+
+# ── Check 1: Messages sent TO an alias instead of canonical ───────
+# These are new messages where the sender put the alias (not canonical) as recipient.
+MISROUTE_DIRECT=$(_psql <<SQL
+SELECT COUNT(*)
+  FROM agent_messages
+ WHERE recipient IN (${ALIAS_LIST})
+   ${TIME_CLAUSE}
+   ${AGENT_CLAUSE};
+SQL
+)
+MISROUTE_DIRECT=${MISROUTE_DIRECT:-0}
+
+# ── Check 2: Reply routing — replies to alias-sent originals ──────
+# When the original sender was an alias, did the reply go to the alias
+# (misroute) or to the canonical (correct)? This checks that the mapping
+# was applied at reply time.
+MISROUTE_REPLY=$(_psql <<SQL
+WITH alias_originals AS (
+  SELECT id, sender, correlation_id
+    FROM agent_messages
+   WHERE sender IN (${ALIAS_LIST})
+     ${TIME_CLAUSE}
+     ${AGENT_CLAUSE}
+),
+replies AS (
+  SELECT am.id, am.parent_id, am.recipient, ao.sender AS original_sender
+    FROM agent_messages am
+    JOIN alias_originals ao ON am.parent_id = ao.id
+   WHERE am.task_type = 'reply'
+     ${TIME_CLAUSE}
+)
+SELECT COUNT(*)
+  FROM replies
+ WHERE recipient IN (${ALIAS_LIST});
+SQL
+)
+MISROUTE_REPLY=${MISROUTE_REPLY:-0}
+
+# ── Check 3: Stuck messages — alias-recipient rows not terminal ────
+STUCK_COUNT=$(_psql <<SQL
+SELECT COUNT(*)
+  FROM agent_messages
+ WHERE recipient IN (${ALIAS_LIST})
+   AND status NOT IN ('done', 'failed', 'cancelled')
+   ${TIME_CLAUSE}
+   ${AGENT_CLAUSE};
+SQL
+)
+STUCK_COUNT=${STUCK_COUNT:-0}
+
+# ── Repair: re-route stuck messages from alias to canonical ────────
+if [ "$REPAIR" -eq 1 ]; then
+  # Fetch stuck message IDs with alias→canonical mapping
+  STUCK_IDS=""
+  while IFS='|' read -r mid malias; do
+    local canon; canon=$(_canonical_for "$malias")
+    if [ "$malias" != "$canon" ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        echo "[DRY-RUN] Would re-route msg $mid: recipient $malias → $canon"
+      else
+        _psql -v mid="$mid" -v canon="$canon" <<'REPAIR_SQL'
+UPDATE agent_messages
+   SET recipient = :'canon',
+       payload = jsonb_set(payload, '{_repaired_from}', to_jsonb(recipient::text), true),
+       updated_at = NOW()
+ WHERE id = :'mid'::bigint
+   AND status NOT IN ('done', 'failed', 'cancelled');
+REPAIR_SQL
+        echo "REPAIRED msg $mid: recipient $malias → $canon"
+      fi
+    fi
+  done < <(_psql <<SQL
+SELECT id, recipient
+  FROM agent_messages
+ WHERE recipient IN (${ALIAS_LIST})
+   AND status NOT IN ('done', 'failed', 'cancelled')
+   ${TIME_CLAUSE}
+   ${AGENT_CLAUSE}
+ ORDER BY id;
+SQL
+  )
+
+  if [ -z "$STUCK_IDS" ] && [ "$STUCK_COUNT" -eq 0 ]; then
+    echo "REPAIR: no stuck messages to fix"
+  fi
+  exit 0
+fi
+
+# ── Report ─────────────────────────────────────────────────────────
+TOTAL_ISSUES=$((MISROUTE_DIRECT + MISROUTE_REPLY))
+
+WINDOW_LABEL="${WINDOW}"
+[ -n "$SINCE" ] && WINDOW_LABEL="since ${SINCE}"
+
+if [ "$TOTAL_ISSUES" -eq 0 ] && [ "$STUCK_COUNT" -eq 0 ]; then
+  [ "$QUIET" -eq 0 ] && echo "MISROUTE-CHECK: OK — 0 misroutes in ${WINDOW_LABEL}"
+  exit 0
+fi
+
+echo "=== MISROUTE CHECK (window: ${WINDOW_LABEL}) ==="
+echo "  direct-to-alias:  $MISROUTE_DIRECT"
+echo "  reply-misrouted:  $MISROUTE_REPLY"
+echo "  stuck-on-alias:   $STUCK_COUNT"
+echo ""
+
+if [ "$MISROUTE_DIRECT" -gt 0 ]; then
+  echo "--- Direct-to-alias messages ---"
+  _psql <<SQL
+SELECT id, sender, recipient, task_type, status,
+       to_char(issued_at, 'YYYY-MM-DD HH24:MI:SS') AS issued,
+       left(payload->>'text', 80) AS preview
+  FROM agent_messages
+ WHERE recipient IN (${ALIAS_LIST})
+   ${TIME_CLAUSE}
+   ${AGENT_CLAUSE}
+ ORDER BY issued_at DESC;
+SQL
+  echo ""
+fi
+
+if [ "$MISROUTE_REPLY" -gt 0 ]; then
+  echo "--- Reply-misroutes (reply went to alias instead of canonical) ---"
+  _psql <<SQL
+WITH alias_originals AS (
+  SELECT id, sender
+    FROM agent_messages
+   WHERE sender IN (${ALIAS_LIST})
+     ${TIME_CLAUSE}
+),
+replies AS (
+  SELECT am.id, am.parent_id, am.sender, am.recipient, am.task_type, am.status,
+         to_char(am.issued_at, 'YYYY-MM-DD HH24:MI:SS') AS issued,
+         left(am.payload->>'text', 80) AS preview,
+         ao.sender AS original_sender
+    FROM agent_messages am
+    JOIN alias_originals ao ON am.parent_id = ao.id
+   WHERE am.task_type = 'reply'
+     AND am.recipient IN (${ALIAS_LIST})
+     ${TIME_CLAUSE}
+)
+SELECT id, sender, recipient, task_type, status, issued, preview
+  FROM replies
+ ORDER BY issued DESC;
+SQL
+  echo ""
+fi
+
+if [ "$STUCK_COUNT" -gt 0 ]; then
+  echo "--- Stuck messages on alias ---"
+  echo "Run: gcg-misroute-check --repair    to fix these"
+  _psql <<SQL
+SELECT id, sender, recipient, task_type, status,
+       to_char(issued_at, 'YYYY-MM-DD HH24:MI:SS') AS issued,
+       left(payload->>'text', 80) AS preview
+  FROM agent_messages
+ WHERE recipient IN (${ALIAS_LIST})
+   AND status NOT IN ('done', 'failed', 'cancelled')
+   ${TIME_CLAUSE}
+   ${AGENT_CLAUSE}
+ ORDER BY issued_at DESC;
+SQL
+fi
+
+echo "=== END ==="
+exit 1

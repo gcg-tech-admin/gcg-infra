@@ -1,0 +1,19 @@
+#!/bin/bash
+# claude-resume — serialize agent access to shared --resume session
+set -e
+SESSION_UUID="$1"
+PROMPT="$2"
+LOCKFILE="/run/lock/claude-resume-${SESSION_UUID:0:8}.lock"
+MAX_WAIT=120
+LOG_TAG="claude-resume"
+if [ -z "$SESSION_UUID" ] || [ -z "$PROMPT" ]; then
+    echo "Usage: claude-resume <session_uuid> <prompt>" >&2
+    exit 1
+fi
+exec 200>"$LOCKFILE"
+if ! flock -w "$MAX_WAIT" 200; then
+    echo "[$LOG_TAG] TIMEOUT after ${MAX_WAIT}s for $SESSION_UUID" >&2
+    exit 2
+fi
+trap "flock -u 200" EXIT
+exec claude --resume "$SESSION_UUID" -p "$PROMPT"

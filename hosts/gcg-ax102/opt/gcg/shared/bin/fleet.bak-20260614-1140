@@ -73,39 +73,6 @@ _validate_agent() {
   esac
 }
 
-# _ghost_guard <parent_id> <task_type> <recipient>
-# Pre-INSERT check: prevents creating live work tasks referencing already-terminal parents.
-# Ghost-task guard: refuse to create any task (work or coordination) when parent is terminal.
-# Work types: standard, decision, build, fix, deploy_approval, remediation, escalation,
-#   feature_request, proposal, qa_review, review, task, qa.
-# Coordination types also blocked when parented: notification, ack, fyi, result, reply.
-# Exception: message — loosely-coupled FYI with no structural parent dependency.
-# Exit 0 = safe, exit 6 with message to stderr = BLOCKED.
-# Source: GHOST-TASK-GUARD-v2 (#153788)
-_ghost_guard() {
-  local parent="$1" ttype="$2" recipient="$3"
-  # Only check when parent is set
-  [ "$parent" = "NULL" ] && return 0
-  # message type: always pass (no structural parent dependency — informational only)
-  [ "$ttype" = "message" ] && return 0
-  # Check parent status
-  local pstatus
-  pstatus=$(_psql -tA -F '' -c "SELECT status FROM agent_messages WHERE id = ${parent}::bigint;" 2>/dev/null || echo "")
-  if [ -z "$pstatus" ]; then
-    echo "ghost guard: parent #${parent} not found — allowed (new tree)" >&2
-    return 0
-  fi
-  case "$pstatus" in
-    done|failed|cancelled)
-      echo "refused: ghost-task blocked — parent #${parent} is already ${pstatus}; cannot create ${ttype} from a terminal task" >&2
-      exit 6
-      ;;
-    *)
-      return 0  # parent is still alive
-      ;;
-  esac
-}
-
 # _validate_acceptance <message>
 # For standard/decision tasks, rejects if no valid Acceptance: line.
 # Caller must have already checked $ttype is standard or decision.
@@ -226,8 +193,7 @@ cmd_send() {
       *)                   break;;
     esac
   done
-  local raw_to="${1:?usage: fleet send [--from S] <to> <msg>}"; shift
-  local to; to=$(_canonical_recipient "$raw_to")
+  local to="${1:?usage: fleet send [--from S] <to> <msg>}"; shift
   local msg="${*:?usage: fleet send [--from S] <to> <msg>}"
   _validate_agent "$to"
   [ -z "$sender" ] && sender=$(_resolve_sender)
@@ -236,9 +202,6 @@ cmd_send() {
 
   # ── Acceptance criteria gate for standard/decision tasks ──
   case "$ttype" in standard|decision) _validate_acceptance "$msg" ;; esac
-
-  # ── Ghost-task guard: refuse live tasks on already-terminal parents ──
-  _ghost_guard "$parent" "$ttype" "$to"
 
   # Auto-extract acceptance from message text if --acceptance not explicitly provided
   if [ -z "$acceptance" ] && { [ "$ttype" = "standard" ] || [ "$ttype" = "decision" ]; }; then
@@ -252,8 +215,7 @@ cmd_send() {
   fi
 
   # Use psql variables so the message is safely quoted regardless of contents
-  local send_result
-  send_result=$(_psql -tA \
+  _psql -tA \
     -v corr="$corr" -v parent="$parent" -v sender="$sender" -v to="$to" \
     -v ttype="$ttype" -v prio="$prio" -v nonce="$nonce" -v msg="$msg" \
     -v needs_review="$needs_review" -v accountable_owner="$accountable_owner" \
@@ -288,15 +250,6 @@ VALUES
    CASE WHEN :'blocked' = 'true' THEN 'waiting on deps' ELSE NULL END)
 RETURNING id, correlation_id, status;
 SQL
-  )
-  echo "$send_result"
-  # Dispatch logger hook: record start for token/latency baseline (Phase 0.0)
-  local dispatch_id; dispatch_id=$(echo "$send_result" | cut -d'|' -f1 | head -1)
-  if [ -n "$dispatch_id" ] && [ -x /opt/gcg/shared/scripts/dispatch_logger.py ]; then
-    /opt/gcg/shared/scripts/dispatch_logger.py start --id "$dispatch_id" --agent "$sender" --task "$(echo "$msg" | head -1 | cut -c1-120)" 2>/dev/null &
-    # Snapshot recipient's session store for later token-delta computation
-    /opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/dispatch_snapshot.py "$dispatch_id" "$to" 2>/dev/null &
-  fi
 }
 
 cmd_decide() {
@@ -366,55 +319,7 @@ SQL
 }
 
 cmd_ack()    { local id="${1:?usage: fleet ack <id>}";    _set_status "$id" acked       acked_at;   }
-
-# _dispatch_log_finish <id> <outcome>
-# Reads wall_ms from DB timestamps, reads token file if present, fires dispatch_logger finish.
-# Always runs in background (non-blocking). Source: token+latency logger (#153893).
-_dispatch_log_finish() {
-  local id="$1" outcome="$2"
-  [ -x /opt/gcg/shared/scripts/dispatch_logger.py ] || return 0
-  {
-    local timing in_tok out_tok wall_ms tok_file agent_name
-    timing=$(_psql -tA -F $'\t' -v id="$id" <<'SQL'
-SELECT extract(epoch FROM COALESCE(done_at, NOW()))::bigint,
-       extract(epoch FROM COALESCE(started_at, issued_at, NOW()))::bigint,
-       COALESCE(recipient, 'unknown')
-  FROM agent_messages WHERE id = :'id'::bigint LIMIT 1;
-SQL
-    )
-    local done_ep start_ep
-    done_ep=$(echo "$timing"    | cut -f1)
-    start_ep=$(echo "$timing"   | cut -f2)
-    agent_name=$(echo "$timing" | cut -f3)
-    wall_ms=$(( (${done_ep:-0} - ${start_ep:-0}) * 1000 ))
-    [ "$wall_ms" -lt 0 ] && wall_ms=0
-
-    in_tok=0; out_tok=0
-    tok_file="/tmp/fleet_tokens_${id}"
-    if [ -f "$tok_file" ]; then
-      in_tok=$(python3 -c "import json; d=json.load(open('$tok_file')); print(d.get('input_tokens',0))" 2>/dev/null || echo 0)
-      out_tok=$(python3 -c "import json; d=json.load(open('$tok_file')); print(d.get('output_tokens',0))" 2>/dev/null || echo 0)
-      rm -f "$tok_file" 2>/dev/null || true
-    fi
-    /opt/gcg/shared/scripts/dispatch_logger.py finish \
-      --id "$id" --agent "${agent_name:-unknown}" --wall-ms "$wall_ms" \
-      --input-tokens "$in_tok" --output-tokens "$out_tok" \
-      --outcome "$outcome" 2>/dev/null
-  } &
-}
-
-cmd_done() {
-  local id="${1:?usage: fleet done <id>}"
-  local result; result=$(_psql -tA -v id="$id" <<'SQL'
-UPDATE agent_messages SET status = 'done', done_at = NOW()
- WHERE id = :'id'::bigint
-RETURNING id, status, done_at;
-SQL
-  )
-  echo "$result"
-  _dispatch_log_finish "$id" success
-}
-
+cmd_done()   { local id="${1:?usage: fleet done <id>}";   _set_status "$id" done        done_at;    }
 # start is idempotent: re-starting an already in_progress row is a no-op success
 # (original started_at preserved); a terminal row (done/failed/cancelled) is never resurrected.
 cmd_start()  {
@@ -431,15 +336,12 @@ SQL
 cmd_fail()   {
   local id="${1:?usage: fleet fail <id> <reason>}"; shift
   local reason="${*:?usage: fleet fail <id> <reason>}"
-  local result; result=$(_psql -tA -v id="$id" -v reason="$reason" <<'SQL'
+  _psql -tA -v id="$id" -v reason="$reason" <<'SQL'
 UPDATE agent_messages
    SET status = 'failed', done_at = NOW(), blocked_reason = :'reason'
  WHERE id = :'id'::bigint
 RETURNING id, status;
 SQL
-  )
-  echo "$result"
-  _dispatch_log_finish "$id" fail
 }
 cmd_cancel() {
   local id="${1:?usage: fleet cancel <id>}"; _set_status "$id" cancelled done_at
@@ -559,57 +461,22 @@ RETURNING id, blocked_by;
 SQL
 }
 
-# Canonical sender mapping — rewrites reply recipients so multi-instance agents
-# (e.g. Atlas on Mac Mini) don't siphon replies away from the primary instance.
-# Source: ROOTCAUSE_misroute-daen-atlas-2026-06-14
-_canonical_recipient() {
-  local raw="$1"
-  local map_file="/opt/gcg/shared/fleet-workspace/config/sender-map.json"
-  if [ -r "$map_file" ]; then
-    local mapped
-    mapped=$(python3 -c "import json,sys; m=json.load(open('$map_file')).get('map',{}); print(m.get(sys.argv[1], sys.argv[1]))" "$raw" 2>/dev/null)
-    echo "${mapped:-$raw}"
-  else
-    echo "$raw"
-  fi
-}
-
 cmd_reply() {
   local id="${1:?usage: fleet reply <id> <msg>}"; shift
   local msg="${*:?usage: fleet reply <id> <msg>}"
   local sender; sender=$(_resolve_sender)
   local nonce; nonce=$(_uuid)
-
-  # Ghost-task guard: refuse to reply to an already-terminal task
-  local parent_status; parent_status=$(_psql -tA -F '' -c "SELECT status FROM agent_messages WHERE id = ${id}::bigint;" 2>/dev/null || echo '')
-  case "$parent_status" in
-    done|failed|cancelled)
-      echo "fleet reply: parent task #${id} is already ${parent_status} — reply refused (ghost guard)" >&2
-      exit 2;;
-  esac
-
-  # Resolve original sender through canonical mapping so replies always
-  # route to the primary instance (e.g. atlas→daen per ROOTCAUSE 2026-06-14).
-  local raw_sender; raw_sender=$(_psql -tA -v id="$id" <<<'SELECT sender FROM agent_messages WHERE id = :'\''id'\''::bigint;')
-  local mapped_recipient; mapped_recipient=$(_canonical_recipient "$raw_sender")
-  local reply_result
-  reply_result=$(_psql -tA -v id="$id" -v sender="$sender" -v recip="$mapped_recipient" -v nonce="$nonce" -v msg="$msg" <<'SQL'
+  _psql -tA -v id="$id" -v sender="$sender" -v nonce="$nonce" -v msg="$msg" <<'SQL'
 WITH src AS (
   SELECT correlation_id, sender, recipient FROM agent_messages WHERE id = :'id'::bigint
 )
 INSERT INTO agent_messages
   (correlation_id, parent_id, sender, recipient, task_type, payload, nonce)
-SELECT src.correlation_id, :'id'::bigint, :'sender', :'recip', 'reply',
+SELECT src.correlation_id, :'id'::bigint, :'sender', src.sender, 'reply',
        jsonb_build_object('text', :'msg'), :'nonce'
   FROM src
 RETURNING id, correlation_id, sender, recipient, status;
 SQL
-  )
-  echo "$reply_result"
-  local dispatch_id; dispatch_id=$(echo "$reply_result" | cut -d'|' -f1 | head -1)
-  if [ -n "$dispatch_id" ] && [ -x /opt/gcg/shared/scripts/dispatch_logger.py ]; then
-    /opt/gcg/shared/scripts/dispatch_logger.py start --id "$dispatch_id" --agent "$sender" --task "$(echo "$msg" | head -1 | cut -c1-120)" 2>/dev/null &
-  fi
 }
 
 cmd_revert() {

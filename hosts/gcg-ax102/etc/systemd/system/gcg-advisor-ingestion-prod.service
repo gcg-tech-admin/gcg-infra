@@ -1,0 +1,29 @@
+[Unit]
+Description=GCG Advisor Ingestion Pipeline (PROD)
+Documentation=https://docs.gcgstr.com/advisor-ingestion
+After=network.target docker.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+
+Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH=/opt/gcg/shared:/opt/gcg/shared/gcg_tools"
+EnvironmentFile=/run/openclaw-daen/env
+
+WorkingDirectory=/opt/gcg/shared/superapp/advisor_ingestion
+ExecStart=/opt/gcg/shared/superapp/advisor_ingestion/run_pipeline_prod.sh
+
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ProtectHome=read-only
+ReadWritePaths=/opt/gcg/shared/superapp/advisor_ingestion
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-advisor-ingestion-prod
+
+[Install]
+WantedBy=multi-user.target

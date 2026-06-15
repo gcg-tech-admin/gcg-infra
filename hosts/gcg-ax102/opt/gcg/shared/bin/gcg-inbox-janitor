@@ -204,8 +204,12 @@ handle_acked_stale() {
     count=$((count + 1))
     _runtime_check
 
-    if [ "${deliver_count:-0}" -ge 2 ]; then
-      # Cancel — already re-delivered, agent isn't picking up
+    if [ "${deliver_count:-0}" -ge 6 ]; then
+      # Cancel — 6+ delivery attempts over multiple hours, agent truly isn't picking up.
+      # Raised from 2 → 6 (v4.1, 2026-06-15) to match poller's zombie guard at 5.
+      # The old deliver_count≥2 was triggered by the janitor's own repokes:
+      # janitor repoke → deliver_count=3, next poller reclaim → deliver_count=4,
+      # janitor runs again → deliver_count=5, sees ≥2 → kills it. Race condition.
       if [ "$cancel_count" -ge "$MAX_CANCEL" ]; then
         _log "CANCEL_LIMIT reached ($MAX_CANCEL) — skipping id=$id"
         continue

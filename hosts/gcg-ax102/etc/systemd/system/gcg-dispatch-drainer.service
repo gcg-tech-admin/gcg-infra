@@ -7,16 +7,12 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=/var/lib/gcg-dispatch
-
-# DB connection via vSwitch (AX42)
+ExecStartPre=/bin/mkdir -p /var/lib/gcg-dispatch
 Environment=GCG_DB_HOST=10.0.0.2
-# db_connect.py + gcg_tools
+Environment=GCG_DB_PASSWORD=efd23a6dc1a2d4c8649bcd4d07f8ca7c86c2e9954b99ed58cca5364ede18e9f0
 Environment=PYTHONPATH=/opt/gcg/shared/gcg_tools
-# Claude OAuth profile for headless claude --print execution
 Environment=HOME=/opt/gcg/claude-profiles/sub-peter
-# Suppress claude telemetry in headless/service mode
 Environment=CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-
 ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/dispatch_drainer.py
 Restart=always
 RestartSec=10

@@ -1,12 +1,13 @@
 #!/bin/bash
 # gcg-inbox-poll — one-shot inbox drain + wake for a single agent.
-# POLLER_VERSION=13.7 (2026-06-15: DELIVERY-RACE FIX — zombie-guard grace 2min->12min + re-poke window 15min->30min, so slow/degrading-OAuth agents (Vulcan) are not false-failed as 'undeliverable' before they start. Effective deadline ~42min; genuinely-dead tasks still cleaned.)
-# POLLER_VERSION=13.6 (2026-06-14: QA-DISPATCH-GATE — Pass 6 only dispatches QA for task_type IN ('standard','decision'). Fixes reply/result/message/notification types wrongly getting qa_review subtasks.
-# POLLER_VERSION=13.5 (2026-06-14: CASCADE-AUTO-ADVANCE — Pass 3b exempts plan_authorized tasks
-#                      from 30-min approval timeout. Pass 3d auto-dones plan_authorized parents
-#                      when QA subtask wedges. Fixes chain-break where plan_authorized tasks
-#                      auto-fail and cascade-kill dependents.
-# POLLER_VERSION=13.4 (2026-06-14: HARDENING — Pass 7 fleet-send failure now logs WARN instead of
+# POLLER_VERSION=13.3 (2026-06-14: QA_ALLOWLIST — replace phantom coder-sonnet/coder-opus with daen/argus;
+#                      Pass 6 type exclusion — add reply/message/notification to prevent self-QA loop.
+#                      Approved by Daen (messages #153332, #153339).
+# POLLER_VERSION=13.2 (2026-06-14: Pass 3a-prime — event-driven decision routing to Daen (PUSH).
+#                      Non-Peter authority gates (owner_type!='human', recipient!='peter') now
+#                      trigger a fleet-send to daen at the exact moment of input-required transition.
+#                      Dedup via artifacts.daen_notified (shared with Pass 7 + gcg-loop-driver).
+# POLLER_VERSION=13.1 (2026-06-14: HARDENING — Pass 7 fleet-send failure now logs WARN instead of
 #                      silently eating the error; success path logs OK. Stamp already set before send
 #                      so original task is never affected on failure (best-effort, HW4).
 # POLLER_VERSION=13 (2026-06-14: de-gate utility tasks — Pass 3a only parks genuine human decisions
@@ -42,7 +43,7 @@ set -euo pipefail
 
 # Active retry window: re-poke only while a row is this young. Past it -> Pass 0's
 # zombie_repoke classifier catches it on the next tick.
-RETRY_WINDOW="${INBOX_RETRY_WINDOW:-30 minutes}"
+RETRY_WINDOW="${INBOX_RETRY_WINDOW:-15 minutes}"
 # Backoff: re-poke at most once per this interval (throttles pass 2).
 RETRY_BACKOFF="${INBOX_RETRY_BACKOFF:-25 seconds}"
 
@@ -188,7 +189,7 @@ WITH src AS (
    WHERE recipient = :'agent' AND status IN ('delivered','acked')
      AND deliver_count >= 2
      AND started_at IS NULL
-     AND acked_at < NOW() - INTERVAL '12 minutes'
+     AND acked_at < NOW() - INTERVAL '2 minutes'
    RETURNING 1
 )
 SELECT COUNT(*) FROM src;
@@ -300,11 +301,11 @@ WITH src AS (
        OR needs_review = true
        OR task_type IN ('money', 'wire', 'payment', 'payout', 'wire_transfer')
        -- Real work needing QA: bounce only non-utility task types
-       -- Utility types (message, notification, qa_review, ack, fyi, reply, result) go straight to done.
+       -- Utility types (message, notification, qa_review, ack, fyi) go straight to done.
        OR (
          qa_tier IN ('standard', 'high_stakes')
          AND task_type IS NOT NULL
-         AND task_type NOT IN ('message', 'notification', 'qa_review', 'ack', 'fyi', 'reply', 'result')
+         AND task_type NOT IN ('message', 'notification', 'qa_review', 'ack', 'fyi')
        )
      )
    RETURNING 1
@@ -315,11 +316,42 @@ SQL
   IR_BOUNCED=${IR_BOUNCED:-0}
   [ "$IR_BOUNCED" -gt 0 ] && echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] ir_bounced=$IR_BOUNCED" >&2
 
+  # 3a-prime: decision routing to Daen (PUSH) — NON-Peter gates only.
+  # Notify daen at the moment of transition for orchestration bounces (QA / needs-a-call).
+  # Peter-authority gates (owner_type='human' or recipient='peter') are excluded — they
+  # already route through Peter's Forge. Dedup via artifacts.daen_notified (same key as
+  # Pass 7 and gcg-loop-driver: each task gets exactly one decision notification).
+  IR_NOTIFY=$(_psql -F $'\t' <<'SQL'
+WITH stamped AS (
+  UPDATE agent_messages
+     SET artifacts = COALESCE(artifacts, '{}'::jsonb) || '{"daen_notified":true}'::jsonb
+   WHERE status = 'input-required'
+     AND input_required_at > NOW() - INTERVAL '30 seconds'
+     AND (artifacts->>'daen_notified') IS NULL
+     AND (owner_type IS DISTINCT FROM 'human')
+     AND (recipient IS DISTINCT FROM 'peter')
+     AND (accountable_owner = :'agent' OR sender = :'agent' OR recipient = :'agent')
+   RETURNING id, recipient, COALESCE(NULLIF(blocked_reason,''), NULLIF(input_prompt,''), 'needs review') AS reason
+)
+SELECT id, recipient, reason FROM stamped;
+SQL
+  )
+  if [ -n "$IR_NOTIFY" ]; then
+    while IFS=$'\t' read -r NID NRECIPIENT NREASON; do
+      [ -z "$NID" ] && continue
+      DECISION_MSG="DECISION NEEDED — task #${NID} (${NRECIPIENT}): ${NREASON}. Resolve and unblock."
+      if /opt/gcg/shared/bin/fleet send --from cascade --type message daen "$DECISION_MSG" 2>/dev/null; then
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] daen_decision id=$NID reason=$NREASON OK" >&2
+      else
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] daen_decision WARN id=$NID fleet-send failed (stamp set, best-effort)" >&2
+      fi
+    done <<< "$IR_NOTIFY"
+  fi
+
   # 3b. Auto-fail input-required tasks past the 30-min approval window.
   # EXEMPTIONS:
   #   - human-gated tasks (owner_type='human' OR task_type='decision') — wait for human; reminder at 7d
   #   - tasks with qa_dispatched=true — waiting for agent QA (not human); QA subtask has its own timeout
-  #   - plan_authorized tasks — the plan IS the approval; never auto-fail these (Peter 2026-06-14)
   IR_TIMEDOUT=$(_psql -F '' <<SQL
 WITH src AS (
   UPDATE agent_messages
@@ -332,7 +364,6 @@ WITH src AS (
      AND owner_type IS DISTINCT FROM 'human'
      AND task_type NOT IN ('decision', 'revert_request')
      AND qa_dispatched = false
-     AND (plan_authorized IS NOT TRUE)
    RETURNING 1
 )
 SELECT COUNT(*) FROM src;
@@ -341,10 +372,29 @@ SQL
   IR_TIMEDOUT=${IR_TIMEDOUT:-0}
   [ "$IR_TIMEDOUT" -gt 0 ] && echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] ir_timeout=$IR_TIMEDOUT" >&2
 
+  # 3b-qal. QA Learning Loop: capture auto-fail as lesson for tracked agents (talos)
+  if [ "$IR_TIMEDOUT" -gt 0 ]; then
+    _psql -F '' <<SQL
+INSERT INTO public.qa_lessons (task_id, agent, failure_class, reject_reason, what_was_checked)
+SELECT id, recipient,
+       'approval timeout (30 min exceeded)',
+       'approval timeout (30 min exceeded)',
+       'task sat in input-required >30 min without approval'
+  FROM agent_messages
+ WHERE status = 'failed'
+   AND blocked_reason = 'approval timeout (30 min exceeded)'
+   AND recipient = ANY(ARRAY['talos'])
+   AND done_at > NOW() - INTERVAL '10 seconds'
+   AND NOT EXISTS (
+     SELECT 1 FROM public.qa_lessons ql
+      WHERE ql.task_id = agent_messages.id
+        AND ql.failure_class = 'approval timeout (30 min exceeded)'
+   );
+SQL
+  fi
+
   # 3d. QA subtask timeout recovery: when a qa_review task is auto-failed (wedged QA agent),
-  # handle based on plan_authorized:
-  #   - plan_authorized parent → auto-done (plan approval IS the authorization; Peter 2026-06-14)
-  #   - non-plan_authorized parent → reset qa_dispatched=false for re-dispatch
+  # reset the parent's qa_dispatched=false so the next poller tick re-dispatches to another agent.
   QA_WEDGE_RESET=$(_psql -F '' <<SQL
 WITH failed_qa AS (
   SELECT am.id AS qa_id, am.parent_id
@@ -355,22 +405,6 @@ WITH failed_qa AS (
      AND am.done_at > NOW() - INTERVAL '2 minutes'
      AND (am.accountable_owner = :'agent' OR am.sender = :'agent' OR am.recipient = :'agent')
 ),
-auto_done AS (
-  UPDATE agent_messages p
-     SET status          = 'done',
-         verified_by     = 'qa-auto',
-         verified_actor_type = 'agent',
-         verified_at     = NOW(),
-         done_at         = NOW(),
-         blocked_reason  = NULL,
-         progress_note   = COALESCE(p.progress_note,'') ||
-                           E'\n[qa_wedge_auto_done] QA agent timed out; plan_authorized — auto-done'
-    FROM failed_qa fq
-   WHERE p.id = fq.parent_id
-     AND p.plan_authorized = true
-     AND p.status = 'input-required'
-  RETURNING p.id
-),
 reset AS (
   UPDATE agent_messages p
      SET qa_dispatched = false,
@@ -378,17 +412,15 @@ reset AS (
                          E'\n[qa_wedge_reset] QA agent timed out; re-dispatching'
     FROM failed_qa fq
    WHERE p.id = fq.parent_id
-     AND p.plan_authorized IS NOT TRUE
      AND p.qa_dispatched = true
      AND p.status = 'input-required'
   RETURNING p.id
 )
-SELECT COALESCE((SELECT COUNT(*) FROM auto_done), 0) +
-       COALESCE((SELECT COUNT(*) FROM reset), 0);
+SELECT COUNT(*) FROM reset;
 SQL
 )
   QA_WEDGE_RESET=${QA_WEDGE_RESET:-0}
-  [ "$QA_WEDGE_RESET" -gt 0 ] && echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] qa_wedge_reset=$QA_WEDGE_RESET" >&2
+  [ "$QA_WEDGE_RESET" -gt 0 ] && echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] qa_wedge_reset=$QA_WEDGE_RESET (re-dispatch on next tick)" >&2
 
   # 3c. Gentle reminder for human-gated tasks waiting >7 days (not a fail — just a nudge).
   # Stamps progress_note so each reminder fires at most once per 7 days.
@@ -514,11 +546,11 @@ SQL2
   # qa_review subtask for the QA agent with a full context bundle.
   #
   # QA agent selection (separation of duties):
-  #   - Default: vulcan.  Fallback round-robin: orpheus, nexus.
+  #   - Default: vulcan.  Fallback round-robin: coder-sonnet, coder-opus (real agents only).
   #   - NEVER the task's recipient (doer) or accountable_owner.
   # Idempotency: qa_dispatched=true prevents a second dispatch on the next tick.
   # Human gates (owner_type='human') are not auto-dispatched — they wait for a human.
-  QA_ALLOWLIST=("vulcan" "orpheus" "nexus")
+  QA_ALLOWLIST=("vulcan" "daen" "argus")
 
   QA_DISPATCH_DATA=$(_psql <<'SQL'
 SELECT am.id,
@@ -528,7 +560,7 @@ SELECT am.id,
        am.qa_tier,
        am.plan_authorized,
        replace(COALESCE(am.payload->>'text','(no text)'), E'\n', ' ') AS task_text,
-       replace(COALESCE(NULLIF(COALESCE(am.payload->>'acceptance',''), ''), '(none)'), E'\n', ' ') AS acceptance,
+       replace(COALESCE(NULLIF(TRIM(COALESCE(am.payload->>'acceptance','')), ''), NULLIF(TRIM(regexp_replace(substring(regexp_replace(am.payload->>'text', 'Acceptance:', 'Acceptance:', 'i'), 'Acceptance:\s*\n?(.*)'), '\n\n.*$|\[plan_authorized.*$', '', 'i')), ''), '(none)'), E'\n', ' ') AS acceptance,
        COALESCE(NULLIF(am.correlation_id::text, ''), gen_random_uuid()::text) AS corr_id,
        replace(COALESCE(am.artifacts::text, '{}'), E'\n', ' ') AS artifacts_json,
        replace(COALESCE(NULLIF(COALESCE(am.input_prompt, ''), ''), '(none)'), E'\n', ' ') AS input_prompt
@@ -538,7 +570,7 @@ SELECT am.id,
    AND am.agent_qa_by      IS NULL
    AND am.qa_dispatched    = false
    AND (am.owner_type      IS DISTINCT FROM 'human')
-   AND (am.task_type       IN ('standard', 'decision'))
+   AND (am.task_type       NOT IN ('decision','revert_request','qa_review','reply','message','notification'))
    AND NOT (am.task_type = 'deploy_approval' AND am.plan_authorized = false)
    AND (am.accountable_owner = :'agent' OR am.sender = :'agent' OR am.recipient = :'agent')
  ORDER BY am.id
@@ -666,7 +698,7 @@ fi  # end feature flag
 NOTIFY_ROWS=$(_psql -F '|' <<'SQL'
 WITH stamped AS (
   UPDATE agent_messages
-     SET artifacts = artifacts || '{"daen_notified": true}'::jsonb
+     SET artifacts = COALESCE(artifacts, '{}'::jsonb) || '{"daen_notified": true}'::jsonb
    WHERE (accountable_owner = :'agent' OR sender = :'agent' OR recipient = :'agent')
      AND status IN ('done', 'failed')
      AND done_at > NOW() - INTERVAL '30 seconds'

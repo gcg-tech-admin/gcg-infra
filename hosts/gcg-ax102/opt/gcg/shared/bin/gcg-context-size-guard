@@ -1,0 +1,129 @@
+#!/opt/gcg/shared/venv/bin/python3
+"""Context-bloat size-check guard.
+Checks injected workspace files for size bloat and alerts on oversize.
+Usage: gcg-context-size-guard --agent AGENT [--max-file-kb N] [--max-total-kb N] [--quiet]
+Exit: 0=ok, 1=warning, 2=critical (alert-worthy).
+"""
+import argparse, json, os, sys, subprocess
+from datetime import datetime, timezone
+
+# Files OpenClaw injects as "Workspace Files" at session bootstrap
+CONTEXT_FILES = [
+    "SOUL.md", "MEMORY.md", "AGENTS.md",
+    "IDENTITY.md", "USER.md", "TOOLS.md", "HEARTBEAT.md", "RECALL.md"
+]
+
+# Additional files that can bloat context when loaded
+EXTRA_CHECKS = ["INBOX.md"]  # auto-generated, checked but not fatal
+
+DEFAULT_MAX_FILE_KB = 14      # warn: single file exceeds this
+DEFAULT_CRITICAL_FILE_KB = 22 # critical: single file exceeds this
+DEFAULT_MAX_TOTAL_KB = 55     # warn: total injected > this
+DEFAULT_CRITICAL_TOTAL_KB = 85 # critical: total injected > this
+
+
+def find_workspace(agent: str) -> str | None:
+    """Find workspace dir for a given agent."""
+    candidates = [
+        f"/opt/gcg/openclaw-{agent}/workspace",
+        f"/opt/gcg/shared/agents/{agent}/workspace",
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return None
+
+
+def check_agent(agent: str, max_file_kb: int, critical_file_kb: int,
+                max_total_kb: int, critical_total_kb: int) -> dict:
+    workspace = find_workspace(agent)
+    if not workspace:
+        return {"error": f"workspace not found for agent '{agent}'", "exit_code": 1}
+
+    files = {}
+    total = 0
+    worst_file = None
+    worst_kb = 0
+
+    for fname in CONTEXT_FILES:
+        fp = os.path.join(workspace, fname)
+        if os.path.isfile(fp):
+            size = os.path.getsize(fp)
+            kb = round(size / 1024, 1)
+            files[fname] = {"bytes": size, "kb": kb}
+            total += size
+            if kb > worst_kb:
+                worst_kb = kb
+                worst_file = fname
+
+    total_kb = round(total / 1024, 1)
+
+    # Determine exit code
+    exit_code = 0
+    alerts = []
+
+    for fname, info in files.items():
+        if info["kb"] > critical_file_kb:
+            alerts.append(f"CRITICAL: {fname} is {info['kb']}KB (limit {critical_file_kb}KB)")
+            exit_code = max(exit_code, 2)
+        elif info["kb"] > max_file_kb:
+            alerts.append(f"WARN: {fname} is {info['kb']}KB (limit {max_file_kb}KB)")
+            exit_code = max(exit_code, 1)
+
+    if total_kb > critical_total_kb:
+        alerts.append(f"CRITICAL: total context {total_kb}KB (limit {critical_total_kb}KB)")
+        exit_code = max(exit_code, 2)
+    elif total_kb > max_total_kb:
+        alerts.append(f"WARN: total context {total_kb}KB (limit {max_total_kb}KB)")
+        exit_code = max(exit_code, 1)
+
+    return {
+        "agent": agent,
+        "workspace": workspace,
+        "files": files,
+        "total_kb": total_kb,
+        "exit_code": exit_code,
+        "alerts": alerts,
+        "checked_at": datetime.now(timezone.utc).isoformat() + "Z",
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Context-bloat size-check guard")
+    parser.add_argument("--agent", default=os.environ.get("FLEET_SENDER", "talos"),
+                        help="Agent name (default: $FLEET_SENDER or talos)")
+    parser.add_argument("--max-file-kb", type=int, default=DEFAULT_MAX_FILE_KB)
+    parser.add_argument("--critical-file-kb", type=int, default=DEFAULT_CRITICAL_FILE_KB)
+    parser.add_argument("--max-total-kb", type=int, default=DEFAULT_MAX_TOTAL_KB)
+    parser.add_argument("--critical-total-kb", type=int, default=DEFAULT_CRITICAL_TOTAL_KB)
+    parser.add_argument("--quiet", action="store_true", help="Suppress stdout (exit code only)")
+    parser.add_argument("--alert", action="store_true", help="Fleet-alert daen on violations")
+    args = parser.parse_args()
+
+    result = check_agent(
+        args.agent,
+        args.max_file_kb, args.critical_file_kb,
+        args.max_total_kb, args.critical_total_kb
+    )
+
+    if args.quiet:
+        if result.get("alerts"):
+            json.dump(result, sys.stdout, indent=2)
+        sys.exit(result.get("exit_code", 0))
+    
+    json.dump(result, sys.stdout, indent=2)
+
+    # Fleet-alert daen on critical/warn
+    if args.alert and result.get("alerts"):
+        alert_text = "Context bloat detected:\n" + "\n".join(result["alerts"])
+        subprocess.run([
+            "/opt/gcg/shared/bin/fleet", "send",
+            "--priority", "3",
+            "daen", alert_text
+        ], capture_output=True)
+
+    sys.exit(result.get("exit_code", 0))
+
+
+if __name__ == "__main__":
+    main()

@@ -97,8 +97,7 @@ def normalize_changes(text: str) -> str:
 def dispatch_reviewer(
     plan_slug: str, plan_file: str, goal: str,
     reviewer: str, round_n: int,
-    key_finding: str = "", pattern: str = "", prior_fail: str = "",
-    changed_since: str = ""
+    key_finding: str = "", pattern: str = "", prior_fail: str = ""
 ):
     agent_id = REVIEWER_IDS[reviewer]
     role = REVIEWER_ROLES[reviewer]
@@ -107,12 +106,8 @@ def dispatch_reviewer(
     round_header = f"Round {round_n}"
     revision_ctx = ""
     if round_n > 1:
-        changed_note = ""
-        if changed_since:
-            changed_note = f"\nCHANGED-SINCE R{round_n-1}: {changed_since}\n"
         revision_ctx = (
             f"\n\n⚠️ REVISION ROUND {round_n}: Plan has been revised since your last review."
-            f"\nRevised plan path: {plan_file}" + changed_note +
             f"\nYour prior FAIL required:\n{prior_fail}"
             f"\nFocus ONLY on: (1) your previously flagged issues, (2) any sections touched by the revision."
             f"\n\nROOT CAUSE CHECK: Your required changes must target the ROOT CAUSE, not symptoms."
@@ -209,8 +204,7 @@ def run_loop(plan_slug: str, plan_file: str, goal: str, key_finding: str = "", p
 
         for r in active_reviewers:
             dispatch_reviewer(plan_slug, plan_file, goal, r, round_n,
-                              key_finding, pattern, fail_notes.get(r, ""),
-                              changed_since=state.get("changed_since", ""))
+                              key_finding, pattern, fail_notes.get(r, ""))
 
         print(f"\nPolling for {len(active_reviewers)} verdict(s) (timeout {POLL_TIMEOUT//60}m)...")
         verdicts = poll_verdicts(plan_slug, active_reviewers, round_n)
@@ -283,65 +277,24 @@ def run_loop(plan_slug: str, plan_file: str, goal: str, key_finding: str = "", p
             print(f"\nState: {state_file}")
             return "ESCALATE"
 
-        # Still have FAILs but not stuck — auto-redraft via convener (Daen)
+        # Still have FAILs but not stuck — pause for revision
         print(f"\n{'─'*60}")
         print(f"🔄 REVISION NEEDED before Round {round_n + 1}")
         print(f"Failing reviewers: {fails}")
-
-        revised = plan_file.replace(".md", f"-R{round_n + 1}.md")
-
-        # Collect required changes for the REVISE request + CHANGED-SINCE note
-        changes_summary = []
-        changed_parts = []
         for r in fails:
             print(f"\n  [{r}] Required changes (ROOT CAUSE — fix this, not symptoms):\n    {fail_notes[r]}")
-            changes_summary.append(f"[{r}]\n{fail_notes[r]}")
-            changed_parts.append(f"{r}: {normalize_changes(fail_notes[r])[:150]}")
-        changed_since = " | ".join(changed_parts)
+        print(f"\n  Action: Revise ONLY the failing sections. Address root cause, not symptoms.")
+        print(f"  Save revised plan to: {plan_file.replace('.md', f'-R{round_n+1}.md')}")
+        print(f"  Press Enter when revision is complete...")
+        input()
 
-        # Fleet-send Daen the autonomous REVISE request
-        revise_msg = (
-            f"COUNCIL REVISE REQUEST — {plan_slug} (Round {round_n}→{round_n + 1})\n\n"
-            f"Current plan: {plan_file}\n"
-            f"Target revised path: {revised}\n"
-            f"Goal: {goal}\n\n"
-            f"Failing reviewers — required changes (ROOT CAUSE, not symptoms):\n\n"
-            + "\n\n".join(changes_summary) + "\n\n"
-            f"ACTION: Read the current plan at {plan_file}. "
-            f"Revise it to address the ROOT CAUSES above (not symptoms). "
-            f"Write the revised plan to: {revised}\n"
-            f"Then: fleet reply <this_msg_id> \"Revised plan written to {revised}\""
-        )
-        subprocess.run(["fleet", "send", "--priority", "3", "daen", revise_msg], check=True)
-        print(f"  → REVISE request fleet-sent to Daen")
-
-        # Poll for the revised plan file (autonomous: Daen process writes it)
-        REVISION_POLL_TIMEOUT = 600  # 10 min
-        revision_poll_start = time.time()
-        revised_found = False
-        print(f"  Polling for revised plan: {revised} (timeout {REVISION_POLL_TIMEOUT}s)...")
-        while time.time() - revision_poll_start < REVISION_POLL_TIMEOUT:
-            if os.path.exists(revised):
-                revised_found = True
-                break
-            time.sleep(10)
-
-        if revised_found:
+        revised = plan_file.replace(".md", f"-R{round_n + 1}.md")
+        if os.path.exists(revised):
             plan_file = revised
             state["plan_file"] = plan_file
-            state["changed_since"] = changed_since
-            print(f"  ✓ Revised plan found: {plan_file}")
+            print(f"  → Using revised plan: {plan_file}")
         else:
-            state["final_gate"] = "ESCALATE"
-            state["escalate_reason"] = (
-                f"Revision timeout at round {round_n}: Daen did not produce revised plan "
-                f"at {revised} within {REVISION_POLL_TIMEOUT}s."
-            )
-            state_file.write_text(json.dumps(state, indent=2))
-            print(f"\n🚨 REVISION TIMEOUT — ESCALATE TO PETER")
-            print(f"  Daen did not produce revised plan at {revised} within {REVISION_POLL_TIMEOUT}s.")
-            print(f"  State: {state_file}")
-            return "ESCALATE"
+            print(f"  → Revised file not found at {revised}, continuing with: {plan_file}")
 
         active_reviewers = fails  # Only re-dispatch FAILers
 

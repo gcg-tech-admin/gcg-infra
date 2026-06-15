@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""
+gcg-qa-lesson-sync — sync QA lessons from DB to qa-lessons.md on AX102.
+Part of QA Learning Loop (Daen directive 2026-06-14).
+
+Reads unsynced lessons from public.qa_lessons for the configured agent,
+appends/updates qa-lessons.md with dedup (same failure_class = same entry),
+and marks rows as synced.
+
+Usage: gcg-qa-lesson-sync [--agent talos] [--dry-run]
+"""
+
+import argparse
+import os
+import re
+import sys
+from datetime import datetime, timezone
+
+# DB access from shared config
+sys.path.insert(0, "/opt/gcg/shared/gcg_tools")
+from db_config import get_connection
+
+QA_LESSONS_PATH = "/opt/gcg/openclaw-talos/workspace/memory/qa-lessons.md"
+
+
+def _fetch_unsynced(agent: str):
+    """Return list of unsynced qa_lessons rows for agent, oldest first."""
+    conn = get_connection(agent_name=agent)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, task_id, agent, lesson_date, failure_class,
+                       what_was_checked, reject_reason, rule_to_avoid
+                  FROM public.qa_lessons
+                 WHERE agent = %s AND synced = false
+                 ORDER BY id ASC
+                """,
+                (agent,),
+            )
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description]
+            return [dict(zip(cols, r)) for r in rows]
+    finally:
+        conn.close()
+
+
+def _mark_synced(lesson_ids: list[int], agent: str):
+    """Mark lesson rows as synced."""
+    if not lesson_ids:
+        return
+    conn = get_connection(agent_name=agent)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.qa_lessons SET synced = true, synced_at = NOW() WHERE id = ANY(%s)",
+                (lesson_ids,),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_existing_lessons(path: str) -> dict:
+    """Parse existing qa-lessons.md into {failure_class: entry_text} dict.
+    Also returns the header/meta lines for reconstruction."""
+    if not os.path.exists(path):
+        return {}, []
+    with open(path) as f:
+        content = f.read()
+
+    entries = {}
+    # Split by ## headers
+    parts = re.split(r'\n(?=## \d{4}-\d{2}-\d{2})', content)
+    header_lines = parts[0] if parts else ""
+
+    for section in parts[1:]:
+        # Extract failure_class from header: "## YYYY-MM-DD — class_name"
+        header_match = re.match(r'^## \d{4}-\d{2}-\d{2} — (.+)$', section.strip(), re.MULTILINE)
+        if header_match:
+            fc = header_match.group(1).strip().lower()
+            entries[fc] = section.strip()
+    return entries, header_lines.strip().split('\n') if header_lines else []
+
+
+def _build_entry(lesson: dict) -> str:
+    """Build a single markdown entry for a lesson."""
+    date_str = lesson["lesson_date"].strftime("%Y-%m-%d")
+    fc = lesson["failure_class"]
+    task_id = lesson["task_id"]
+    reason = lesson["reject_reason"]
+    checked = lesson.get("what_was_checked") or ""
+    rule = lesson.get("rule_to_avoid") or ""
+
+    lines = [f"## {date_str} — {fc}"]
+    lines.append(f"- **Task:** #{task_id}")
+    if checked:
+        lines.append(f"- **What was checked:** {checked}")
+    lines.append(f"- **Why it failed:** {reason}")
+    if rule:
+        lines.append(f"- **Rule:** {rule}")
+    lines.append(f"- **Occurrences:** 1")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _update_entry(existing_entry: str, lesson: dict) -> str:
+    """Update an existing entry: bump occurrence count, append task ID."""
+    lines = existing_entry.strip().split('\n')
+
+    # Bump occurrence count
+    new_lines = []
+    for line in lines:
+        m = re.match(r'^- \*\*Occurrences:\*\* (\d+)$', line)
+        if m:
+            new_count = int(m.group(1)) + 1
+            new_lines.append(f"- **Occurrences:** {new_count}")
+        else:
+            new_lines.append(line)
+
+    # Append new task ID
+    task_line = f"- **Also:** #{lesson['task_id']} — {lesson['reject_reason'][:120]}"
+    new_lines.append(task_line)
+
+    return "\n".join(new_lines)
+
+
+def sync(agent: str, dry_run: bool = False):
+    """Main sync: fetch unsynced, dedup, write, mark synced."""
+    lessons = _fetch_unsynced(agent)
+    if not lessons:
+        return 0
+
+    existing_entries, header_lines = _read_existing_lessons(QA_LESSONS_PATH)
+    synced_ids = []
+    new_sections = []
+    updated_fcs = set()
+
+    for lesson in lessons:
+        fc = lesson["failure_class"].lower()
+        if fc in existing_entries and fc not in updated_fcs:
+            # Update existing entry
+            existing_entries[fc] = _update_entry(existing_entries[fc], lesson)
+            updated_fcs.add(fc)
+        elif fc not in existing_entries:
+            # New entry
+            new_sections.append(_build_entry(lesson))
+            existing_entries[fc] = _build_entry(lesson)  # track for future
+        synced_ids.append(lesson["id"])
+
+    if dry_run:
+        print(f"[DRY-RUN] Would write {len(new_sections)} new + {len(updated_fcs)} updated entries")
+        for s in new_sections:
+            print(s)
+        for fc in updated_fcs:
+            print(f"[UPDATED] {fc}")
+        return 0
+
+    # Reconstruct file
+    header = "# QA Lessons — Talos\n\n"
+    header += "> Auto-generated by QA Learning Loop. Lessons captured from Vulcan QA rejections.\n"
+    header += "> Each entry: date, task, what was checked, why it failed, rule to avoid.\n"
+    header += "> Same failure class = same entry (occurrences bumped, not duplicated).\n\n"
+
+    # Rebuild: header then all entries sorted by date (most recent first)
+    all_entries = list(existing_entries.values())
+    # Sort by date in header (most recent first)
+    def _sort_key(entry_text: str) -> str:
+        m = re.search(r'^## (\d{4}-\d{2}-\d{2})', entry_text)
+        return m.group(1) if m else "0000-00-00"
+
+    all_entries.sort(key=_sort_key, reverse=True)
+
+    # Backup existing file if it exists
+    if os.path.exists(QA_LESSONS_PATH):
+        bak = QA_LESSONS_PATH + ".bak"
+        with open(QA_LESSONS_PATH) as src, open(bak, 'w') as dst:
+            dst.write(src.read())
+
+    with open(QA_LESSONS_PATH, 'w') as f:
+        f.write(header)
+        f.write("\n".join(all_entries))
+        if all_entries:
+            f.write("\n")
+
+    # Mark synced
+    _mark_synced(synced_ids, agent)
+
+    msg = f"qa-lesson-sync: {len(new_sections)} new + {len(updated_fcs)} updated (agent={agent})"
+    print(msg)
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync QA lessons from DB to qa-lessons.md")
+    parser.add_argument("--agent", default="talos", help="Agent name (default: talos)")
+    parser.add_argument("--dry-run", action="store_true", help="Print what would be written, don't write")
+    args = parser.parse_args()
+
+    rc = sync(args.agent, dry_run=args.dry_run)
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()

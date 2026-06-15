@@ -1,8 +1,5 @@
 #!/bin/bash
 # gcg-loop-driver — W3 loop driver heartbeat
-# LOOP_VERSION=4 (2026-06-14: orphan-sweep exemption — plan_authorized failed blockers skip
-#                    orphan cascade. Plan-authorized tasks are recoverable via revert_request;
-#                    auto-failing their dependents breaks chains that could recover.)
 # LOOP_VERSION=2 (2026-06-13: H5 orphan sweep — auto-fail blocked tasks whose deps are all terminal)
 #
 # Runs every ~10s (gcg-loop-driver.timer). Advances the fleet task queue by:
@@ -72,8 +69,6 @@ fi
 # ── Orphan sweep: auto-fail blocked tasks stuck on terminal (failed/cancelled) deps ──
 # A task is orphaned if ALL its blocked_by entries are terminal (done/failed/cancelled)
 # AND at least one is failed or cancelled. Such a task can never run — fail it.
-# EXCEPTION: if the failed blocker is plan_authorized, skip the orphan sweep — plan-authorized
-# tasks are recoverable via revert_request and should not cascade-kill their dependents.
 # This handles the gap where a blocked task waits forever on a failed dependency.
 ORPHANED=$(_psql -F '' <<'SQL'
 WITH
@@ -85,7 +80,6 @@ terminal_bad AS (
   SELECT ARRAY_AGG(id) AS ids FROM agent_messages WHERE status IN ('failed','cancelled')
 ),
 -- Find blocked tasks where ALL deps are terminal AND at least one is bad (failed/cancelled)
--- BUT skip if the failed blocker is plan_authorized (recoverable — don't cascade-kill dependents)
 orphaned AS (
   SELECT m.id,
          m.blocked_by,
@@ -98,14 +92,6 @@ orphaned AS (
                          COALESCE(terminal_bad.ids,  ARRAY[]::bigint[]))
     -- At least one dep must be bad (failed/cancelled) — otherwise unblock sweep handles it
     AND m.blocked_by && COALESCE(terminal_bad.ids, ARRAY[]::bigint[])
-    -- EXEMPTION: if any failed blocker is plan_authorized, skip orphan sweep
-    -- (plan-authorized tasks are recoverable via revert_request)
-    AND NOT EXISTS (
-      SELECT 1 FROM agent_messages blocker
-       WHERE blocker.id = ANY(m.blocked_by)
-         AND blocker.status IN ('failed','cancelled')
-         AND blocker.plan_authorized = true
-    )
 ),
 failed AS (
   UPDATE agent_messages m
@@ -127,69 +113,6 @@ ORPHANED=${ORPHANED:-0}
 
 if [ "$ORPHANED" -gt 0 ]; then
   echo "$(date -u +%FT%TZ) gcg-loop-driver orphan_failed=$ORPHANED" >&2
-
-  # Decision routing to Daen (PUSH) — orphaned tasks that were auto-failed.
-  # These tasks can never succeed (all blocked_by deps are terminal, at least one
-  # failed/cancelled). Daen must decide: reroute, retry, or cancel the parent chain.
-  # Dedup via artifacts.daen_notified (same key as gcg-inbox-poll Pass 3a/Pass 7).
-  ORPH_NOTIFY=$(_psql -F $'\t' <<'SQL'
-WITH stamped AS (
-  UPDATE agent_messages
-     SET artifacts = COALESCE(artifacts, '{}'::jsonb) || '{"daen_notified":true}'::jsonb
-   WHERE status = 'failed'
-     AND blocked_reason LIKE 'dependency failed%'
-     AND done_at > NOW() - INTERVAL '30 seconds'
-     AND (artifacts->>'daen_notified') IS NULL
-   RETURNING id, recipient, COALESCE(blocked_reason, 'orphaned — all deps terminal') AS reason
-)
-SELECT id, recipient, reason FROM stamped;
-SQL
-  )
-  if [ -n "$ORPH_NOTIFY" ]; then
-    while IFS=$'\t' read -r OID ORECIPIENT OREASON; do
-      [ -z "$OID" ] && continue
-      DECISION_MSG="DECISION NEEDED — task #${OID} (${ORECIPIENT}): ${OREASON}. Resolve and unblock."
-      if /opt/gcg/shared/bin/fleet send --from cascade --type message daen "$DECISION_MSG" 2>/dev/null; then
-        echo "$(date -u +%FT%TZ) gcg-loop-driver daen_decision id=$OID reason=$OREASON OK" >&2
-      else
-        echo "$(date -u +%FT%TZ) gcg-loop-driver daen_decision WARN id=$OID fleet-send failed (stamp set, best-effort)" >&2
-      fi
-    done <<< "$ORPH_NOTIFY"
-  fi
-
-  # ── Recovery: auto-unblock orphaned tasks whose failed blocker is now done ──
-  # When a task was failed due to "dependency failed: X" and X was later restored
-  # (status→done or input-required), reset the orphaned dependent to pending.
-  RECOVERED=$(_psql -F '' <<'SQL'
-WITH restored_blockers AS (
-  -- Tasks that are now done/input-required but previously caused orphans
-  SELECT id FROM agent_messages
-   WHERE status IN ('done', 'input-required')
-     AND done_at > NOW() - INTERVAL '5 minutes'
-),
-recoverable AS (
-  SELECT m.id
-  FROM agent_messages m, restored_blockers rb
-  WHERE m.status = 'failed'
-    AND m.blocked_reason LIKE 'dependency failed%'
-    AND rb.id = ANY(m.blocked_by)
-    AND m.done_at > NOW() - INTERVAL '30 minutes'
-  FOR UPDATE SKIP LOCKED
-),
-recovered AS (
-  UPDATE agent_messages m
-     SET status        = 'pending',
-         blocked_reason = NULL,
-         done_at        = NULL
-    FROM recoverable r
-   WHERE m.id = r.id
-  RETURNING m.id
-)
-SELECT COUNT(*) FROM recovered;
-SQL
-  )
-  RECOVERED=${RECOVERED:-0}
-  [ "$RECOVERED" -gt 0 ] && echo "$(date -u +%FT%TZ) gcg-loop-driver orphan_recovered=$RECOVERED (blocker restored — re-queued)" >&2
 fi
 
 exit 0
