@@ -405,24 +405,9 @@ SQL
 
 cmd_done() {
   local id="${1:?usage: fleet done <id>}"
-  # GATE GUARD (2026-06-15): a task parked at input-required can ONLY be cleared by a human
-  # approve (The Forge / POST /tasks/<id>/approve), NEVER by the doer calling `fleet done`.
-  # Root cause of the 2026-06-15 unreviewed-prod-migration incident: doer re-ran `fleet done`
-  # on an input-required task and Pass 3a couldn't re-bounce (input_required_at already set).
-  local cur; cur=$(_psql -tA -v id="$id" <<'SQL'
-SELECT status FROM agent_messages WHERE id = :'id'::bigint;
-SQL
-  )
-  cur=$(printf '%s' "$cur" | tr -d '[:space:]')
-  if [ "$cur" = "input-required" ]; then
-    echo "refused: task #$id is input-required (awaiting human approval). Resolve in The Forge or POST /tasks/$id/approve — not 'fleet done'." >&2
-    _dispatch_log_finish "$id" refused 2>/dev/null || true
-    return 1
-  fi
   local result; result=$(_psql -tA -v id="$id" <<'SQL'
 UPDATE agent_messages SET status = 'done', done_at = NOW()
  WHERE id = :'id'::bigint
-   AND status <> 'input-required'
 RETURNING id, status, done_at;
 SQL
   )

@@ -957,6 +957,7 @@ shared-mime-info				install
 socat						install
 software-properties-common			install
 sosreport					install
+sqlite3						install
 ssh-import-id					install
 sshpass						install
 ssl-cert					install
