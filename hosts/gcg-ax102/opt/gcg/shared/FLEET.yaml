@@ -529,12 +529,12 @@ agents:
     port: 19650
     workspace: /opt/gcg/openclaw-anna/workspace
     agents_md: /opt/gcg/openclaw-anna/workspace/AGENTS.md
-    model_primary: claude-cli/claude-sonnet-4-6
+    model_primary: claude-cli/claude-opus-4-8
     model_fallbacks:
     - deepseek/deepseek-v4-pro
     - moonshot/kimi-k2.6
     - google/gemini-3.5-flash
-    expected_model_primary: claude-cli/claude-sonnet-4-6
+    expected_model_primary: claude-cli/claude-opus-4-8
     heartbeat:
       every: 30m
       model: deepseek/deepseek-v4-flash
@@ -692,7 +692,7 @@ agents:
     port: 20350
     workspace: /opt/gcg/openclaw-cassandra/workspace
     agents_md: /opt/gcg/openclaw-cassandra/workspace/AGENTS.md
-    model_primary: claude-cli/claude-opus-4-7
+    model_primary: claude-cli/claude-opus-4-8
     model_fallbacks:
     - deepseek/deepseek-v4-pro
     - google/gemini-3.5-flash
@@ -724,7 +724,7 @@ agents:
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
-    expected_model_primary: claude-cli/claude-opus-4-7
+    expected_model_primary: claude-cli/claude-opus-4-8
   chiron:
     title: Health & Longevity Research Specialist
     group: PERSONAL
@@ -831,12 +831,12 @@ agents:
     port: 19200
     workspace: /opt/gcg/openclaw-daen/workspace
     agents_md: /opt/gcg/openclaw-daen/workspace/AGENTS.md
-    model_primary: claude-cli/claude-opus-4-7
+    model_primary: claude-cli/claude-opus-4-8
     model_fallbacks:
     - deepseek/deepseek-v4-pro
     - moonshot/kimi-k2.6
     - google/gemini-3.5-flash
-    expected_model_primary: claude-cli/claude-opus-4-7
+    expected_model_primary: claude-cli/claude-opus-4-8
     heartbeat:
       every: 30m
       model: deepseek/deepseek-v4-flash
@@ -1429,11 +1429,11 @@ agents:
     port: 20450
     workspace: /opt/gcg/openclaw-nemesis/workspace
     agents_md: /opt/gcg/openclaw-nemesis/workspace/AGENTS.md
-    model_primary: openai-codex/gpt-5.5
+    model_primary: openai/gpt-5.5
     model_context_cap:
       openai/gpt-5.5: 272000
     model_context_codex_oauth:
-      openai-codex/gpt-5.5: 400000
+      openai/gpt-5.5: 400000
     model_fallbacks:
     - deepseek/deepseek-v4-pro
     - google/gemini-3.5-flash
@@ -1466,7 +1466,7 @@ agents:
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
-    expected_model_primary: openai-codex/gpt-5.5
+    expected_model_primary: openai/gpt-5.5
   niccolo:
     title: "AI Infrastructure Advisor \u2014 Robin's Agent"
     group: STRATEGY
@@ -1476,12 +1476,12 @@ agents:
     port: 19800
     workspace: /opt/gcg/openclaw-niccolo/workspace
     agents_md: /opt/gcg/openclaw-niccolo/workspace/AGENTS.md
-    model_primary: claude-cli/claude-sonnet-4-6
+    model_primary: claude-cli/claude-opus-4-8
     model_fallbacks:
     - deepseek/deepseek-v4-pro
     - moonshot/kimi-k2.6
     - google/gemini-3.5-flash
-    expected_model_primary: claude-cli/claude-sonnet-4-6
+    expected_model_primary: claude-cli/claude-opus-4-8
     heartbeat:
       every: 1h
       model: deepseek/deepseek-v4-flash
@@ -1524,12 +1524,12 @@ agents:
     port: 18850
     workspace: /opt/gcg/openclaw-nik/workspace
     agents_md: /opt/gcg/openclaw-nik/workspace/AGENTS.md
-    model_primary: claude-cli/claude-sonnet-4-6
+    model_primary: claude-cli/claude-opus-4-8
     model_fallbacks:
     - deepseek/deepseek-v4-pro
     - moonshot/kimi-k2.6
     - google/gemini-3.5-flash
-    expected_model_primary: claude-cli/claude-sonnet-4-6
+    expected_model_primary: claude-cli/claude-opus-4-8
     heartbeat:
       every: 30m
       model: deepseek/deepseek-v4-flash
