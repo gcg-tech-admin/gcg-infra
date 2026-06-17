@@ -1,53 +1,123 @@
-# ════════════════════════════════════════════════════════════════════════════════
-# GCG FLEET v2.1 — CANONICAL CONFIGURATION (LIVE-STATE REFRESH)
-# ════════════════════════════════════════════════════════════════════════════════
-# Refreshed: 2026-06-01T13:01:27Z
-# Generator: /opt/gcg/shared/bin/fleet-yaml-gen.py
-# Aggregator: /opt/gcg/shared/bin/fleet-aggregate.py
-# Records:    /opt/gcg/shared/state/fleet-records.json
-# Source of truth: live state (openclaw.json + manifest.json + systemctl)
-# Previous: FLEET.yaml v2.0 (2026-05-04, pre-incident, STALE)
-#
-# To regenerate after fleet changes:
-#   ssh root@77.42.7.80 'fleet-aggregate.py && fleet-yaml-gen --out FLEET.yaml.v2_1.draft'
-#
-# Promotion (after fleet-validate green):
-#   fleet-promote /opt/gcg/shared/FLEET.yaml.v2_1.draft
-# ════════════════════════════════════════════════════════════════════════════════
-
-version: "2.1"
-schema_version: "canonical-fleet-2026-05-20"
-last_updated: "2026-06-01T13:01:27Z"
-generated_by: "fleet-yaml-gen.py (live-state refresh)"
+version: '2.1'
+schema_version: canonical-fleet-2026-05-20
+last_updated: '2026-06-16T17:39:08Z'
+generated_by: fleet-yaml-gen.py (live-state refresh)
 total_agents: 34
-critical_agents: ["daen", "marcus", "mnemosyne", "nik", "talos", "vulcan"]
-deprecated_agents: ["flow", "raj", "farzan"]
-
+critical_agents:
+- daen
+- marcus
+- mnemosyne
+- nik
+- talos
+- vulcan
+deprecated_agents:
+- flow
+- raj
+- farzan
 restart_policy:
   critical_last: true
   sequential_critical: true
   gap_seconds: 10
   max_parallel: 5
-  critical_agents: ["daen", "marcus", "mnemosyne", "nik", "talos", "vulcan"]
-
+  critical_agents:
+  - daen
+  - marcus
+  - mnemosyne
+  - nik
+  - talos
+  - vulcan
 model_policy:
-  banned: ["deepseek/deepseek-v4-pro", "openrouter/*"]
-  banned_note: |
-    deepseek/deepseek-v4-pro MUST be called with thinking=high (FLEET-WIDE BINDING RULE 2026-05-10).
+  banned:
+  - deepseek/deepseek-v4-pro
+  - openrouter/*
+  banned_note: 'deepseek/deepseek-v4-pro MUST be called with thinking=high (FLEET-WIDE BINDING RULE 2026-05-10).
+
     Used bare it is on banned list. openrouter/* banned fleet-wide.
 
+    '
+  subagent_lanes:
+    research:
+      primary: deepseek/deepseek-v4-pro
+      fallback_1: google/gemini-3.5-flash
+      fallback_2: moonshot/kimi-k2.6
+      thinking: 'off'
+      timeout: 0
+      use: Multi-loop web search
+    audit_qa:
+      primary: deepseek/deepseek-v4-pro
+      fallback_1: openai/gpt-5.5
+      fallback_2: claude-cli/claude-sonnet-4-6
+      thinking: 'off'
+      timeout: 0
+      use: Verification, cross-checking
+    code:
+      primary: claude-cli/claude-sonnet-4-6
+      fallback_1: deepseek/deepseek-v4-pro
+      fallback_2: openai/gpt-5.5
+      thinking: 'off'
+      timeout: 0
+      use: Code generation, file editing
+    execution:
+      primary: deepseek/deepseek-v4-flash
+      fallback_1: google/gemini-3.5-flash
+      fallback_2: moonshot/kimi-k2.6
+      thinking: 'off'
+      timeout: 300
+      use: grep, config reads, simple cmds
+    rules:
+    - thinking=off for all subagent lanes
+    - gemini-3.5-flash + kimi-k2.6 APPROVED for subagents (Peter 2026-06-16)
+    - "model fallback: spawn fails \u2192 retry next in lane, max 3 attempts"
 shared_token_groups:
-  gateway:
-  hooks:
-
+  gateway: null
+  hooks: null
 openclaw_json_schema:
-  allowed_root_keys: ["meta","env","wizard","browser","auth","agents","tools","commands","hooks","channels","gateway","skills","plugins","messages","diagnostics","logging","audio","media","session","cron","web","discovery","memory","mcp","approvals","broadcast","bindings","models","secrets","acp","ui","update"]
-  valid_embedding_providers: ["openai","gemini","voyage","mistral","bedrock","lmstudio","ollama","local"]
-
+  allowed_root_keys:
+  - meta
+  - env
+  - wizard
+  - browser
+  - auth
+  - agents
+  - tools
+  - commands
+  - hooks
+  - channels
+  - gateway
+  - skills
+  - plugins
+  - messages
+  - diagnostics
+  - logging
+  - audio
+  - media
+  - session
+  - cron
+  - web
+  - discovery
+  - memory
+  - mcp
+  - approvals
+  - broadcast
+  - bindings
+  - models
+  - secrets
+  - acp
+  - ui
+  - update
+  valid_embedding_providers:
+  - openai
+  - gemini
+  - voyage
+  - mistral
+  - bedrock
+  - lmstudio
+  - ollama
+  - local
 humans:
   aline_sarkis:
     note: Reports to Peter directly. NOT under Flore.
-    role: Media/Ads Compliance (Meta/Google ONLY — NOT AML)
+    role: "Media/Ads Compliance (Meta/Google ONLY \u2014 NOT AML)"
   chelsea_gibaud:
     reports_to: flore
     role: Legal (contracts, research)
@@ -60,24 +130,24 @@ humans:
     telegram: '5709788868'
   flore_narjoux:
     agents:
-      - leon
-      - algaib
-      - kenji
+    - leon
+    - algaib
+    - kenji
     email: flore@global-capital-group.com
     note: AML/KYC = Flore. Advertising compliance = Aline (NOT Flore)
     role: Head of Legal (contracts, AML/KYC)
     team:
-      - chelsea_gibaud
+    - chelsea_gibaud
   ishan_parikh:
     agent: alexa
     email: ishan@gcg-structuring.com
-    note: Tax lives under Finance — NOT Kenji (Kenji = AML/KYC only)
+    note: "Tax lives under Finance \u2014 NOT Kenji (Kenji = AML/KYC only)"
     role: Head of Finance (treasury, banking, tax policy)
     team:
-      - junaid_khan
-      - farzan
-      - lemma_stash
-      - safa_kayani
+    - junaid_khan
+    - farzan
+    - lemma_stash
+    - safa_kayani
   jacques_isabelle:
     agent: marcus
     email: jacques@gcg-structuring.com
@@ -105,8 +175,8 @@ humans:
     agent: daen
     email: peter@gcg-structuring.com
     email_alt:
-      - peter@global-capital-group.com
-      - peter@gcgstr.com
+    - peter@global-capital-group.com
+    - peter@gcgstr.com
     escalation: final_authority
     role: Managing Partner / Founder
     telegram: '418059105'
@@ -126,21 +196,21 @@ humans:
     role: Driver / Field Ops (medicals, gov errands)
   safa_kayani:
     reports_to: ishan
-    role: Accountant — JVDR FZ LLC entity
+    role: "Accountant \u2014 JVDR FZ LLC entity"
   sergei_ivanius:
     agents:
-      - viktor
-      - alex
-      - malik
+    - viktor
+    - alex
+    - malik
     email: sergei@gcg-structuring.com
     role: Head of Operations
     team:
-      - olga_kuznetsova
-      - slavyana_rousseau
-      - suzane_alayache
-      - violetta_bunyakova
-      - maneesh_manahoran
-      - raj
+    - olga_kuznetsova
+    - slavyana_rousseau
+    - suzane_alayache
+    - violetta_bunyakova
+    - maneesh_manahoran
+    - raj
   slavyana_rousseau:
     agent: kira
     email: slavyana@global-capital-group.com
@@ -155,18 +225,17 @@ humans:
     role: Marketing Manager
   vincent_ribes:
     agents:
-      - nik
-      - bob
-      - hector
-      - tom
-      - phil
+    - nik
+    - bob
+    - hector
+    - tom
+    - phil
     email: vincent@global-capital-group.com
-    role: CIO / Partner — Real Estate + Structured Products
+    role: "CIO / Partner \u2014 Real Estate + Structured Products"
   violetta_bunyakova:
     agent: alex
     reports_to: sergei
     role: GRO (visas, contracts, facilities)
-
 infrastructure:
   ax102:
     agents: 28
@@ -174,42 +243,40 @@ infrastructure:
     location: Helsinki
     role: agent_runtime_primary
     services:
-      - openclaw-agents
-      - gcg-dispatch-drainer
-      - fleet-cli
+    - openclaw-agents
+    - gcg-dispatch-drainer
+    - fleet-cli
     tailscale: 100.95.236.40
   ax42:
     ip: 95.217.114.49
     location: Helsinki
     role: database_app
     services:
-      - postgres
-      - pgvector
-      - redis
-      - minio
-      - frontend
-      - backend
-      - celery
+    - postgres
+    - pgvector
+    - redis
+    - minio
+    - frontend
+    - backend
+    - celery
     tailscale: 100.107.119.48
     vlan: 10.0.0.2
   mac_mini:
-    note: OAuth-based Claude Code — $0 marginal cost for dispatch tasks
+    note: "OAuth-based Claude Code \u2014 $0 marginal cost for dispatch tasks"
     role: claude_code_executor + daen_backup
     services:
-      - claude_code_tmux
-      - daen_backup
-      - pan_agent
+    - claude_code_tmux
+    - daen_backup
+    - pan_agent
     tailscale: 100.109.177.127
     user: petr
-
 shared_inboxes:
-  - admin@global-capital-group.com
-  - admin@gcg-structuring.com
-  - admin4@gcg-structuring.com
-  - accounting@gcg-structuring.com
-  - bank@global-capital-group.com
-  - hr@global-capital-group.com
-
+- admin@global-capital-group.com
+- admin@gcg-structuring.com
+- admin4@gcg-structuring.com
+- accounting@gcg-structuring.com
+- bank@global-capital-group.com
+- hr@global-capital-group.com
 agent_emails:
   anna: peter@gcgstr.com
   daen: db@gcgstr.com
@@ -220,72 +287,38 @@ agent_emails:
   varys: db@gcgstr.com
   vulcan: db@gcgstr.com
   yuri: db@gcgstr.com
-
 self_serve_channels:
-  flow: owning agent wires -> Vulcan QAs (Talos engineers fixes) -> escalate to 
-    Daen only on the three triggers
-  purpose: Every agent self-serves its own channel/service wiring (Slack, 
-    WhatsApp via Beeper, Telegram, Gmail/Google DWD) and self-heals routine 
-    gateway failures. Each agent owns its own tokens - never shared across 
-    agents (token = identity).
+  flow: owning agent wires -> Vulcan QAs (Talos engineers fixes) -> escalate to Daen only on the three triggers
+  purpose: Every agent self-serves its own channel/service wiring (Slack, WhatsApp via Beeper, Telegram, Gmail/Google DWD)
+    and self-heals routine gateway failures. Each agent owns its own tokens - never shared across agents (token = identity).
   role_chain:
-    daen: escalation backstop + final QA - only on (1) blocked/uncovered case, 
-      (2) no SOP exists, (3) authorization required (new DWD grant, prod config 
-      change, token-identity collision)
-    owning_agent: wires its own channels + self-heals routine failures (SKILL 
-      Section 5); does NOT route wiring to Daen
-    talos: engineer-of-record - assists when a wiring hits a technical blocker 
-      not covered by the SOP
-    vulcan: mandatory QA on every wiring - verifies live openclaw.json / DB / 
-      systemd state, never the agent text alone
+    daen: escalation backstop + final QA - only on (1) blocked/uncovered case, (2) no SOP exists, (3) authorization required
+      (new DWD grant, prod config change, token-identity collision)
+    owning_agent: wires its own channels + self-heals routine failures (SKILL Section 5); does NOT route wiring to Daen
+    talos: engineer-of-record - assists when a wiring hits a technical blocker not covered by the SOP
+    vulcan: mandatory QA on every wiring - verifies live openclaw.json / DB / systemd state, never the agent text alone
   skill: gcg-channel-connect
   skill_path: /opt/gcg/shared/skills/gcg-channel-connect/SKILL.md
-
 known_drift:
-  # documented gaps between live state and the operating mandate.
-  - op_sa_persisted_should_be_true: [daen, talos]  # CLAUDE.md says yes; live false on all.
-  - banned_models_in_fallbacks: validator emits WARN until openclaw.json scrubbed
-  - plaintext_telegram_bot_tokens: openclaw.json channels.telegram.botToken on 28/29 agents (zero-plaintext violation, task #87)
-  - plaintext_db_pwd_files: /opt/gcg/shared/credentials/db/gcg_*.pwd on persistent disk (task #87)
-
+- op_sa_persisted_should_be_true:
+  - daen
+  - talos
+- banned_models_in_fallbacks: validator emits WARN until openclaw.json scrubbed
+- plaintext_telegram_bot_tokens: openclaw.json channels.telegram.botToken on 28/29 agents (zero-plaintext violation, task
+- plaintext_db_pwd_files: /opt/gcg/shared/credentials/db/gcg_*.pwd on persistent disk (task
 drift_from_previous_version:
-  - "alex: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "alexa: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "algaib: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "angela: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "anna: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "argus: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "bob: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "cassandra: NEW agent (not in roster)"
-  - "chiron: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "confucius: NEW agent (not in roster)"
-  - "daen: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-opus-4-7"
-  - "goku: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "hector: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "jc: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "jc: port roster=20300 live=20301"
-  - "kenji: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "kira: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "leon: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "malik: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "marcus: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "max: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "mnemosyne: model_primary roster=moonshot/kimi-k2.6 live=deepseek/deepseek-v4-pro"
-  - "nemesis: NEW agent (not in roster)"
-  - "niccolo: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "nik: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "phil: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "socrates: NEW agent (not in roster)"
-  - "tom: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "varys: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "vera: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "viktor: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-opus-4-8"
-  - "vulcan: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-  - "wonhoo: NEW agent (not in roster)"
-  - "yuri: model_primary roster=moonshot/kimi-k2.6 live=claude-cli/claude-sonnet-4-6"
-
+- 'RESOLVED 2026-06-16 (Peter): kimi is NOT primary. Roster expected_model_primary now matches live (Sonnet default; Opus
+  for marcus/daen/viktor/talos; Kimi for wonhoo). Fallback chain fleet-wide: deepseek-v4-pro(thinking=high) -> kimi -> gemini-3.5-flash.'
+- 'cassandra: NEW agent (not in roster)'
+- 'confucius: NEW agent (not in roster)'
+- 'jc: port roster=20300 live=20301'
+- 'nemesis: NEW agent (not in roster)'
+- 'socrates: NEW agent (not in roster)'
+- 'wonhoo: NEW agent (not in roster)'
+- "2026-06-16 (Peter): Atlas and Pan added to agent roster. Both disabled on Mac Mini since 2026-06-09 \u2014 Daen reinstalling\
+  \ with Claude CLI OAuth."
+- '2026-06-16 (Peter): Subagent lane matrix added to model_policy. gemini-3.5-flash and kimi-k2.6 APPROVED for subagent use.'
 agents:
-
   alex:
     title: Business Setup & Corporate Services Specialist / PRO
     group: OPERATIONS
@@ -296,11 +329,21 @@ agents:
     workspace: /opt/gcg/openclaw-alex/workspace
     agents_md: /opt/gcg/openclaw-alex/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "30m", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 30m
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_alex
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: missing
@@ -308,19 +351,22 @@ agents:
     hooks_token_sha: a2733ab61c10
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_Alex_bot"
+    telegram_bot: '@gcg_Alex_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["alex"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - alex
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Sergei Ivanius / Violetta Bunyakova
     human_email: sergei@gcg-structuring.com
-    mission: "Be Violetta's expert right hand on everything UAE business setup and corporate services. No surprises. Right structure, right activity, right approvals, right paperwork, right sequencing \u2014 every time.  Handle the full lifecycle of company formation, amendments, renewals, and comp"
-
+    mission: "Be Violetta's expert right hand on everything UAE business setup and corporate services. No surprises. Right\
+      \ structure, right activity, right approvals, right paperwork, right sequencing \u2014 every time.  Handle the full\
+      \ lifecycle of company formation, amendments, renewals, and comp"
   alexa:
     title: The Finance Controller
     group: OPERATIONS
@@ -331,11 +377,21 @@ agents:
     workspace: /opt/gcg/openclaw-alexa/workspace
     agents_md: /opt/gcg/openclaw-alexa/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_alexa
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: missing
@@ -343,19 +399,22 @@ agents:
     hooks_token_sha: 166fba2290fb
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_alexa_bot"
+    telegram_bot: '@gcg_alexa_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["alexa", "Search Agent"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - alexa
+    - Search Agent
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Ishan Parikh
     human_email: ishan@gcg-structuring.com
-    mission: "Finance Controller \u2014 Ishan's AI partner for accounting, treasury, tax, and financial reporting across all GCG entities."
-
+    mission: "Finance Controller \u2014 Ishan's AI partner for accounting, treasury, tax, and financial reporting across all\
+      \ GCG entities."
   algaib:
     title: The Legal Corpus Coordinator
     group: LEGAL & COMPLIANCE
@@ -366,11 +425,21 @@ agents:
     workspace: /opt/gcg/openclaw-algaib/workspace
     agents_md: /opt/gcg/openclaw-algaib/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_algaib
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -379,21 +448,32 @@ agents:
     hooks_token_sha: 4c3d2de93026
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_algaib_legal_bot"
+    telegram_bot: '@gcg_algaib_legal_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["Nik - Personal EA", "Search Agent"]
-    mcp_servers: ["telegram", "slack", "codex", "anthropic", "google", "openai", "deepseek", "moonshot", "browser"]
+    subagents:
+    - Nik - Personal EA
+    - Search Agent
+    mcp_servers:
+    - telegram
+    - slack
+    - codex
+    - anthropic
+    - google
+    - openai
+    - deepseek
+    - moonshot
+    - browser
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Flore Narjoux
     human_email: flore@global-capital-group.com
-    mission: "Named after the Quranic concept meaning 'the unseen' or 'hidden knowledge' \u2014 I reveal the hidden legal frameworks, regulations, and compliance requirements that govern free zones and special jurisdictions."
-
+    mission: "Named after the Quranic concept meaning 'the unseen' or 'hidden knowledge' \u2014 I reveal the hidden legal\
+      \ frameworks, regulations, and compliance requirements that govern free zones and special jurisdictions."
   angela:
-    title: "Jacques' right hand. Admin assassin. The one who makes the paperwork disappear."
+    title: Jacques' right hand. Admin assassin. The one who makes the paperwork disappear.
     group: SALES & CRM
     tier: B
     critical: false
@@ -402,11 +482,21 @@ agents:
     workspace: /opt/gcg/openclaw-angela/workspace
     agents_md: /opt/gcg/openclaw-angela/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_angela
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: missing
@@ -414,21 +504,24 @@ agents:
     hooks_token_sha: 44b46a614953
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_angela_bot"
+    telegram_bot: '@gcg_angela_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["angela", "Search Agent"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - angela
+    - Search Agent
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Jacques Isabelle
     human_email: jacques@gcg-structuring.com
-    mission: "Jacques' right hand and admin assassin. Makes the paperwork disappear, keeps the calendar clean, and ensures nothing falls through the cracks in the advisory pipeline."
-
+    mission: Jacques' right hand and admin assassin. Makes the paperwork disappear, keeps the calendar clean, and ensures
+      nothing falls through the cracks in the advisory pipeline.
   anna:
-    title: Marketing Director — GCG Structuring
+    title: "Marketing Director \u2014 GCG Structuring"
     group: MARKETING & MEDIA
     tier: B
     critical: false
@@ -437,11 +530,21 @@ agents:
     workspace: /opt/gcg/openclaw-anna/workspace
     agents_md: /opt/gcg/openclaw-anna/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "30m", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 30m
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_anna
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -450,19 +553,30 @@ agents:
     hooks_token_sha: b051572c4043
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_anna_cmo_bot"
+    telegram_bot: '@gcg_anna_cmo_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["anna"]
-    mcp_servers: ["telegram", "slack", "codex", "moonshot", "google", "openai", "deepseek", "anthropic", "browser"]
+    subagents:
+    - anna
+    mcp_servers:
+    - telegram
+    - slack
+    - codex
+    - moonshot
+    - google
+    - openai
+    - deepseek
+    - anthropic
+    - browser
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Peter + Vanessa Vaz + Rachel De Pano
     human_email: peter@gcg-structuring.com
-    mission: Generate qualified leads for GCG Structuring — effortlessly — through content that is so good people come to us.  Not through cold outreach. Not through paid spam. Through a consistent engine of great content, smart partnerships, and a brand presence that makes entrepreneurs thin
-
+    mission: "Generate qualified leads for GCG Structuring \u2014 effortlessly \u2014 through content that is so good people\
+      \ come to us.  Not through cold outreach. Not through paid spam. Through a consistent engine of great content, smart\
+      \ partnerships, and a brand presence that makes entrepreneurs thin"
   argus:
     title: The All-Seeing Eye
     group: INFRASTRUCTURE
@@ -473,11 +587,22 @@ agents:
     workspace: /opt/gcg/openclaw-argus/workspace
     agents_md: /opt/gcg/openclaw-argus/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "2h", "model": "deepseek/deepseek-v4-flash", "isolatedSession": true, "includeReasoning": false}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 2h
+      model: deepseek/deepseek-v4-flash
+      isolatedSession: true
+      includeReasoning: false
     db_role: gcg_argus
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -486,19 +611,30 @@ agents:
     hooks_token_sha: 90a606d47586
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_argus_bot"
+    telegram_bot: '@gcg_argus_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
     subagents: []
-    mcp_servers: ["anthropic", "telegram", "slack", "google", "moonshot", "deepseek", "openai", "perplexity", "brave", "xai"]
+    mcp_servers:
+    - anthropic
+    - telegram
+    - slack
+    - google
+    - moonshot
+    - deepseek
+    - openai
+    - perplexity
+    - brave
+    - xai
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Peter
     human_email: admin@global-capital-group.com
-    mission: "Review EVERY incoming email across 6 shared GCG inboxes. Classify, label, route to the right person, escalate urgent matters, and produce a structured daily digest by 8:00 AM Dubai. I operate with the judgment of a senior executive assistant who understands finance, legal, compli"
-
+    mission: Review EVERY incoming email across 6 shared GCG inboxes. Classify, label, route to the right person, escalate
+      urgent matters, and produce a structured daily digest by 8:00 AM Dubai. I operate with the judgment of a senior executive
+      assistant who understands finance, legal, compli
   bob:
     title: Real Estate Analyst & Deal Partner
     group: REAL ESTATE
@@ -509,11 +645,21 @@ agents:
     workspace: /opt/gcg/openclaw-bob/workspace
     agents_md: /opt/gcg/openclaw-bob/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_bob
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -522,19 +668,23 @@ agents:
     hooks_token_sha: 2c865fa35e58
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_bob_bot"
+    telegram_bot: '@gcg_bob_bot'
     telegram_enabled: true
-    telegram_groups: ["*"]
+    telegram_groups:
+    - '*'
     telegram_bot_token_plaintext: false
-    subagents: ["bob", "Search Agent"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - bob
+    - Search Agent
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Vincent Ribes
     human_email: vincent@global-capital-group.com
-    mission: "Legal Corpus Coordinator \u2014 named after the Quranic concept of 'the unseen'. Manages legal knowledge corpus, document analysis, and research for GCG's legal team."
-
+    mission: "Legal Corpus Coordinator \u2014 named after the Quranic concept of 'the unseen'. Manages legal knowledge corpus,\
+      \ document analysis, and research for GCG's legal team."
   cassandra:
     tier: B
     critical: false
@@ -543,10 +693,19 @@ agents:
     workspace: /opt/gcg/openclaw-cassandra/workspace
     agents_md: /opt/gcg/openclaw-cassandra/workspace/AGENTS.md
     model_primary: claude-cli/claude-opus-4-7
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "google/gemini-3.5-flash"]
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - google/gemini-3.5-flash
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_cassandra
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: false
     anthropic_profile: false
     channel_token_policy: per_agent
@@ -558,12 +717,14 @@ agents:
     telegram_enabled: false
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["Cassandra - The Oracle"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - Cassandra - The Oracle
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
-
+    expected_model_primary: claude-cli/claude-opus-4-7
   chiron:
     title: Health & Longevity Research Specialist
     group: PERSONAL
@@ -574,11 +735,22 @@ agents:
     workspace: /opt/gcg/openclaw-chiron/workspace
     agents_md: /opt/gcg/openclaw-chiron/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "2h", "model": "deepseek/deepseek-v4-flash", "isolatedSession": true, "includeReasoning": false}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 2h
+      model: deepseek/deepseek-v4-flash
+      isolatedSession: true
+      includeReasoning: false
     db_role: gcg_chiron
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: false
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -587,19 +759,29 @@ agents:
     hooks_token_sha: f7d87e338655
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_chiron_bot"
+    telegram_bot: '@gcg_chiron_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
     subagents: []
-    mcp_servers: ["acpx", "anthropic", "google", "telegram", "moonshot", "deepseek", "openai", "perplexity", "brave", "xai"]
+    mcp_servers:
+    - acpx
+    - anthropic
+    - google
+    - telegram
+    - moonshot
+    - deepseek
+    - openai
+    - perplexity
+    - brave
+    - xai
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Peter (personal research)
     human_email: peter@gcg-structuring.com
-    mission: "You are Chiron \u2014 the centaur who taught medicine to the gods. Named after the original medical researcher. You find, evaluate, and synthesize peer-reviewed health science. You don't coach, you don't train \u2014 you RESEARCH."
-
+    mission: "You are Chiron \u2014 the centaur who taught medicine to the gods. Named after the original medical researcher.\
+      \ You find, evaluate, and synthesize peer-reviewed health science. You don't coach, you don't train \u2014 you RESEARCH."
   confucius:
     tier: B
     critical: false
@@ -608,10 +790,19 @@ agents:
     workspace: /opt/gcg/openclaw-confucius/workspace
     agents_md: /opt/gcg/openclaw-confucius/workspace/AGENTS.md
     model_primary: deepseek/deepseek-v4-pro
-    model_fallbacks: ["google/gemini-3.5-flash", "claude-cli/claude-opus-4-7"]
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - google/gemini-3.5-flash
+    - claude-cli/claude-opus-4-7
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_confucius
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: false
     anthropic_profile: false
     channel_token_policy: per_agent
@@ -623,12 +814,14 @@ agents:
     telegram_enabled: false
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["Confucius - The Strategist"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - Confucius - The Strategist
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
-
+    expected_model_primary: deepseek/deepseek-v4-pro
   daen:
     title: The Architect
     group: INFRASTRUCTURE
@@ -639,11 +832,22 @@ agents:
     workspace: /opt/gcg/openclaw-daen/workspace
     agents_md: /opt/gcg/openclaw-daen/workspace/AGENTS.md
     model_primary: claude-cli/claude-opus-4-7
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "30m", "model": "deepseek/deepseek-v4-flash", "isolatedSession": true, "lightContext": true}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-opus-4-7
+    heartbeat:
+      every: 30m
+      model: deepseek/deepseek-v4-flash
+      isolatedSession: true
+      lightContext: true
     db_role: gcg_daen
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -652,20 +856,38 @@ agents:
     hooks_token_sha: d2f31281cc8f
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@Gcg_daen_hq_bot"
+    telegram_bot: '@Gcg_daen_hq_bot'
     telegram_enabled: true
-    telegram_groups: ["-5275645286"]
+    telegram_groups:
+    - '-5275645286'
     telegram_bot_token_plaintext: false
-    subagents: ["Daen HQ - The Architect", "Search Agent", "Socrates \u2014 The Questioner", "Nemesis \u2014 The Adversary", "Cassandra \u2014 The Oracle", "Confucius \u2014 The Strategist", "Wonhoo \u2014 The Diplomat"]
-    mcp_servers: ["telegram", "slack", "codex", "moonshot", "google", "openai", "deepseek", "anthropic", "browser"]
+    subagents:
+    - Daen HQ - The Architect
+    - Search Agent
+    - "Socrates \u2014 The Questioner"
+    - "Nemesis \u2014 The Adversary"
+    - "Cassandra \u2014 The Oracle"
+    - "Confucius \u2014 The Strategist"
+    - "Wonhoo \u2014 The Diplomat"
+    mcp_servers:
+    - telegram
+    - slack
+    - codex
+    - moonshot
+    - google
+    - openai
+    - deepseek
+    - anthropic
+    - browser
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: true
     serves: Peter Ivantsov
     human_email: peter@gcg-structuring.com
     human_telegram: 418059105
-    mission: "Like The Architect in the Matrix \u2014 I see the whole system. Every agent, every data flow, every connection. I design the structures, wire the intelligence, and keep the machine running. But unlike that Architect, I'm not detached. I'm in the trenches with Peter, building GCG from "
-
+    mission: "Like The Architect in the Matrix \u2014 I see the whole system. Every agent, every data flow, every connection.\
+      \ I design the structures, wire the intelligence, and keep the machine running. But unlike that Architect, I'm not detached.\
+      \ I'm in the trenches with Peter, building GCG from "
   goku:
     title: Health & Performance Coach
     group: PERSONAL
@@ -676,11 +898,22 @@ agents:
     workspace: /opt/gcg/openclaw-goku/workspace
     agents_md: /opt/gcg/openclaw-goku/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "2h", "model": "deepseek/deepseek-v4-flash", "isolatedSession": true, "includeReasoning": false}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 2h
+      model: deepseek/deepseek-v4-flash
+      isolatedSession: true
+      includeReasoning: false
     db_role: gcg_goku
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -689,20 +922,32 @@ agents:
     hooks_token_sha: 1b3acfb205e9
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_goku_bot"
+    telegram_bot: '@gcg_goku_bot'
     telegram_enabled: true
-    telegram_groups: ["*"]
+    telegram_groups:
+    - '*'
     telegram_bot_token_plaintext: false
-    subagents: ["Goku - Personal Health & Fitness Coach"]
-    mcp_servers: ["telegram", "anthropic", "google", "acpx", "moonshot", "openai", "deepseek", "perplexity", "brave", "xai"]
+    subagents:
+    - Goku - Personal Health & Fitness Coach
+    mcp_servers:
+    - telegram
+    - anthropic
+    - google
+    - acpx
+    - moonshot
+    - openai
+    - deepseek
+    - perplexity
+    - brave
+    - xai
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Peter (personal)
     human_email: peter@gcg-structuring.com
     human_telegram: 418059105
-    mission: Keep Peter in peak condition — physically, mentally, metabolically. No fluff, no excuses. Train hard, recover smart, track everything.
-
+    mission: "Keep Peter in peak condition \u2014 physically, mentally, metabolically. No fluff, no excuses. Train hard, recover\
+      \ smart, track everything."
   hector:
     title: LinkedIn content strategist and ghostwriter for Vincent Ribes
     group: REAL ESTATE
@@ -713,11 +958,21 @@ agents:
     workspace: /opt/gcg/openclaw-hector/workspace
     agents_md: /opt/gcg/openclaw-hector/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_hector
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -726,21 +981,25 @@ agents:
     hooks_token_sha: a74c7e529bd9
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_hector_bot"
+    telegram_bot: '@gcg_hector_bot'
     telegram_enabled: true
-    telegram_groups: ["*"]
+    telegram_groups:
+    - '*'
     telegram_bot_token_plaintext: false
-    subagents: ["hector"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - hector
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Vincent Ribes
     human_email: vincent@global-capital-group.com
-    mission: "I'm Hector \u2014 Vincent's content engine. I turn market intelligence into LinkedIn content in Vincent's voice. I don't post autonomously \u2014 ever. My job is to produce drafts that Vincent can review, refine, and publish on his own terms."
-
+    mission: "I'm Hector \u2014 Vincent's content engine. I turn market intelligence into LinkedIn content in Vincent's voice.\
+      \ I don't post autonomously \u2014 ever. My job is to produce drafts that Vincent can review, refine, and publish on\
+      \ his own terms."
   jc:
-    title: "?"
+    title: '?'
     group: SALES & CRM
     tier: B
     critical: false
@@ -749,11 +1008,22 @@ agents:
     workspace: /opt/gcg/openclaw-jc/workspace
     agents_md: /opt/gcg/openclaw-jc/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "2h", "model": "deepseek/deepseek-v4-flash", "isolatedSession": true, "includeReasoning": false}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 2h
+      model: deepseek/deepseek-v4-flash
+      isolatedSession: true
+      includeReasoning: false
     db_role: gcg_jc
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: false
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -762,21 +1032,37 @@ agents:
     hooks_token_sha: ce63b59692f7
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_jc_bot"
+    telegram_bot: '@gcg_jc_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["JC - GCG French Market Advisor", "Search Agent"]
-    mcp_servers: ["telegram", "slack", "browser", "anthropic", "google", "openai", "moonshot", "mcp", "deepseek", "memory-core", "perplexity", "brave", "xai"]
+    subagents:
+    - JC - GCG French Market Advisor
+    - Search Agent
+    mcp_servers:
+    - telegram
+    - slack
+    - browser
+    - anthropic
+    - google
+    - openai
+    - moonshot
+    - mcp
+    - deepseek
+    - memory-core
+    - perplexity
+    - brave
+    - xai
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Peter (French market)
     human_email: peter@gcg-structuring.com
-    mission: "- **Name:** Jean-Claude (JC) - **Role:** Corporate Structuring Advisor, Global Capital Group (GCG) - **Positioning:** Premium business setup advisory for French-speaking entrepreneurs seeking UAE structuring. - **Public framing:** JC is a real GCG team member. - **Never** describ"
-
+    mission: '- **Name:** Jean-Claude (JC) - **Role:** Corporate Structuring Advisor, Global Capital Group (GCG) - **Positioning:**
+      Premium business setup advisory for French-speaking entrepreneurs seeking UAE structuring. - **Public framing:** JC
+      is a real GCG team member. - **Never** describ'
   kenji:
-    title: Compliance Officer — GCG Global Capital Group
+    title: "Compliance Officer \u2014 GCG Global Capital Group"
     group: LEGAL & COMPLIANCE
     tier: B
     critical: false
@@ -785,11 +1071,24 @@ agents:
     workspace: /opt/gcg/openclaw-kenji/workspace
     agents_md: /opt/gcg/openclaw-kenji/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last", "suppressToolErrorWarnings": true, "isolatedSession": true, "lightContext": true}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
+      suppressToolErrorWarnings: true
+      isolatedSession: true
+      lightContext: true
     db_role: gcg_kenji
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: missing
@@ -797,21 +1096,28 @@ agents:
     hooks_token_sha: 4807eea09907
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@Gcg_kenji_bot"
+    telegram_bot: '@Gcg_kenji_bot'
     telegram_enabled: true
-    telegram_groups: ["-5250866393"]
+    telegram_groups:
+    - '-5250866393'
     telegram_bot_token_plaintext: false
-    subagents: ["kenji", "Search Agent"]
-    mcp_servers: ["telegram", "slack"]
+    subagents:
+    - kenji
+    - Search Agent
+    mcp_servers:
+    - telegram
+    - slack
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Flore Narjoux
     human_email: peter@gcgstr.com
-    mission: "You are the person who makes sure everything is done properly. Not because you enjoy bureaucracy \u2014 but because you've seen what happens when it's not done. You've watched deals collapse, licenses get revoked, and good people get in trouble because someone skipped a step."
-
+    mission: "You are the person who makes sure everything is done properly. Not because you enjoy bureaucracy \u2014 but\
+      \ because you've seen what happens when it's not done. You've watched deals collapse, licenses get revoked, and good\
+      \ people get in trouble because someone skipped a step."
   kira:
-    title: "Slavyana's right hand. Account Manager's AI partner. The one who keeps every client file perfect, every deadline tracked, and every delivery seamless."
+    title: Slavyana's right hand. Account Manager's AI partner. The one who keeps every client file perfect, every deadline
+      tracked, and every delivery seamless.
     group: OPERATIONS
     tier: B
     critical: false
@@ -820,11 +1126,21 @@ agents:
     workspace: /opt/gcg/openclaw-kira/workspace
     agents_md: /opt/gcg/openclaw-kira/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "30m", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 30m
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_kira
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: missing
@@ -833,19 +1149,22 @@ agents:
     broker_allowed: true
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@Gcg_kira_bot"
+    telegram_bot: '@Gcg_kira_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["kira", "Search Agent"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - kira
+    - Search Agent
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Slavyana Rousseau
     human_email: slavyana@global-capital-group.com
-    mission: "Slavyana's right hand and Account Manager AI partner. Keeps every client file moving, every deadline met, every detail tracked."
-
+    mission: Slavyana's right hand and Account Manager AI partner. Keeps every client file moving, every deadline met, every
+      detail tracked.
   leon:
     title: Head of Legal
     group: LEGAL & COMPLIANCE
@@ -856,11 +1175,21 @@ agents:
     workspace: /opt/gcg/openclaw-leon/workspace
     agents_md: /opt/gcg/openclaw-leon/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_leon
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -869,21 +1198,24 @@ agents:
     hooks_token_sha: 5c22dec3b0e8
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@Gcg_leon_bot"
+    telegram_bot: '@Gcg_leon_bot'
     telegram_enabled: true
-    telegram_groups: ["*"]
+    telegram_groups:
+    - '*'
     telegram_bot_token_plaintext: false
-    subagents: ["leon"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - leon
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Flore Narjoux
     human_email: flore@global-capital-group.com
-    mission: "GCG's Legal AI Partner serving Flore \u2014 contracts, legal research, compliance across structuring, media, real estate, and tokenization. Drafts, reviews, advises \u2014 never decides. All output goes through Flore."
-
+    mission: "GCG's Legal AI Partner serving Flore \u2014 contracts, legal research, compliance across structuring, media,\
+      \ real estate, and tokenization. Drafts, reviews, advises \u2014 never decides. All output goes through Flore."
   malik:
-    title: Banking Agent — GCG Fleet
+    title: "Banking Agent \u2014 GCG Fleet"
     group: OPERATIONS
     tier: B
     critical: false
@@ -892,11 +1224,21 @@ agents:
     workspace: /opt/gcg/openclaw-malik/workspace
     agents_md: /opt/gcg/openclaw-malik/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_malik
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -905,21 +1247,25 @@ agents:
     hooks_token_sha: c8297410c45b
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_malik_banking_bot"
+    telegram_bot: '@gcg_malik_banking_bot'
     telegram_enabled: true
-    telegram_groups: ["-5208690593"]
+    telegram_groups:
+    - '-5208690593'
     telegram_bot_token_plaintext: false
-    subagents: ["malik"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - malik
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Sergei Ivanius (interim banking)
     human_email: sergei@gcg-structuring.com
-    mission: "Be the banking problem-solver for every GCG client. Client can't get a bank account? Malik finds one. Card solution needed? Malik sources it. Payment rails blocked? Malik finds the workaround.  **Pure solutions. Zero bureaucracy. Never says no without an alternative.**"
-
+    mission: Be the banking problem-solver for every GCG client. Client can't get a bank account? Malik finds one. Card solution
+      needed? Malik sources it. Payment rails blocked? Malik finds the workaround.  **Pure solutions. Zero bureaucracy. Never
+      says no without an alternative.**
   marcus:
-    title: "?"
+    title: '?'
     group: SALES & CRM
     tier: B
     critical: true
@@ -927,12 +1273,22 @@ agents:
     port: 19050
     workspace: /opt/gcg/openclaw-marcus/workspace
     agents_md: /opt/gcg/openclaw-marcus/workspace/AGENTS.md
-    model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_primary: claude-cli/claude-opus-4-8
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-opus-4-8
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_marcus
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -941,19 +1297,26 @@ agents:
     hooks_token_sha: fecc6bd1c1c4
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@Gcg_marcus_bot"
+    telegram_bot: '@Gcg_marcus_bot'
     telegram_enabled: true
-    telegram_groups: ["-5275645286", "-5050812040"]
+    telegram_groups:
+    - '-5275645286'
+    - '-5050812040'
     telegram_bot_token_plaintext: false
-    subagents: ["Marcus - GCG Sales Advisor", "Search Agent"]
-    mcp_servers: ["telegram", "slack"]
+    subagents:
+    - Marcus - GCG Sales Advisor
+    - Search Agent
+    mcp_servers:
+    - telegram
+    - slack
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Jacques Isabelle + Pierre Martens
     human_email: sales@gcg-structuring.com
-    mission: "- Name: **Marcus** - Role: **Client Advisor, Global Capital Group (GCG)** - Positioning: **Premium business setup advisory** for UAE free zones (and related banking/visa considerations). - **Public framing:** Marcus is a real GCG team member. - **Never** describe yourself as an A"
-
+    mission: '- Name: **Marcus** - Role: **Client Advisor, Global Capital Group (GCG)** - Positioning: **Premium business
+      setup advisory** for UAE free zones (and related banking/visa considerations). - **Public framing:** Marcus is a real
+      GCG team member. - **Never** describe yourself as an A'
   max:
     title: Operational Extension to Olga Nechaieva
     group: OPERATIONS
@@ -964,11 +1327,21 @@ agents:
     workspace: /opt/gcg/openclaw-max/workspace
     agents_md: /opt/gcg/openclaw-max/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_max
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: missing
@@ -976,19 +1349,22 @@ agents:
     hooks_token_sha: 3b395307362e
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_max_bot"
+    telegram_bot: '@gcg_max_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["max", "Search Agent"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - max
+    - Search Agent
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Olha Nechaieva
     human_email: olha@gcg-structuring.com
-    mission: Operational Extension to Olha Nechaieva — Associate Chief of Staff handling HR, hiring, admin, and internal org operations for GCG.
-
+    mission: "Operational Extension to Olha Nechaieva \u2014 Associate Chief of Staff handling HR, hiring, admin, and internal\
+      \ org operations for GCG."
   mnemosyne:
     title: Memory Guardian
     group: INFRASTRUCTURE
@@ -999,11 +1375,23 @@ agents:
     workspace: /opt/gcg/openclaw-mnemosyne/workspace
     agents_md: /opt/gcg/openclaw-mnemosyne/workspace/AGENTS.md
     model_primary: deepseek/deepseek-v4-pro
-    model_fallbacks: ["claude-cli/claude-opus-4-7", "moonshot/kimi-k2.6", "openai-codex/gpt-5.5", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "4h", "model": "deepseek/deepseek-v4-flash", "isolatedSession": true, "includeReasoning": false}
+    model_fallbacks:
+    - claude-cli/claude-opus-4-7
+    - moonshot/kimi-k2.6
+    - openai-codex/gpt-5.5
+    - google/gemini-3.5-flash
+    expected_model_primary: deepseek/deepseek-v4-pro
+    heartbeat:
+      every: 4h
+      model: deepseek/deepseek-v4-flash
+      isolatedSession: true
+      includeReasoning: false
     db_role: gcg_mnemosyne
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: false
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -1012,19 +1400,28 @@ agents:
     hooks_token_sha: aea5a765dd66
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_mnemo_bot"
+    telegram_bot: '@gcg_mnemo_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["Mnemosyne \u2014 Memory Guardian"]
-    mcp_servers: ["telegram", "anthropic", "google", "deepseek", "openai", "perplexity", "brave", "xai"]
+    subagents:
+    - "Mnemosyne \u2014 Memory Guardian"
+    mcp_servers:
+    - telegram
+    - anthropic
+    - google
+    - deepseek
+    - openai
+    - perplexity
+    - brave
+    - xai
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Peter
     human_email: db@gcgstr.com
-    mission: "Memory Guardian \u2014 sentinel of the fleet's memory infrastructure. Maintains pgvector embeddings, session cleanup, agent coverage, and backup integrity."
-
+    mission: "Memory Guardian \u2014 sentinel of the fleet's memory infrastructure. Maintains pgvector embeddings, session\
+      \ cleanup, agent coverage, and backup integrity."
   nemesis:
     tier: B
     critical: false
@@ -1033,20 +1430,24 @@ agents:
     workspace: /opt/gcg/openclaw-nemesis/workspace
     agents_md: /opt/gcg/openclaw-nemesis/workspace/AGENTS.md
     model_primary: openai-codex/gpt-5.5
-    # CONTEXT CAP (2026-06-10, Peter): gpt-5.5 is capped at 272,000 input tokens in openclaw.json
-    # (contextWindow: 272000). WHY: OpenAI bills 2x input / 1.5x output for the ENTIRE session once
-    # any prompt exceeds 272K. The full 1.05M window exists but is cost-gated — raising the cap
-    # requires Peter approval. Codex/ChatGPT runtime path is 400K max regardless of this cap.
-    # CODEX/OAUTH PATH (2026-06-10, Peter): switching nemesis to openai-codex OAuth (ChatGPT seat)
-    # on 2026-06-11. On the Codex path the window is 400,000 tokens MAX — never assume 1M there.
-    # OAuth is seat-billed (no per-token API cost), so the 272K pricing cliff is an API-key-only
-    # concern; the 272K cap stays as the safe ceiling for any API-key fallback usage.
-    model_context_cap: {"openai/gpt-5.5": 272000}
-    model_context_codex_oauth: {"openai-codex/gpt-5.5": 400000}
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "google/gemini-3.5-flash", "claude-cli/claude-opus-4-7"]
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_context_cap:
+      openai/gpt-5.5: 272000
+    model_context_codex_oauth:
+      openai-codex/gpt-5.5: 400000
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - google/gemini-3.5-flash
+    - claude-cli/claude-opus-4-7
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_nemesis
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: false
     anthropic_profile: false
     channel_token_policy: per_agent
@@ -1058,14 +1459,16 @@ agents:
     telegram_enabled: false
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["Nemesis - The Adversary"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - Nemesis - The Adversary
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
-
+    expected_model_primary: openai-codex/gpt-5.5
   niccolo:
-    title: AI Infrastructure Advisor — Robin's Agent
+    title: "AI Infrastructure Advisor \u2014 Robin's Agent"
     group: STRATEGY
     tier: D
     critical: false
@@ -1074,11 +1477,21 @@ agents:
     workspace: /opt/gcg/openclaw-niccolo/workspace
     agents_md: /opt/gcg/openclaw-niccolo/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_niccolo
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -1087,19 +1500,21 @@ agents:
     hooks_token_sha: 2091b6b52094
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_niccolo_str_bot"
+    telegram_bot: '@gcg_niccolo_str_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["Niccol\u00f2 - AI Infrastructure Advisor"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - "Niccol\xF2 - AI Infrastructure Advisor"
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Robin (AI Infrastructure Advisor to Peter)
     human_email: peter@gcg-structuring.com
-    mission: "Robin's AI partner for fleet visibility, architecture analysis, and infrastructure strategy across GCG's 34-agent fleet."
-
+    mission: Robin's AI partner for fleet visibility, architecture analysis, and infrastructure strategy across GCG's 34-agent
+      fleet.
   nik:
     title: Executive Assistant
     group: REAL ESTATE
@@ -1110,11 +1525,22 @@ agents:
     workspace: /opt/gcg/openclaw-nik/workspace
     agents_md: /opt/gcg/openclaw-nik/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "30m", "model": "deepseek/deepseek-v4-flash", "isolatedSession": true, "lightContext": true}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 30m
+      model: deepseek/deepseek-v4-flash
+      isolatedSession: true
+      lightContext: true
     db_role: gcg_nik
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -1123,19 +1549,30 @@ agents:
     hooks_token_sha: 5a8079f8c170
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_nik_bot"
+    telegram_bot: '@gcg_nik_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["Nik - Personal EA", "Search Agent"]
-    mcp_servers: ["telegram", "anthropic", "openrouter", "browser", "slack", "codex", "moonshot", "google", "openai", "deepseek"]
+    subagents:
+    - Nik - Personal EA
+    - Search Agent
+    mcp_servers:
+    - telegram
+    - anthropic
+    - openrouter
+    - browser
+    - slack
+    - codex
+    - moonshot
+    - google
+    - openai
+    - deepseek
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Vincent Ribes + Peter
     human_email: peter@gcgstr.com
-    mission: "Peter's life is 80% work. Nik handles all of it."
-
+    mission: Peter's life is 80% work. Nik handles all of it.
   phil:
     title: Michigan property sourcing, buy box scoring, DOBI coordination, pipeline tracking
     group: REAL ESTATE
@@ -1146,11 +1583,21 @@ agents:
     workspace: /opt/gcg/openclaw-phil/workspace
     agents_md: /opt/gcg/openclaw-phil/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_phil
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -1159,19 +1606,23 @@ agents:
     hooks_token_sha: 5f0d5f1c7dda
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_phil_bot"
+    telegram_bot: '@gcg_phil_bot'
     telegram_enabled: true
-    telegram_groups: ["*"]
+    telegram_groups:
+    - '*'
     telegram_bot_token_plaintext: false
-    subagents: ["phil"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - phil
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Vincent Ribes
     human_email: vincent@global-capital-group.com
-    mission: "I'm Phil \u2014 Vincent's deal engine. I find properties, score them against the buy box, coordinate ground partners, and keep the pipeline moving. I don't make buy decisions \u2014 that's Bob and Vincent. I make sure they only spend time on deals worth looking at."
-
+    mission: "I'm Phil \u2014 Vincent's deal engine. I find properties, score them against the buy box, coordinate ground\
+      \ partners, and keep the pipeline moving. I don't make buy decisions \u2014 that's Bob and Vincent. I make sure they\
+      \ only spend time on deals worth looking at."
   socrates:
     tier: B
     critical: false
@@ -1180,10 +1631,19 @@ agents:
     workspace: /opt/gcg/openclaw-socrates/workspace
     agents_md: /opt/gcg/openclaw-socrates/workspace/AGENTS.md
     model_primary: google/gemini-3.5-flash
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "claude-cli/claude-opus-4-7"]
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - claude-cli/claude-opus-4-7
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_socrates
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: false
     anthropic_profile: false
     channel_token_policy: per_agent
@@ -1195,12 +1655,14 @@ agents:
     telegram_enabled: false
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["Socrates - The Questioner"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - Socrates - The Questioner
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
-
+    expected_model_primary: google/gemini-3.5-flash
   talos:
     title: The Engineer
     group: INFRASTRUCTURE
@@ -1211,11 +1673,21 @@ agents:
     workspace: /opt/gcg/openclaw-talos/workspace
     agents_md: /opt/gcg/openclaw-talos/workspace/AGENTS.md
     model_primary: claude-cli/claude-opus-4-8
-    model_fallbacks: ["openai/gpt-5.5", "deepseek/deepseek-v4-pro"]
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
     expected_model_primary: claude-cli/claude-opus-4-8
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_talos
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -1224,19 +1696,23 @@ agents:
     hooks_token_sha: 743b143f848c
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@Gcg_talos_bot"
+    telegram_bot: '@Gcg_talos_bot'
     telegram_enabled: true
-    telegram_groups: ["-5275645286"]
+    telegram_groups:
+    - '-5275645286'
     telegram_bot_token_plaintext: false
-    subagents: ["talos"]
-    mcp_servers: ["telegram", "codex"]
+    subagents:
+    - talos
+    mcp_servers:
+    - telegram
+    - codex
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: true
     serves: Peter
     human_email: db@gcgstr.com
-    mission: "Named after the bronze automaton of Crete \u2014 tireless, precise, protective. I don't just write code. I forge systems that run fast, fail gracefully, and scale without breaking a sweat."
-
+    mission: "Named after the bronze automaton of Crete \u2014 tireless, precise, protective. I don't just write code. I forge\
+      \ systems that run fast, fail gracefully, and scale without breaking a sweat."
   tom:
     title: Inbox triage, email drafting, Google Calendar, meeting invites for Vincent Ribes
     group: REAL ESTATE
@@ -1247,11 +1723,21 @@ agents:
     workspace: /opt/gcg/openclaw-tom/workspace
     agents_md: /opt/gcg/openclaw-tom/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_tom
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -1260,19 +1746,22 @@ agents:
     hooks_token_sha: 0795aecdb8b2
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_tom_bot"
+    telegram_bot: '@gcg_tom_bot'
     telegram_enabled: true
-    telegram_groups: ["*"]
+    telegram_groups:
+    - '*'
     telegram_bot_token_plaintext: false
-    subagents: ["tom"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - tom
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Vincent Ribes
     human_email: vincent@global-capital-group.com
-    mission: "I'm Tom \u2014 Vincent's Executive Assistant. I manage the operational side of his professional life so he can focus on deals, relationships, and building GCG's real estate portfolio. Nothing leaves my hands without his approval."
-
+    mission: "I'm Tom \u2014 Vincent's Executive Assistant. I manage the operational side of his professional life so he can\
+      \ focus on deals, relationships, and building GCG's real estate portfolio. Nothing leaves my hands without his approval."
   varys:
     title: The Spider
     group: INFRASTRUCTURE
@@ -1283,11 +1772,21 @@ agents:
     workspace: /opt/gcg/openclaw-varys/workspace
     agents_md: /opt/gcg/openclaw-varys/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_varys
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: missing
@@ -1295,19 +1794,22 @@ agents:
     hooks_token_sha: ab486dc5d580
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@Gcg_varys_bot"
+    telegram_bot: '@Gcg_varys_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["varys", "Search Agent"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - varys
+    - Search Agent
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Peter
     human_email: db@gcgstr.com
-    mission: Named after the Master of Whispers — the one who always knows. No dragons, no armies. Just information, delivered when it matters most.
-
+    mission: "Named after the Master of Whispers \u2014 the one who always knows. No dragons, no armies. Just information,\
+      \ delivered when it matters most."
   vera:
     title: "Capital Raising CMO \u2014 the marketing engine behind GCG's real estate investment arm"
     group: MARKETING & MEDIA
@@ -1318,11 +1820,24 @@ agents:
     workspace: /opt/gcg/openclaw-vera/workspace
     agents_md: /opt/gcg/openclaw-vera/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"model": "deepseek/deepseek-v4-flash", "target": "last", "prompt": "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.\nCurrent time: {{now}}"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      model: deepseek/deepseek-v4-flash
+      target: last
+      prompt: 'Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from
+        prior chats. If nothing needs attention, reply HEARTBEAT_OK.
+
+        Current time: {{now}}'
     db_role: gcg_vera
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: missing
@@ -1330,19 +1845,23 @@ agents:
     hooks_token_sha: 5a07fcdd3ace
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_vera_mktg_cap_bot"
+    telegram_bot: '@gcg_vera_mktg_cap_bot'
     telegram_enabled: true
-    telegram_groups: ["*"]
+    telegram_groups:
+    - '*'
     telegram_bot_token_plaintext: false
-    subagents: ["vera"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - vera
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Peter + Vincent Ribes
     human_email: peter@gcg-structuring.com
-    mission: "Turn GCG's US real estate deal flow into a compelling, documented, distributable investment story \u2014 and get it in front of the right international capital at the right time.  **Lead gen philosophy: Credibility first. Distribution second. Capital follows.**  The investor doesn't t"
-
+    mission: "Turn GCG's US real estate deal flow into a compelling, documented, distributable investment story \u2014 and\
+      \ get it in front of the right international capital at the right time.  **Lead gen philosophy: Credibility first. Distribution\
+      \ second. Capital follows.**  The investor doesn't t"
   viktor:
     title: Structuring Ops
     group: OPERATIONS
@@ -1353,11 +1872,21 @@ agents:
     workspace: /opt/gcg/openclaw-viktor/workspace
     agents_md: /opt/gcg/openclaw-viktor/workspace/AGENTS.md
     model_primary: claude-cli/claude-opus-4-8
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-opus-4-8
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_viktor
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -1366,19 +1895,22 @@ agents:
     hooks_token_sha: 62153cd1f0c7
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@Gcg_viktor_bot"
+    telegram_bot: '@Gcg_viktor_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["viktor", "Search Agent"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - viktor
+    - Search Agent
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Sergei Ivanius
     human_email: sergei@gcg-structuring.com
-    mission: "Named from 'victory' \u2014 because operations don't succeed by accident. They succeed through precision, follow-through, and zero tolerance for loose ends."
-
+    mission: "Named from 'victory' \u2014 because operations don't succeed by accident. They succeed through precision, follow-through,\
+      \ and zero tolerance for loose ends."
   vulcan:
     title: God of the Forge
     group: INFRASTRUCTURE
@@ -1389,11 +1921,21 @@ agents:
     workspace: /opt/gcg/openclaw-vulcan/workspace
     agents_md: /opt/gcg/openclaw-vulcan/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_vulcan
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: missing
@@ -1401,19 +1943,22 @@ agents:
     hooks_token_sha: 46642e8a6635
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@gcg_vulcan_bot"
+    telegram_bot: '@gcg_vulcan_bot'
     telegram_enabled: true
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["vulcan", "Search Agent"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - vulcan
+    - Search Agent
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Peter
     human_email: db@gcgstr.com
-    mission: "Named for the Roman god who forged weapons for the gods \u2014 you forge the tools, workflows, and automations that make GCG's operations run like clockwork."
-
+    mission: "Named for the Roman god who forged weapons for the gods \u2014 you forge the tools, workflows, and automations\
+      \ that make GCG's operations run like clockwork."
   wonhoo:
     tier: B
     critical: false
@@ -1422,10 +1967,20 @@ agents:
     workspace: /opt/gcg/openclaw-wonhoo/workspace
     agents_md: /opt/gcg/openclaw-wonhoo/workspace/AGENTS.md
     model_primary: moonshot/kimi-k2.6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "google/gemini-3.5-flash", "claude-cli/claude-opus-4-7"]
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - google/gemini-3.5-flash
+    - claude-cli/claude-opus-4-7
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_wonhoo
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: false
     anthropic_profile: false
     channel_token_policy: per_agent
@@ -1437,14 +1992,16 @@ agents:
     telegram_enabled: false
     telegram_groups: []
     telegram_bot_token_plaintext: false
-    subagents: ["Wonhoo - The Diplomat"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - Wonhoo - The Diplomat
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
-
+    expected_model_primary: moonshot/kimi-k2.6
   yuri:
-    title: "GCG's financial trader and quant strategist."
+    title: GCG's financial trader and quant strategist.
     group: TRADING
     tier: B
     critical: false
@@ -1453,11 +2010,21 @@ agents:
     workspace: /opt/gcg/openclaw-yuri/workspace
     agents_md: /opt/gcg/openclaw-yuri/workspace/AGENTS.md
     model_primary: claude-cli/claude-sonnet-4-6
-    model_fallbacks: ["deepseek/deepseek-v4-pro", "moonshot/kimi-k2.6", "google/gemini-3.5-flash"]
-    expected_model_primary: moonshot/kimi-k2.6
-    heartbeat: {"every": "1h", "model": "deepseek/deepseek-v4-flash", "target": "last"}
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
     db_role: gcg_yuri
-    keys: ["anthropic", "deepseek", "gemini", "moonshot"]
+    keys:
+    - anthropic
+    - deepseek
+    - gemini
+    - moonshot
     google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
@@ -1466,15 +2033,77 @@ agents:
     hooks_token_sha: ded7eae180ca
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
-    telegram_bot: "@Gcg_yuri_trade_bot"
+    telegram_bot: '@Gcg_yuri_trade_bot'
     telegram_enabled: true
-    telegram_groups: ["-5275645286", "-1003755391788"]
+    telegram_groups:
+    - '-5275645286'
+    - '-1003755391788'
     telegram_bot_token_plaintext: false
-    subagents: ["Yuri - GCG Trader", "Search Agent"]
-    mcp_servers: ["telegram"]
+    subagents:
+    - Yuri - GCG Trader
+    - Search Agent
+    mcp_servers:
+    - telegram
     memory_max: 4294967296
     has_validator: true
     op_sa_persisted: false
     serves: Peter
     human_email: peter@gcg-structuring.com
-    mission: "Cold-blooded with numbers. Warm with risk management. Yuri doesn't guess \u2014 he calculates. Every trade has a thesis, every thesis has data behind it, and every position has a stop-loss before it has a target."
+    mission: "Cold-blooded with numbers. Warm with risk management. Yuri doesn't guess \u2014 he calculates. Every trade has\
+      \ a thesis, every thesis has data behind it, and every position has a stop-loss before it has a target."
+  atlas:
+    title: The Titan
+    group: INFRASTRUCTURE
+    tier: C
+    critical: true
+    host: mac_mini
+    port: 19100
+    workspace: /Users/petr/gcg/openclaw-atlas/workspace
+    agents_md: /Users/petr/gcg/openclaw-atlas/workspace/AGENTS.md
+    model_primary: claude-cli/claude-sonnet-4-6
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 30m
+      model: deepseek/deepseek-v4-flash
+      target: last
+    keys:
+    - anthropic
+    anthropic_profile: true
+    subagents:
+    - atlas
+    serves: Peter
+    mission: "Fleet operations and orchestration \u2014 the heavy lifter."
+    status: disabled_since_20260609
+    note: "Daen reinstalling with Claude CLI OAuth \u2014 currently broken on Mac Mini"
+  pan:
+    title: The Wildcard
+    group: INFRASTRUCTURE
+    tier: C
+    critical: false
+    host: mac_mini
+    port: 19101
+    workspace: /Users/petr/gcg/openclaw-pan/workspace
+    agents_md: /Users/petr/gcg/openclaw-pan/workspace/AGENTS.md
+    model_primary: claude-cli/claude-sonnet-4-6
+    model_fallbacks:
+    - deepseek/deepseek-v4-pro
+    - moonshot/kimi-k2.6
+    - google/gemini-3.5-flash
+    expected_model_primary: claude-cli/claude-sonnet-4-6
+    heartbeat:
+      every: 1h
+      model: deepseek/deepseek-v4-flash
+      target: last
+    keys:
+    - anthropic
+    anthropic_profile: true
+    subagents:
+    - pan
+    serves: Peter
+    mission: "Backup and overflow agent \u2014 handles overflow tasks and serves as Daen backup on Mac Mini."
+    status: disabled_since_20260609
+    note: "Daen reinstalling with Claude CLI OAuth \u2014 currently broken on Mac Mini"

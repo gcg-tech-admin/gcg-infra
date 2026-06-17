@@ -168,8 +168,7 @@ if [ "$REPAIR" -eq 1 ]; then
         _psql -v mid="$mid" -v canon="$canon" <<'REPAIR_SQL'
 UPDATE agent_messages
    SET recipient = :'canon',
-       payload = jsonb_set(payload, '{_repaired_from}', to_jsonb(recipient::text), true),
-       updated_at = NOW()
+       payload = jsonb_set(payload, '{_repaired_from}', to_jsonb(recipient::text), true)
  WHERE id = :'mid'::bigint
    AND status NOT IN ('done', 'failed', 'cancelled');
 REPAIR_SQL

@@ -1,6 +1,6 @@
 #!/bin/bash
 # gcg-inbox-poll — one-shot inbox drain + wake for a single agent.
-# POLLER_VERSION=13.7 (2026-06-15: DELIVERY-RACE FIX — zombie-guard grace 2min->12min + re-poke window 15min->30min, so slow/degrading-OAuth agents (Vulcan) are not false-failed as 'undeliverable' before they start. Effective deadline ~42min; genuinely-dead tasks still cleaned.)
+# POLLER_VERSION=13.8 (2026-06-16: J2-FIX — Pass 6 now excludes human_gate task types (decision, revert_request) from auto-QA dispatch, matching derive_gate_kind. decision tasks with owner_type=agent are still human_gate and route directly to human approval.)
 # POLLER_VERSION=13.6 (2026-06-14: QA-DISPATCH-GATE — Pass 6 only dispatches QA for task_type IN ('standard','decision'). Fixes reply/result/message/notification types wrongly getting qa_review subtasks.
 # POLLER_VERSION=13.5 (2026-06-14: CASCADE-AUTO-ADVANCE — Pass 3b exempts plan_authorized tasks
 #                      from 30-min approval timeout. Pass 3d auto-dones plan_authorized parents
@@ -293,6 +293,9 @@ WITH src AS (
      AND input_required_at IS NULL
      AND verified_by IS NULL
      AND qa_tier IS DISTINCT FROM 'trivial'
+     -- Throwaway test tasks (sender='test') never enter the QA gate — they auto-complete.
+     -- Stops needs_acceptance_criteria FAIL spam on disposable test rows.
+     AND sender IS DISTINCT FROM 'test'
      AND (
        -- Human decision gate: always park these for human approval
        task_type = 'decision'
@@ -316,6 +319,9 @@ SQL
   [ "$IR_BOUNCED" -gt 0 ] && echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] ir_bounced=$IR_BOUNCED" >&2
 
   # 3b. Auto-fail input-required tasks past the 30-min approval window.
+  # GATE_KIND: human_gate tasks (owner_type='human', task_type='decision'/'revert_request')
+  # are EXEMPT from auto-fail — they wait indefinitely for a human (gentle 7d reminder in 3c).
+  # work_qa_gate tasks (standard/high_stakes with agent owner) auto-fail after 30min.
   # EXEMPTIONS:
   #   - human-gated tasks (owner_type='human' OR task_type='decision') — wait for human; reminder at 7d
   #   - tasks with qa_dispatched=true — waiting for agent QA (not human); QA subtask has its own timeout
@@ -333,6 +339,9 @@ WITH src AS (
      AND task_type NOT IN ('decision', 'revert_request')
      AND qa_dispatched = false
      AND (plan_authorized IS NOT TRUE)
+     -- high_stakes post-QA approval gate is human-paced (Daen) — exempt from auto-fail.
+     -- Matches gate_kind.is_exempt_from_auto_fail(work_qa_gate, high_stakes)=True.
+     AND NOT (qa_tier = 'high_stakes' AND agent_qa_by IS NOT NULL)
    RETURNING 1
 )
 SELECT COUNT(*) FROM src;
@@ -509,6 +518,11 @@ SQL2
   fi
 
   # ── Pass 6: auto-QA-dispatch ───────────────────────────────────────────────
+  # GATE_KIND: only work_qa_gate tasks get auto-QA-dispatched.
+  # human_gate tasks (owner_type='human', task_type='decision'/'revert_request')
+  # are excluded — they wait for a human approver, not an agent QA reviewer.
+  # Pass 6 matches derive_gate_kind: owner_type != human AND task_type NOT IN
+  # (decision, revert_request) → always work_qa_gate, never human_gate.
   # For every task in input-required state that needs agent QA (standard/high_stakes,
   # agent_qa_by IS NULL, not yet dispatched, not a human-gate task), auto-create a
   # qa_review subtask for the QA agent with a full context bundle.
@@ -538,8 +552,9 @@ SELECT am.id,
    AND am.agent_qa_by      IS NULL
    AND am.qa_dispatched    = false
    AND (am.owner_type      IS DISTINCT FROM 'human')
-   AND (am.task_type       IN ('standard', 'decision'))
+   AND (am.task_type       NOT IN ('decision', 'revert_request'))
    AND NOT (am.task_type = 'deploy_approval' AND am.plan_authorized = false)
+   AND am.sender IS DISTINCT FROM 'test'
    AND (am.accountable_owner = :'agent' OR am.sender = :'agent' OR am.recipient = :'agent')
  ORDER BY am.id
  LIMIT 20;
@@ -581,22 +596,26 @@ Original task:
 ${T_TEXT}
 
 Acceptance criteria:
-${T_ACCEPTANCE:-NONE — flag as needs_acceptance_criteria and FAIL}
+${T_ACCEPTANCE:-NONE — if empty, infer concrete checks from the task text}
 
-Doer artifacts:
+(Optional doer notes — NOT required and NOT the basis for your verdict):
 ${T_ARTIFACTS}
 
 Project correlation_id: ${T_CORR}
 
-Instructions:
-1. Use the project-context skill to recall relevant architecture/schema for this task.
-2. For schema/data tasks, load the DB schema pack first via pgvector recall.
-3. Evaluate whether the artifacts meet the acceptance criteria above.
-4. If acceptance criteria is empty/missing: verdict = FAIL, reason = 'needs_acceptance_criteria'.
-5. Call POST /tasks/${TASK_ID}/qa-verify with your verdict (pass/fail) and reasoning.
-   - verdict=pass if artifacts satisfy ALL stated acceptance criteria.
-   - verdict=fail otherwise (include which criterion failed and why).
-6. Record which context sources you used (architecture docs, schema) in your reasoning."
+Instructions — VERIFY AGAINST THE LIVE SYSTEM, not a self-reported artifacts blob
+(Peter directive 2026-06-16: artifacts gate SCRAPPED — proof is reality, not what the doer claims):
+1. Use the project-context skill / pgvector recall for relevant architecture/schema.
+2. Independently CHECK each acceptance criterion against reality yourself — curl the endpoint,
+   query the DB, load the page, run the test. The live system is the source of truth.
+3. Do NOT fail a task merely because the doer submitted no artifacts. Fail ONLY if the live
+   system does not meet the acceptance criteria.
+4. If acceptance criteria are missing AND you cannot infer concrete checks from the task text,
+   verdict = FAIL, reason = 'needs_acceptance_criteria'.
+5. Call POST /tasks/${TASK_ID}/qa-verify with your verdict (pass/fail) and your LIVE evidence.
+   - verdict=pass if the live system satisfies ALL acceptance criteria (state what you checked).
+   - verdict=fail otherwise (include which criterion failed, with the live evidence).
+6. Record exactly what you checked (URLs, queries, results) in your reasoning."
 
       # Mark dispatched BEFORE inserting subtask (prevents race on concurrent pollers)
       MARK_OK=$(_psql -F '' -v tid="$TASK_ID" <<'SQL3'

@@ -1,0 +1,24 @@
+[Unit]
+Description=GCG Outcome Signal Detection Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/outcome_signal_daemon.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+Environment=POLL_INTERVAL=30
+Environment=FLUSH_INTERVAL=300
+
+# Security hardening
+ProtectSystem=strict
+ReadWritePaths=/opt/gcg
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

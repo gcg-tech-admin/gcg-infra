@@ -25,6 +25,8 @@
 #   check --inbox-stale --threshold N [--agent A]
 #                                 — exit 1 + list if any pending/delivered row older than N s
 #   chain <id> <dep_id>           — safely add dep_id to blocked_by for id, REJECT if cycle
+#   qa-pass <id> [reason]         — QA verdict: pass (DB-direct, self-auth via tokens.json)
+#   qa-fail <id> <reason>         — QA verdict: fail (bounces to input-required)
 #
 # DB credentials: /opt/gcg/shared/credentials/db/gcg_fleet.pwd
 
@@ -226,6 +228,19 @@ cmd_send() {
       *)                   break;;
     esac
   done
+  # ── Cascade-First guard (Phase 1.5): message-type asks must use fleet decide ──
+  # Detected BEFORE the INSERT so we reject early and suggest the correct command.
+  # Bypass for legitimate system/automated senders (e.g. council_loop dispatch, which
+  # contains "?" in reviewer prompts): set FLEET_SKIP_CASCADE_GUARD=1. (Daen 2026-06-16:
+  # the bare \? in the pattern was blocking the Council's own dispatch.)
+  if [ "$ttype" = "message" ] && [ "${FLEET_SKIP_CASCADE_GUARD:-}" != "1" ]; then
+    local _cf_lower; _cf_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
+    if echo "$_cf_lower" | grep -qE '(please|pls|can you|could you).*(review|approve|sign off|check|verify|decide|confirm|authorize|look at|take a look)|\?'; then
+      echo "refused: this message looks like a review/approval request (Cascade-First)." >&2
+      echo "Use 'fleet decide ${1} \"${*}\"' instead — decision tasks have proper gate tracking." >&2
+      exit 7
+    fi
+  fi
   local raw_to="${1:?usage: fleet send [--from S] <to> <msg>}"; shift
   local to; to=$(_canonical_recipient "$raw_to")
   local msg="${*:?usage: fleet send [--from S] <to> <msg>}"
@@ -708,6 +723,147 @@ SQL
   echo "To approve: fleet approve ${revert_id}  (or via The Forge UI)"
 }
 
+cmd_qa_pass() {
+  # fleet qa-pass <id> [reason] — DB-direct QA verdict (no HTTP endpoint needed).
+  # Phase 1.3: replaces the non-existent /api/tasks/{id}/qa-verify HTTP endpoint.
+  # Phase 2 (2026-06-16): branches on qa_tier — standard→done, high_stakes→input-required(daen).
+  # Self-auth via /opt/gcg/shared/credentials/fleet-api-tokens.json.
+  local id="${1:?usage: fleet qa-pass <id> [reason]}"; shift
+  local reason="${*:-QA passed}"
+  local actor; actor=$(_resolve_sender)
+
+  # Self-auth: caller must have a token entry
+  local tok_file="/opt/gcg/shared/credentials/fleet-api-tokens.json"
+  if ! python3 -c "
+import json
+data = json.load(open('$tok_file'))
+found = any(e['actor'] == '$actor' for e in data.get('tokens', {}).values())
+exit(0 if found else 1)
+" 2>/dev/null; then
+    echo "fleet qa-pass: actor '$actor' not authorized (no token in fleet-api-tokens.json)" >&2
+    exit 1
+  fi
+
+  # Read qa_tier + agent_qa_by + verified_by to branch standard vs high_stakes
+  local meta; meta=$(_psql -tA -v id="$id" <<<"SELECT qa_tier, agent_qa_by, verified_by FROM agent_messages WHERE id = :'id'::bigint LIMIT 1;" 2>/dev/null || true)
+  if [ -z "$meta" ]; then
+    echo "fleet qa-pass: task #$id not found" >&2
+    exit 2
+  fi
+  local qa_tier;  qa_tier=$(echo "$meta" | cut -d'|' -f1)
+  local existing_qa; existing_qa=$(echo "$meta" | cut -d'|' -f2)
+  local existing_vb; existing_vb=$(echo "$meta" | cut -d'|' -f3)
+  qa_tier="${qa_tier:-standard}"
+
+  # Idempotent: already QA'd (agent_qa_by for high_stakes, verified_by for standard)
+  if [ -n "$existing_qa" ] || [ -n "$existing_vb" ]; then
+    local who="${existing_qa:-$existing_vb}"
+    echo "fleet qa-pass: task #$id already QA'd by ${who} (no-op)" >&2
+    exit 0
+  fi
+
+  local result
+  if [ "$qa_tier" = "high_stakes" ]; then
+    # ── HIGH_STAKES: QA pass → park for Daen approval (NOT auto-done) ──
+    # Owner stays 'agent' (daen), owner≠approver enforces non-self-approval.
+    # Exempt from 30-min auto-fail (Daen's review is human-paced).
+    result=$(_psql -tA -v id="$id" -v actor="$actor" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET agent_qa_by         = :'actor',
+       verified_by         = :'actor',
+       verified_actor_type = 'agent',
+       verified_at         = NOW(),
+       status              = 'input-required',
+       input_required_at   = NOW(),
+       accountable_owner   = 'daen',
+       owner_type          = 'agent',
+       blocked_reason      = NULL,
+       progress_note       = COALESCE(progress_note, '') ||
+                             E'\n[qa-pass high_stakes] ' || :'actor' || ': ' || :'reason' ||
+                             E'\n[gate] awaiting daen approval'
+ WHERE id = :'id'::bigint
+   AND agent_qa_by IS NULL
+RETURNING id, agent_qa_by;
+SQL
+    )
+    if [ -z "$result" ]; then
+      echo "fleet qa-pass: task #$id already QA'd (no-op)" >&2
+      exit 0
+    fi
+    echo "qa-pass: task #$id verified by $actor — parked for daen approval (high_stakes)"
+  else
+    # ── STANDARD: QA pass → done (no human gate) ──
+    result=$(_psql -tA -v id="$id" -v actor="$actor" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET verified_by         = :'actor',
+       verified_actor_type = 'agent',
+       verified_at         = NOW(),
+       status              = 'done',
+       done_at             = NOW(),
+       progress_note       = COALESCE(progress_note, '') ||
+                             E'\n[qa-pass] ' || :'actor' || ': ' || :'reason'
+ WHERE id = :'id'::bigint
+   AND verified_by IS NULL
+RETURNING id, verified_by;
+SQL
+    )
+    if [ -z "$result" ]; then
+      local existing; existing=$(_psql -tA -v id="$id" <<<"SELECT verified_by FROM agent_messages WHERE id = :'id'::bigint;" 2>/dev/null || true)
+      echo "fleet qa-pass: task #$id already verified by ${existing:-?} (no-op)" >&2
+      exit 0
+    fi
+    echo "qa-pass: task #$id verified by $actor — done"
+  fi
+}
+
+cmd_qa_fail() {
+  # fleet qa-fail <id> <reason> — DB-direct QA failure verdict.
+  # Phase 1.3: same self-auth as qa-pass.
+  # Bounces task back to input-required with failure reason.
+  local id="${1:?usage: fleet qa-fail <id> <reason>}"; shift
+  local reason="${*:?reason required}"
+  local actor; actor=$(_resolve_sender)
+
+  local tok_file="/opt/gcg/shared/credentials/fleet-api-tokens.json"
+  if ! python3 -c "
+import json
+data = json.load(open('$tok_file'))
+found = any(e['actor'] == '$actor' for e in data.get('tokens', {}).values())
+exit(0 if found else 1)
+" 2>/dev/null; then
+    echo "fleet qa-fail: actor '$actor' not authorized (no token in fleet-api-tokens.json)" >&2
+    exit 1
+  fi
+
+  local exists; exists=$(_psql -tA -v id="$id" <<<"SELECT 1 FROM agent_messages WHERE id = :'id'::bigint LIMIT 1;" 2>/dev/null || true)
+  if [ -z "$exists" ]; then
+    echo "fleet qa-fail: task #$id not found" >&2
+    exit 2
+  fi
+
+  local result
+  result=$(_psql -tA -v id="$id" -v actor="$actor" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET verified_by         = :'actor',
+       verified_actor_type = 'agent',
+       verified_at         = NOW(),
+       blocked_reason      = COALESCE(blocked_reason || ' ', '') ||
+                             'QA FAIL [' || :'actor' || ']: ' || :'reason',
+       status              = 'input-required',
+       input_required_at   = NOW(),
+       progress_note       = COALESCE(progress_note, '') ||
+                             E'\n[qa-fail] ' || :'actor' || ': ' || :'reason'
+ WHERE id = :'id'::bigint
+RETURNING id, verified_by;
+SQL
+  )
+  if [ -z "$result" ]; then
+    echo "fleet qa-fail: task #$id not found or already terminal" >&2
+    exit 2
+  fi
+  echo "qa-fail: task #$id failed QA by $actor — $reason"
+}
+
 cmd_deploy_gate() {
   # fleet deploy-gate [--from <sender>] [--task <code_task_id>] [--commit <sha>] "<description>"
   # Raises a high_stakes deploy-approval that parks in The Forge for Daen (prod DECISION owner).
@@ -938,6 +1094,8 @@ case "$CMD" in
   revert)       cmd_revert "$@" ;;
   decide)       cmd_decide "$@" ;;
   deploy-gate)  cmd_deploy_gate "$@" ;;
+  qa-pass)      cmd_qa_pass "$@" ;;
+  qa-fail)      cmd_qa_fail "$@" ;;
   help|-h|--help)
     sed -n '2,28p' "$0" ; exit 0 ;;
   *)

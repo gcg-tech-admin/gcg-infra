@@ -1,6 +1,25 @@
-# FLEET_INDEX.md # Boot map for all GCG agents. Load on startup. Fetch only what you need. # Last updated: 2026-06-01 | Owner: Daen 
+# FLEET_INDEX.md # Boot map for all GCG agents. Load on startup. Fetch only what you need. # Last updated: 2026-06-16 | Owner: Daen 
 
 ---
+
+## UPDATE LOG — 2026-06-16
+
+### Model Roster Standardized (Peter)
+- **Primary models:** Opus-4-8 for marcus/daen/viktor/talos. Sonnet-4-6 for all other OAuth agents. Kimi-k2.6 for wonhoo.
+- **Fallback chain fleet-wide:** deepseek-v4-pro(thinking=on) → kimi-k2.6 → gemini-3.5-flash
+- **Subagent lanes (canonical):** Research=deepseek-v4-pro, Audit/QA=deepseek-v4-pro, Code=sonnet-4-6, Execution=deepseek-v4-flash. thinking=off all lanes. Fallback: spawn fails → retry next in lane, max 3.
+- **gemini-3.5-flash + kimi-k2.6 APPROVED for subagents** — both tested live, no hallucinations (Peter 2026-06-16).
+- **Talos live config fixed:** was sonnet-4-6 → now opus-4-8 (drift caught and corrected).
+- **FLEET.yaml updated:** added atlas + pan agents, expected_model_primary for new agents, subagent_lanes in model_policy.
+- Canonical: FLEET.yaml §model_policy.subagent_lanes
+
+### Daen OAuth Sub Rotated
+- Daen moved sub-maruf → sub-sergei (Peter directive 2026-06-16). sub-sergei AUTH_OK verified. Logged to subscription-rotation-log.md.
+
+### Atlas & Pan Status (Mac Mini)
+- Both DISABLED on Mac Mini since 2026-06-09. LaunchAgents in `.disabled-20260609/`.
+- Root cause: Claude CLI v2.1.114 too old, OAuth creds invalid (401). Daen was reinstalling with Claude CLI OAuth — broke. Fix needs: update Claude CLI → re-auth OAuth → update model config (was fable-5, should be sonnet-4-6) → re-enable LaunchAgents.
+- Talos now has Mac Mini SSH access (key: /root/.ssh/id_ed25519_ax102_to_macmini from May 25).
 
 
 ## UPDATE LOG — 2026-06-01
@@ -82,8 +101,7 @@ Canonical DB access section added below. All agents reach PostgreSQL via VLAN (A
 ---
 
 ## MODEL POLICY Which model for which task (canonical, Peter-approved): → `/opt/gcg/shared/docs/architecture/FLEET_MODEL_DECISIONS.md` → `/opt/gcg/shared/docs/sops/MODEL_ROUTING_MATRIX.md` → `/opt/gcg/shared/config/model_policy.yaml` → `/opt/gcg/shared/config/model_pricing.yaml` → `/opt/gcg/shared/config/subagent_policy.yaml` 
-### ⚠️ Subagent Dispatch Reliability (2026-05-03) Gemini models are CURRENTLY UNRELIABLE for `sessions_spawn` execution work: - `google/gemini-3.1-pro-preview` — silent 120s timeouts, session aborts before fallback engages - `google/gemini-3.1-flash-lite-preview` — hallucinates completions (claims done, executes zero tools)
- **Use for execution subagents:** `deepseek/deepseek-v4-flash` ($0.14/$0.28 per M, 1M ctx) for deterministic file/config tasks. `moonshot/kimi-k2.6` ($0.60/$2.50 per M) for tool-use heavy or judgment tasks. See MODEL_ROUTING_MATRIX.md for full failure log + cost table. 
+### ⚠️ Subagent Dispatch (2026-06-16 UPDATE) **gemini-3.5-flash and kimi-k2.6 are APPROVED for subagents** — tested live, both work, no hallucinations (Peter 2026-06-16). Previous ban lifted. See FLEET.yaml §model_policy.subagent_lanes for canonical lane matrix. 
 
 ---
 

@@ -55,9 +55,24 @@ fi
 [ -r "$CREDENTIALS_DIRECTORY/op-sa-token" ] || { echo "ERROR: no op-sa-token cred" >&2; exit 3; }
 export OP_SERVICE_ACCOUNT_TOKEN=$(cat "$CREDENTIALS_DIRECTORY/op-sa-token")
 
+# ── Anthropic API key drift gate (Peter directive 2026-06-16) ──
+# DEFAULT-OFF: ANTHROPIC_API_KEY is NOT injected into agent env/auth-profiles.
+# Fleet uses OAuth (claude-cli/*) exclusively. Key injection requires explicit opt-in:
+#   touch /opt/gcg/shared/credentials/.allow-anthropic-api-key
+#   OR: GCG_ALLOW_ANTHROPIC_API_KEY=1 in environment
+# RT-9 consensus model reads key from 1Password at call-time — not affected.
+ALLOW_ANTHROPIC_KEY=false
+if [ -f /opt/gcg/shared/credentials/.allow-anthropic-api-key ] || [ "${GCG_ALLOW_ANTHROPIC_API_KEY:-}" = "1" ]; then
+  ALLOW_ANTHROPIC_KEY=true
+fi
+
 # Shared keys — single Anthropic key for fleet, available but NOT for recurring/heartbeat use
 # UUID-based path: item title "Anthropic / Claude API key" contains literal "/" which collides with op:// separator.
-ANTHROPIC_KEY=$(op read "op://GCG Agent Fleet/7jmhrwkjtm62mfx3bnpebf72ki/password" 2>/dev/null || true)
+if $ALLOW_ANTHROPIC_KEY; then
+  ANTHROPIC_KEY=$(op read "op://GCG Agent Fleet/7jmhrwkjtm62mfx3bnpebf72ki/password" 2>/dev/null || true)
+else
+  ANTHROPIC_KEY=""
+fi
 DEEPSEEK_KEY=$(op read "op://GCG Agent Fleet/Deepseek API/password" 2>/dev/null || true)
 MOONSHOT_KEY=$(op read "op://GCG Agent Fleet/Moonshot Kimi/credential" 2>/dev/null || true)
 GEMINI_KEY=$(op read   "op://GCG Agent Fleet/Gemini Api Key/password" 2>/dev/null || true)
@@ -70,7 +85,10 @@ OPENAI_KEY=$(op read "op://GCG Agent Fleet/qlowj7vobk3twfl66rw4cso544/password" 
   [ -n "$TG_LINE" ]        && echo "$TG_LINE"
   [ -n "$SLACK_BOT_LINE" ] && echo "$SLACK_BOT_LINE"
   [ -n "$SLACK_APP_LINE" ] && echo "$SLACK_APP_LINE"
-  [ -n "$ANTHROPIC_KEY" ]  && echo "ANTHROPIC_API_KEY=$ANTHROPIC_KEY"
+  if $ALLOW_ANTHROPIC_KEY && [ -n "$ANTHROPIC_KEY" ]; then
+    echo "ANTHROPIC_API_KEY=$ANTHROPIC_KEY"
+    echo "gcg-secret-bootstrap: $AGENT ANTHROPIC_API_KEY injected (opt-in enabled)"
+  fi
   [ -n "$DEEPSEEK_KEY" ]   && echo "DEEPSEEK_API_KEY=$DEEPSEEK_KEY"
   if [ -n "$MOONSHOT_KEY" ]; then
     echo "MOONSHOT_API_KEY=$MOONSHOT_KEY"
@@ -117,7 +135,8 @@ esac
 
 # Anthropic auth-profile (api_key) into openclaw auth-profiles.json — tmpfs+symlink for zero-plaintext compliance.
 # Bootstrap is single source of 1Password truth; openclaw reads merged profile at process start.
-if [ -n "$ANTHROPIC_KEY" ]; then
+# GATED 2026-06-16: only injected when ALLOW_ANTHROPIC_KEY is true (DEFAULT-OFF).
+if $ALLOW_ANTHROPIC_KEY && [ -n "$ANTHROPIC_KEY" ]; then
   for SUBAGENT in main search; do
     AGENT_DIR="/opt/gcg/openclaw-${AGENT}/state/.openclaw/agents/${SUBAGENT}/agent"
     [ -d "$AGENT_DIR" ] || continue

@@ -1,0 +1,14 @@
+[Unit]
+Description=GCG a2a inbox disk-side drainer for agent %i (archives notification noise + dup decisions)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/gcg-inbox-drain %i
+User=root
+Nice=10
+MemoryMax=64M
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+ReadWritePaths=/opt/gcg

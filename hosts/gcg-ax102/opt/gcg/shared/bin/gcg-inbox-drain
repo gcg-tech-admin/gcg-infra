@@ -1,0 +1,77 @@
+#!/bin/bash
+# gcg-inbox-drain v1 — disk-side inbox sweeper (2026-06-16)
+#
+# WHY THIS EXISTS:
+#   The DB bus is kept clean by gcg-inbox-poll (Pass 0 auto-closes notifications)
+#   and gcg-inbox-janitor (DB row cleanup). But NEITHER touches the JSON files
+#   already materialized on disk in <agent>-incoming/. Daen is the only agent
+#   pointed at the "Pass 7 on-complete daen-ping" firehose — every task that
+#   reaches done/failed pings daen as a notification file. Those files have no
+#   sweeper and pile up indefinitely (187 accumulated by 2026-06-16).
+#
+# WHAT IT DOES (per agent, conservative — MOVE not delete):
+#   1. Archive pure-noise files to processed/:
+#        - task_type == "notification"
+#        - payload text matches "task #N reached done|failed"
+#   2. Dedup "DECISION NEEDED — task #N" by task id: keep newest, archive rest.
+#      (NOTE: correlation_id is a THREAD id, not a message id — many distinct
+#       messages share one. NEVER dedup on it; that discards real work.)
+#   It NEVER touches real messages, replies, escalations, or council items.
+#
+# Usage:   gcg-inbox-drain <agent> [--dry-run]
+# Convention matches gcg-inbox-surface/evidence-check (systemd timer).
+
+set -euo pipefail
+
+AGENT="${1:-}"
+[[ -z "$AGENT" ]] && { echo "usage: gcg-inbox-drain <agent> [--dry-run]" >&2; exit 1; }
+DRY_RUN=false
+[[ "${2:-}" == "--dry-run" ]] && DRY_RUN=true
+
+INBOX="/opt/gcg/openclaw-${AGENT}/workspace/inbox"
+INCOMING="${INBOX}/${AGENT}-incoming"
+PROCESSED="${INBOX}/processed"
+
+[[ -d "$INCOMING" ]] || { echo "no incoming dir: $INCOMING" >&2; exit 0; }
+mkdir -p "$PROCESSED"
+
+log() { echo "$(date -u +%FT%TZ) gcg-inbox-drain[$AGENT] $*" >&2; }
+move() {  # move file -> processed/, or report in dry-run
+  local f="$1" reason="$2"
+  if $DRY_RUN; then log "[DRY] would archive $(basename "$f") ($reason)"; else
+    mv -f "$f" "$PROCESSED/" && log "archived $(basename "$f") ($reason)"
+  fi
+}
+
+# Collect unprocessed files (skip already-marked .done.json)
+mapfile -t FILES < <(ls -1t "$INCOMING"/*.json 2>/dev/null | grep -v '\.done\.json$' || true)
+[[ ${#FILES[@]} -eq 0 ]] && { log "nothing to drain"; exit 0; }
+
+declare -A SEEN_DECISION # decision task id -> already kept one
+archived=0; kept=0
+
+field() { { grep -o "\"$2\": \"[^\"]*\"" "$1" 2>/dev/null | head -1 | sed "s/\"$2\": \"//; s/\"$//"; } || true; }
+
+for f in "${FILES[@]}"; do
+  [[ -f "$f" ]] || continue
+  ttype=$(field "$f" task_type)
+  text=$(field "$f" text)
+
+  # 1. Pure noise: notifications + reached done/failed
+  if [[ "$ttype" == "notification" ]] || [[ "$text" =~ reached\ (done|failed) ]]; then
+    move "$f" "noise:${ttype:-notif}"; archived=$((archived+1)); continue
+  fi
+
+  # 2. Dedup "DECISION NEEDED — task #N" by task id (identical cascade re-fires)
+  if [[ "$text" =~ DECISION\ NEEDED.*task\ #([0-9]+) ]]; then
+    tid="${BASH_REMATCH[1]}"
+    if [[ -n "${SEEN_DECISION[$tid]:-}" ]]; then
+      move "$f" "dup-decision-$tid"; archived=$((archived+1)); continue
+    fi
+    SEEN_DECISION[$tid]=1
+  fi
+
+  kept=$((kept+1))
+done
+
+log "done: archived=$archived kept=$kept (dry_run=$DRY_RUN)"

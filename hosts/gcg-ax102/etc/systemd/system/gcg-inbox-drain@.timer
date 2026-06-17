@@ -1,0 +1,11 @@
+[Unit]
+Description=Run GCG a2a inbox drainer for agent %i every 10 min
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=600
+AccuracySec=30
+Unit=gcg-inbox-drain@%i.service
+
+[Install]
+WantedBy=timers.target
