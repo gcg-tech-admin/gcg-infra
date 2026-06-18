@@ -9,25 +9,25 @@ table ip filter {
 	}
 
 	chain ufw-before-input {
-		iifname "lo" counter packets 45120810 bytes 24155397054 accept
-		ct state related,established counter packets 410711651 bytes 128602211417 accept
-		ct state invalid counter packets 42736 bytes 2470931 jump ufw-logging-deny
-		ct state invalid counter packets 42736 bytes 2470931 drop
+		iifname "lo" counter packets 46529423 bytes 24488269626 accept
+		ct state related,established counter packets 454188864 bytes 137832844606 accept
+		ct state invalid counter packets 42970 bytes 2483887 jump ufw-logging-deny
+		ct state invalid counter packets 42970 bytes 2483887 drop
 		ip protocol icmp icmp type destination-unreachable counter packets 0 bytes 0 accept
 		ip protocol icmp icmp type time-exceeded counter packets 0 bytes 0 accept
 		ip protocol icmp icmp type parameter-problem counter packets 0 bytes 0 accept
 		ip protocol icmp icmp type echo-request counter packets 4 bytes 336 accept
-		udp sport 67 udp dport 68 counter packets 579 bytes 199140 accept
-		counter packets 229855 bytes 16639440 jump ufw-not-local
+		udp sport 67 udp dport 68 counter packets 581 bytes 199752 accept
+		counter packets 237111 bytes 17109657 jump ufw-not-local
 		ip daddr 224.0.0.251 udp dport 5353 counter packets 246 bytes 44390 accept
 		ip daddr 239.255.255.250 udp dport 1900 counter packets 0 bytes 0 accept
-		counter packets 229609 bytes 16595050 jump ufw-user-input
+		counter packets 236865 bytes 17065267 jump ufw-user-input
 	}
 
 	chain ufw-before-output {
-		oifname "lo" counter packets 45624646 bytes 24232004544 accept
-		ct state related,established counter packets 470547140 bytes 286947170713 accept
-		counter packets 42349521 bytes 2930647108 jump ufw-user-output
+		oifname "lo" counter packets 47066703 bytes 24569960604 accept
+		ct state related,established counter packets 526854132 bytes 302141945748 accept
+		counter packets 48010050 bytes 3290201622 jump ufw-user-output
 	}
 
 	chain ufw-before-forward {
@@ -56,7 +56,7 @@ table ip filter {
 	}
 
 	chain ufw-after-logging-input {
-		limit rate 3/minute burst 10 packets counter packets 2242 bytes 1008658 log prefix "[UFW BLOCK] "
+		limit rate 3/minute burst 10 packets counter packets 2296 bytes 1018131 log prefix "[UFW BLOCK] "
 	}
 
 	chain ufw-after-logging-output {
@@ -79,8 +79,8 @@ table ip filter {
 	}
 
 	chain ufw-track-output {
-		ip protocol tcp ct state new counter packets 88345 bytes 5300700 accept
-		ip protocol udp ct state new counter packets 3736481 bytes 525243256 accept
+		ip protocol tcp ct state new counter packets 97078 bytes 5824680 accept
+		ip protocol udp ct state new counter packets 3929562 bytes 552554004 accept
 	}
 
 	chain ufw-track-forward {
@@ -88,23 +88,23 @@ table ip filter {
 
 	chain INPUT {
 		type filter hook input priority filter; policy drop;
-		counter packets 395726478 bytes 125477777686 jump ts-input
-		counter packets 456105635 bytes 152776918318 jump ufw-before-logging-input
-		counter packets 456105635 bytes 152776918318 jump ufw-before-input
-		counter packets 4522 bytes 2208382 jump ufw-after-input
-		counter packets 4518 bytes 2208222 jump ufw-after-logging-input
-		counter packets 4518 bytes 2208222 jump ufw-reject-input
-		counter packets 4518 bytes 2208222 jump ufw-track-input
+		counter packets 440653380 bytes 135046862658 jump ts-input
+		counter packets 500998953 bytes 162340907864 jump ufw-before-logging-input
+		counter packets 500998953 bytes 162340907864 jump ufw-before-input
+		counter packets 4576 bytes 2217855 jump ufw-after-input
+		counter packets 4572 bytes 2217695 jump ufw-after-logging-input
+		counter packets 4572 bytes 2217695 jump ufw-reject-input
+		counter packets 4572 bytes 2217695 jump ufw-track-input
 	}
 
 	chain OUTPUT {
 		type filter hook output priority filter; policy accept;
-		counter packets 558521307 bytes 314109822365 jump ufw-before-logging-output
-		counter packets 558521307 bytes 314109822365 jump ufw-before-output
-		counter packets 3825272 bytes 530590350 jump ufw-after-output
-		counter packets 3825272 bytes 530590350 jump ufw-after-logging-output
-		counter packets 3825272 bytes 530590350 jump ufw-reject-output
-		counter packets 3825272 bytes 530590350 jump ufw-track-output
+		counter packets 621930885 bytes 330002107974 jump ufw-before-logging-output
+		counter packets 621930885 bytes 330002107974 jump ufw-before-output
+		counter packets 4027105 bytes 558426090 jump ufw-after-output
+		counter packets 4027105 bytes 558426090 jump ufw-after-logging-output
+		counter packets 4027105 bytes 558426090 jump ufw-reject-output
+		counter packets 4027105 bytes 558426090 jump ufw-track-output
 	}
 
 	chain FORWARD {
@@ -119,8 +119,8 @@ table ip filter {
 	}
 
 	chain ufw-logging-deny {
-		ct state invalid limit rate 3/minute burst 10 packets counter packets 22807 bytes 1249462 return
-		limit rate 3/minute burst 10 packets counter packets 5046 bytes 290952 log prefix "[UFW BLOCK] "
+		ct state invalid limit rate 3/minute burst 10 packets counter packets 22996 bytes 1259662 return
+		limit rate 3/minute burst 10 packets counter packets 5077 bytes 292836 log prefix "[UFW BLOCK] "
 	}
 
 	chain ufw-logging-allow {
@@ -140,7 +140,7 @@ table ip filter {
 	}
 
 	chain ufw-not-local {
-		fib daddr type local counter packets 229609 bytes 16595050 return
+		fib daddr type local counter packets 236865 bytes 17065267 return
 		fib daddr type multicast counter packets 246 bytes 44390 return
 		fib daddr type broadcast counter packets 0 bytes 0 return
 		limit rate 3/minute burst 10 packets counter packets 0 bytes 0 jump ufw-logging-deny
@@ -148,22 +148,22 @@ table ip filter {
 	}
 
 	chain ufw-user-input {
-		ip saddr 217.165.0.0/16 tcp dport 22 counter packets 212323 bytes 13588656 accept
+		ip saddr 217.165.0.0/16 tcp dport 22 counter packets 219462 bytes 14045552 accept
 		ip saddr 100.64.0.0/10 tcp dport 22 counter packets 0 bytes 0 accept
-		ip saddr 65.21.60.52 tcp dport 22 counter packets 144 bytes 8640 accept
-		ip saddr 10.0.0.0/24 tcp dport 22 counter packets 3 bytes 180 accept
-		tcp dport 80 counter packets 162 bytes 16212 accept
-		tcp dport 443 counter packets 20 bytes 4357 accept
-		ip saddr 10.0.0.0/24 counter packets 6803 bytes 408180 accept
+		ip saddr 65.21.60.52 tcp dport 22 counter packets 145 bytes 8700 accept
+		ip saddr 10.0.0.0/24 tcp dport 22 counter packets 6 bytes 360 accept
+		tcp dport 80 counter packets 169 bytes 16655 accept
+		tcp dport 443 counter packets 27 bytes 4822 accept
+		ip saddr 10.0.0.0/24 counter packets 6848 bytes 410880 accept
 		ip saddr 95.179.253.169 counter packets 0 bytes 0 drop
 		ip saddr 52.91.205.197 counter packets 0 bytes 0 drop
 	}
 
 	chain ufw-user-output {
 		oifname "lo" counter packets 0 bytes 0 accept
-		ip daddr 10.0.0.0/24 counter packets 28640107 bytes 1753279070 accept
-		ip daddr 100.64.0.0/10 counter packets 5055 bytes 315298 accept
-		ip daddr 217.165.0.0/16 counter packets 72940 bytes 11084688 accept
+		ip daddr 10.0.0.0/24 counter packets 33880820 bytes 2069259966 accept
+		ip daddr 100.64.0.0/10 counter packets 5169 bytes 323348 accept
+		ip daddr 217.165.0.0/16 counter packets 75996 bytes 11549200 accept
 		ip daddr 104.16.0.34 counter packets 0 bytes 0 accept
 		ip daddr 104.16.10.34 counter packets 0 bytes 0 accept
 		ip daddr 104.16.11.34 counter packets 0 bytes 0 accept
@@ -178,8 +178,8 @@ table ip filter {
 		ip daddr 104.16.9.34 counter packets 2 bytes 120 accept
 		ip daddr 104.18.18.80 counter packets 76 bytes 4560 accept
 		ip daddr 104.18.19.80 counter packets 86 bytes 5160 accept
-		ip daddr 104.18.28.136 counter packets 19292 bytes 1157520 accept
-		ip daddr 104.18.29.136 counter packets 19244 bytes 1154640 accept
+		ip daddr 104.18.28.136 counter packets 20721 bytes 1243260 accept
+		ip daddr 104.18.29.136 counter packets 20639 bytes 1238340 accept
 		ip daddr 104.18.38.236 counter packets 0 bytes 0 accept
 		ip daddr 104.19.192.174 counter packets 1 bytes 60 accept
 		ip daddr 104.19.192.175 counter packets 1 bytes 60 accept
@@ -190,29 +190,29 @@ table ip filter {
 		ip daddr 104.20.28.246 counter packets 1 bytes 60 accept
 		ip daddr 104.21.32.118 counter packets 29 bytes 1740 accept
 		ip daddr 140.82.121.10 counter packets 0 bytes 0 accept
-		ip daddr 140.82.121.3 counter packets 311 bytes 18660 accept
-		ip daddr 140.82.121.6 counter packets 27 bytes 1620 accept
+		ip daddr 140.82.121.3 counter packets 317 bytes 19020 accept
+		ip daddr 140.82.121.6 counter packets 33 bytes 1980 accept
 		ip daddr 142.251.38.74 counter packets 4852 bytes 291120 accept
-		ip daddr 149.154.166.110 counter packets 277469 bytes 16815932 accept
+		ip daddr 149.154.166.110 counter packets 288180 bytes 17458592 accept
 		ip daddr 151.101.0.223 counter packets 0 bytes 0 accept
 		ip daddr 151.101.128.223 counter packets 0 bytes 0 accept
 		ip daddr 151.101.192.223 counter packets 0 bytes 0 accept
 		ip daddr 151.101.64.223 counter packets 0 bytes 0 accept
 		ip daddr 159.89.225.99 counter packets 0 bytes 0 accept
-		ip daddr 160.79.104.10 counter packets 199209 bytes 11952540 accept
-		ip daddr 162.159.140.245 counter packets 1134 bytes 68040 accept
+		ip daddr 160.79.104.10 counter packets 276092 bytes 16565520 accept
+		ip daddr 162.159.140.245 counter packets 1135 bytes 68100 accept
 		ip daddr 167.172.182.26 counter packets 0 bytes 0 accept
 		ip daddr 167.172.206.31 counter packets 0 bytes 0 accept
 		ip daddr 172.64.149.20 counter packets 0 bytes 0 accept
 		ip daddr 172.66.0.243 counter packets 1085 bytes 65100 accept
 		ip daddr 172.66.152.176 counter packets 0 bytes 0 accept
 		ip daddr 172.67.151.179 counter packets 15 bytes 900 accept
-		ip daddr 18.159.197.225 counter packets 20340 bytes 1220400 accept
-		ip daddr 18.165.122.68 counter packets 26682 bytes 1600920 accept
-		ip daddr 18.165.122.72 counter packets 26081 bytes 1564860 accept
-		ip daddr 18.165.122.80 counter packets 26153 bytes 1569100 accept
-		ip daddr 18.165.122.96 counter packets 26403 bytes 1584180 accept
-		ip daddr 185.199.108.133 counter packets 31 bytes 1860 accept
+		ip daddr 18.159.197.225 counter packets 20383 bytes 1222980 accept
+		ip daddr 18.165.122.68 counter packets 34295 bytes 2057700 accept
+		ip daddr 18.165.122.72 counter packets 33650 bytes 2019000 accept
+		ip daddr 18.165.122.80 counter packets 33611 bytes 2016540 accept
+		ip daddr 18.165.122.96 counter packets 34177 bytes 2050620 accept
+		ip daddr 185.199.108.133 counter packets 32 bytes 1920 accept
 		ip daddr 185.199.109.133 counter packets 25 bytes 1500 accept
 		ip daddr 185.199.110.133 counter packets 27 bytes 1620 accept
 		ip daddr 185.199.111.133 counter packets 28 bytes 1680 accept
@@ -237,15 +237,15 @@ table ip filter {
 		ip daddr 216.58.198.170 counter packets 2857 bytes 171420 accept
 		ip daddr 216.58.198.202 counter packets 2568 bytes 154080 accept
 		ip daddr 216.58.201.10 counter packets 2890 bytes 173400 accept
-		ip daddr 3.173.21.63 counter packets 571297 bytes 34277804 accept
-		ip daddr 3.68.124.168 counter packets 20027 bytes 1201620 accept
-		ip daddr 3.68.124.95 counter packets 20298 bytes 1217880 accept
-		ip daddr 3.68.170.153 counter packets 20119 bytes 1207140 accept
-		ip daddr 3.68.175.98 counter packets 20228 bytes 1213680 accept
+		ip daddr 3.173.21.63 counter packets 595438 bytes 35726264 accept
+		ip daddr 3.68.124.168 counter packets 20066 bytes 1203960 accept
+		ip daddr 3.68.124.95 counter packets 20353 bytes 1221180 accept
+		ip daddr 3.68.170.153 counter packets 20158 bytes 1209480 accept
+		ip daddr 3.68.175.98 counter packets 20267 bytes 1216020 accept
 		ip daddr 37.27.234.53 counter packets 82 bytes 4920 accept
 		ip daddr 44.194.136.48 counter packets 0 bytes 0 accept
 		ip daddr 44.223.248.210 counter packets 0 bytes 0 accept
-		ip daddr 52.29.238.212 counter packets 19833 bytes 1189980 accept
+		ip daddr 52.29.238.212 counter packets 19873 bytes 1192380 accept
 		ip daddr 52.7.185.92 counter packets 0 bytes 0 accept
 		ip daddr 68.183.179.66 counter packets 0 bytes 0 accept
 		ip daddr 74.125.205.95 counter packets 98 bytes 5880 accept
@@ -261,11 +261,11 @@ table ip filter {
 		ip daddr 194.87.254.160 counter packets 0 bytes 0 drop
 		ip daddr 86.107.31.22 counter packets 0 bytes 0 drop
 		ip daddr 51.91.190.241 counter packets 0 bytes 0 drop
-		ip daddr 95.217.114.49 counter packets 7808493 bytes 503382360 accept
+		ip daddr 95.217.114.49 counter packets 7826827 bytes 506020548 accept
 		tcp dport 53 counter packets 0 bytes 0 accept
-		udp dport 53 counter packets 632244 bytes 49886132 accept
+		udp dport 53 counter packets 681750 bytes 53694920 accept
 		ip daddr 185.12.64.3 counter packets 0 bytes 0 accept
-		ip daddr 140.82.121.4 counter packets 355 bytes 21300 accept
+		ip daddr 140.82.121.4 counter packets 360 bytes 21600 accept
 		ip daddr 3.226.163.164 counter packets 0 bytes 0 accept
 		ip daddr 64.233.165.95 counter packets 44 bytes 2640 accept
 		ip daddr 142.250.150.95 counter packets 46 bytes 2760 accept
@@ -276,12 +276,12 @@ table ip filter {
 		ip daddr 18.165.140.62 counter packets 71 bytes 4260 accept
 		ip daddr 140.82.121.9 counter packets 0 bytes 0 accept
 		ip daddr 173.194.73.95 counter packets 66 bytes 3960 accept
-		ip daddr 140.82.121.5 counter packets 44 bytes 2640 accept
+		ip daddr 140.82.121.5 counter packets 52 bytes 3120 accept
 		ip daddr 64.233.162.95 counter packets 91 bytes 5460 accept
-		ip daddr 216.239.32.223 counter packets 4320 bytes 259200 accept
-		ip daddr 216.239.34.223 counter packets 4304 bytes 258240 accept
-		ip daddr 216.239.36.223 counter packets 4174 bytes 250440 accept
-		ip daddr 216.239.38.223 counter packets 4315 bytes 258900 accept
+		ip daddr 216.239.32.223 counter packets 4727 bytes 283620 accept
+		ip daddr 216.239.34.223 counter packets 4787 bytes 287220 accept
+		ip daddr 216.239.36.223 counter packets 4598 bytes 275880 accept
+		ip daddr 216.239.38.223 counter packets 4719 bytes 283140 accept
 		ip daddr 100.49.93.212 counter packets 0 bytes 0 accept
 		ip daddr 3.208.205.75 counter packets 0 bytes 0 accept
 		ip daddr 64.233.161.95 counter packets 110 bytes 6600 accept
@@ -297,6 +297,7 @@ table ip filter {
 		ip daddr 54.162.200.70 counter packets 0 bytes 0 accept
 		ip daddr 52.87.57.105 counter packets 0 bytes 0 accept
 		ip daddr 3.227.43.143 counter packets 0 bytes 0 accept
+		ip daddr 3.216.70.150 counter packets 0 bytes 0 accept
 	}
 
 	chain ufw-user-forward {
@@ -322,8 +323,8 @@ table ip filter {
 
 	chain ts-input {
 		ip saddr 100.90.34.64 iifname "lo" counter packets 16 bytes 26850 accept
-		iifname "tailscale0" counter packets 32547 bytes 7671338 accept
-		udp dport 41641 counter packets 503820 bytes 76580640 accept
+		iifname "tailscale0" counter packets 32687 bytes 7683276 accept
+		udp dport 41641 counter packets 537264 bytes 81664128 accept
 		ip saddr 100.115.92.0/23 iifname != "tailscale0" counter packets 0 bytes 0 return
 		ip saddr 100.64.0.0/10 iifname != "tailscale0" counter packets 0 bytes 0 drop
 	}
@@ -346,17 +347,17 @@ table ip6 filter {
 	}
 
 	chain ufw6-before-input {
-		iifname "lo" counter packets 4952 bytes 6503019 accept
+		iifname "lo" counter packets 5214 bytes 6542764 accept
 		rt type 0 counter packets 0 bytes 0 drop
-		ct state related,established counter packets 97199268 bytes 232226474913 accept
+		ct state related,established counter packets 101564910 bytes 236566040428 accept
 		meta l4proto ipv6-icmp icmpv6 type echo-reply counter packets 0 bytes 0 accept
-		ct state invalid counter packets 92141 bytes 6065673 jump ufw6-logging-deny
-		ct state invalid counter packets 92141 bytes 6065673 drop
+		ct state invalid counter packets 95172 bytes 6249617 jump ufw6-logging-deny
+		ct state invalid counter packets 95172 bytes 6249617 drop
 		meta l4proto ipv6-icmp icmpv6 type destination-unreachable counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type packet-too-big counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type time-exceeded counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type parameter-problem counter packets 0 bytes 0 accept
-		meta l4proto ipv6-icmp icmpv6 type echo-request counter packets 1321 bytes 73056 accept
+		meta l4proto ipv6-icmp icmpv6 type echo-request counter packets 1375 bytes 76048 accept
 		meta l4proto ipv6-icmp icmpv6 type nd-router-solicit ip6 hoplimit 255 counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type nd-router-advert ip6 hoplimit 255 counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 counter packets 9 bytes 648 accept
@@ -379,20 +380,20 @@ table ip6 filter {
 		ip6 saddr fe80::/10 ip6 daddr fe80::/10 udp sport 547 udp dport 546 counter packets 0 bytes 0 accept
 		ip6 daddr ff02::fb udp dport 5353 counter packets 0 bytes 0 accept
 		ip6 daddr ff02::f udp dport 1900 counter packets 0 bytes 0 accept
-		counter packets 7644 bytes 3429088 jump ufw6-user-input
+		counter packets 7673 bytes 3462714 jump ufw6-user-input
 	}
 
 	chain ufw6-before-output {
-		oifname "lo" counter packets 256862 bytes 49831539 accept
+		oifname "lo" counter packets 273846 bytes 52747468 accept
 		rt type 0 counter packets 0 bytes 0 drop
-		ct state related,established counter packets 77509722 bytes 56633858457 accept
+		ct state related,established counter packets 80965228 bytes 60733980525 accept
 		meta l4proto ipv6-icmp icmpv6 type destination-unreachable counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type packet-too-big counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type time-exceeded counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type parameter-problem counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type echo-request counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type echo-reply counter packets 0 bytes 0 accept
-		meta l4proto ipv6-icmp icmpv6 type nd-router-solicit ip6 hoplimit 255 counter packets 1436 bytes 80416 accept
+		meta l4proto ipv6-icmp icmpv6 type nd-router-solicit ip6 hoplimit 255 counter packets 1482 bytes 82992 accept
 		meta l4proto ipv6-icmp icmpv6 type nd-neighbor-advert ip6 hoplimit 255 counter packets 0 bytes 0 accept
 		meta l4proto ipv6-icmp icmpv6 type nd-neighbor-solicit ip6 hoplimit 255 counter packets 9 bytes 648 accept
 		meta l4proto ipv6-icmp icmpv6 type nd-router-advert ip6 hoplimit 255 counter packets 0 bytes 0 accept
@@ -407,7 +408,7 @@ table ip6 filter {
 		ip6 saddr fe80::/10 meta l4proto ipv6-icmp xt match "icmp6" ip6 hoplimit 1 counter packets 0 bytes 0 accept
 		ip6 saddr fe80::/10 meta l4proto ipv6-icmp xt match "icmp6" ip6 hoplimit 1 counter packets 0 bytes 0 accept
 		ip6 saddr fe80::/10 meta l4proto ipv6-icmp xt match "icmp6" ip6 hoplimit 1 counter packets 0 bytes 0 accept
-		counter packets 5805552 bytes 521228256 jump ufw6-user-output
+		counter packets 6081958 bytes 545537672 jump ufw6-user-output
 	}
 
 	chain ufw6-before-forward {
@@ -438,7 +439,7 @@ table ip6 filter {
 	}
 
 	chain ufw6-after-logging-input {
-		limit rate 3/minute burst 10 packets counter packets 4410 bytes 2217011 log prefix "[UFW BLOCK] "
+		limit rate 3/minute burst 10 packets counter packets 4439 bytes 2250637 log prefix "[UFW BLOCK] "
 	}
 
 	chain ufw6-after-logging-output {
@@ -461,8 +462,8 @@ table ip6 filter {
 	}
 
 	chain ufw6-track-output {
-		meta l4proto tcp ct state new counter packets 4648504 bytes 371894230 accept
-		meta l4proto udp ct state new counter packets 550389 bytes 90952522 accept
+		meta l4proto tcp ct state new counter packets 4877002 bytes 390174070 accept
+		meta l4proto udp ct state new counter packets 574469 bytes 94755338 accept
 	}
 
 	chain ufw6-track-forward {
@@ -470,23 +471,23 @@ table ip6 filter {
 
 	chain INPUT {
 		type filter hook input priority filter; policy drop;
-		counter packets 72789143 bytes 67870092355 jump ts-input
-		counter packets 97305342 bytes 232242546853 jump ufw6-before-logging-input
-		counter packets 97305342 bytes 232242546853 jump ufw6-before-input
-		counter packets 7644 bytes 3429088 jump ufw6-after-input
-		counter packets 7644 bytes 3429088 jump ufw6-after-logging-input
-		counter packets 7644 bytes 3429088 jump ufw6-reject-input
-		counter packets 7644 bytes 3429088 jump ufw6-track-input
+		counter packets 77193109 bytes 72214471153 jump ts-input
+		counter packets 101674360 bytes 236582372675 jump ufw6-before-logging-input
+		counter packets 101674360 bytes 236582372675 jump ufw6-before-input
+		counter packets 7673 bytes 3462714 jump ufw6-after-input
+		counter packets 7673 bytes 3462714 jump ufw6-after-logging-input
+		counter packets 7673 bytes 3462714 jump ufw6-reject-input
+		counter packets 7673 bytes 3462714 jump ufw6-track-input
 	}
 
 	chain OUTPUT {
 		type filter hook output priority filter; policy accept;
-		counter packets 83573597 bytes 57205000772 jump ufw6-before-logging-output
-		counter packets 83573597 bytes 57205000772 jump ufw6-before-output
-		counter packets 5273376 bytes 468209580 jump ufw6-after-output
-		counter packets 5273376 bytes 468209580 jump ufw6-after-logging-output
-		counter packets 5273376 bytes 468209580 jump ufw6-reject-output
-		counter packets 5273376 bytes 468209580 jump ufw6-track-output
+		counter packets 87322539 bytes 61332350761 jump ufw6-before-logging-output
+		counter packets 87322539 bytes 61332350761 jump ufw6-before-output
+		counter packets 5528839 bytes 490499956 jump ufw6-after-output
+		counter packets 5528839 bytes 490499956 jump ufw6-after-logging-output
+		counter packets 5528839 bytes 490499956 jump ufw6-reject-output
+		counter packets 5528839 bytes 490499956 jump ufw6-track-output
 	}
 
 	chain FORWARD {
@@ -501,8 +502,8 @@ table ip6 filter {
 	}
 
 	chain ufw6-logging-deny {
-		ct state invalid limit rate 3/minute burst 10 packets counter packets 42564 bytes 2654665 return
-		limit rate 3/minute burst 10 packets counter packets 28935 bytes 1784380 log prefix "[UFW BLOCK] "
+		ct state invalid limit rate 3/minute burst 10 packets counter packets 44102 bytes 2748717 return
+		limit rate 3/minute burst 10 packets counter packets 29944 bytes 1845136 log prefix "[UFW BLOCK] "
 	}
 
 	chain ufw6-logging-allow {
@@ -529,7 +530,7 @@ table ip6 filter {
 	chain ufw6-user-output {
 		oifname "lo" counter packets 0 bytes 0 accept
 		tcp dport 53 counter packets 0 bytes 0 accept
-		udp dport 53 counter packets 527638 bytes 52582489 accept
+		udp dport 53 counter packets 548581 bytes 54601529 accept
 	}
 
 	chain ufw6-user-forward {
@@ -556,7 +557,7 @@ table ip6 filter {
 	chain ts-input {
 		ip6 saddr fd7a:115c:a1e0::2939:2240 iifname "lo" counter packets 0 bytes 0 accept
 		iifname "tailscale0" counter packets 30 bytes 2130 accept
-		udp dport 41641 counter packets 657962 bytes 80685304 accept
+		udp dport 41641 counter packets 692910 bytes 85238280 accept
 	}
 
 	chain ts-forward {
@@ -572,7 +573,7 @@ table ip nat {
 
 	chain POSTROUTING {
 		type nat hook postrouting priority srcnat; policy accept;
-		counter packets 39923086 bytes 2484530118 jump ts-postrouting
+		counter packets 45599146 bytes 2830087801 jump ts-postrouting
 	}
 }
 table ip6 nat {
@@ -582,28 +583,28 @@ table ip6 nat {
 
 	chain POSTROUTING {
 		type nat hook postrouting priority srcnat; policy accept;
-		counter packets 4274296 bytes 355416651 jump ts-postrouting
+		counter packets 4530963 bytes 376484937 jump ts-postrouting
 	}
 }
 table ip mangle {
 	chain PREROUTING {
 		type filter hook prerouting priority mangle; policy accept;
-		ct state related,established counter packets 386776736 bytes 124787830514 meta mark set ct mark and 0xff0000
+		ct state related,established counter packets 431238728 bytes 134320996064 meta mark set ct mark and 0xff0000
 	}
 
 	chain OUTPUT {
 		type route hook output priority mangle; policy accept;
-		ct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 4563448 bytes 646935472 ct mark set mark and 0xff0000
+		ct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 4792969 bytes 679723756 ct mark set mark and 0xff0000
 	}
 }
 table ip6 mangle {
 	chain PREROUTING {
 		type filter hook prerouting priority mangle; policy accept;
-		ct state related,established counter packets 72711467 bytes 67863778985 meta mark set ct mark and 0xff0000
+		ct state related,established counter packets 77112226 bytes 72207929781 meta mark set ct mark and 0xff0000
 	}
 
 	chain OUTPUT {
 		type route hook output priority mangle; policy accept;
-		ct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 540122 bytes 79360680 ct mark set mark and 0xff0000
+		ct state new meta mark & 0x00ff0000 != 0x00000000 counter packets 563948 bytes 82861348 ct mark set mark and 0xff0000
 	}
 }
