@@ -1,0 +1,48 @@
+[Unit]
+Description=Marcus WhatsApp Bridge + API Shim (Public Sales)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/gcg/openclaw-marcus/workspace/whatsapp-bridge
+User=root
+
+# ---- WhatsApp Bridge ----
+Environment=NODE_ENV=production
+Environment=LOG_LEVEL=info
+Environment=PHONE_NUMBER=447418355478
+Environment=PAIRING_MODE=phone
+Environment=BOT_NAME=Marcus
+Environment=AUTH_DIR=/opt/gcg/openclaw-marcus/workspace/whatsapp-bridge/auth_info/
+Environment=MARCUS_API_ENDPOINT=http://localhost:3001/api/message
+Environment=GO_LIVE_TIMESTAMP=2026-06-16T12:28:00+04:00
+
+# ---- API Shim ----
+Environment=GATEWAY_TOKEN=e64abc8298090a88c0ac7babae8a8f691c8b192f00bd9d69
+Environment=GATEWAY_URL=http://127.0.0.1:19050
+Environment=MARCUS_AGENT_ID=marcus
+Environment=PORT=3001
+Environment=TIMEOUT_MS=120000
+
+# ---- Outbox send-server ----
+Environment=OUTBOX_MODE=disabled
+Environment=SEND_PORT=3002
+Environment=DB_HOST=10.0.0.2
+Environment=DB_PORT=5432
+Environment=DB_NAME=gcg_intelligence
+Environment=DB_USER=gcg_admin
+
+ExecStart=/opt/gcg/openclaw-marcus/workspace/whatsapp-bridge/start-with-db.sh
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=append:/opt/gcg/openclaw-marcus/logs/whatsapp-bridge.log
+StandardError=append:/opt/gcg/openclaw-marcus/logs/whatsapp-bridge.log
+
+[Install]
+WantedBy=multi-user.target
