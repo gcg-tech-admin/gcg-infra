@@ -475,14 +475,31 @@ cmd_cancel() {
   local id="${1:?usage: fleet cancel <id>}"; _set_status "$id" cancelled done_at
 }
 cmd_block() {
-  local id="${1:?usage: fleet block <id> <reason>}"; shift
-  local reason="${*:?usage: fleet block <id> <reason>}"
-  _psql -tA -v id="$id" -v reason="$reason" <<'SQL'
+  local id="${1:?usage: fleet block <id> [--dep <blocking_id>] <reason>}"; shift
+  local dep=""
+  if [ "$1" = "--dep" ]; then dep="${2:?--dep needs a blocking task id}"; shift 2; fi
+  local reason="${*:?usage: fleet block <id> [--dep <blocking_id>] <reason>}"
+  if [ -n "$dep" ]; then
+    # Structured dependency block — gcg-loop-driver auto-advances this when <dep> goes terminal.
+    _psql -tA -v id="$id" -v reason="$reason" -v dep="$dep" <<'SQL'
 UPDATE agent_messages
-   SET status = 'blocked', blocked_at = NOW(), blocked_reason = :'reason'
+   SET status = 'blocked', blocked_at = NOW(), blocked_reason = :'reason',
+       blocked_by = ARRAY[:'dep'::bigint]
+ WHERE id = :'id'::bigint
+RETURNING id, status, blocked_by;
+SQL
+  else
+    # ponytail: a block with no structured dep is NOT dependency-blocked — it needs attention.
+    # Route to input-required (surfaced) instead of 'blocked'. The loop-driver only resolves
+    # 'blocked' via blocked_by, so a depless 'blocked' rots in limbo forever (the recurring bug).
+    _psql -tA -v id="$id" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET status = 'input-required', blocked_at = NOW(), blocked_reason = :'reason',
+       input_required_at = NOW()
  WHERE id = :'id'::bigint
 RETURNING id, status;
 SQL
+  fi
 }
 cmd_progress() {
   local id="${1:?usage: fleet progress <id> <note>}"; shift

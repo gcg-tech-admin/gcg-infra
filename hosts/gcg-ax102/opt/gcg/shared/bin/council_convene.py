@@ -183,6 +183,15 @@ def main():
     dispatch_round1(args.slug, args.plan, plan_hash,
                     args.reviewers, args.goal, args.key_finding, args.pattern)
 
+    # Hardening (2026-06-18): self-heal the tick engine. A convened council is dead
+    # if council-tick.timer is off — that silent disable was the root cause of the
+    # 2026-06-18 council stall. Every convene re-guarantees the engine is live.
+    print("Ensuring council-tick engine is live...")
+    subprocess.run(["systemctl", "enable", "--now", "council-tick.timer"], capture_output=True)
+    _en = subprocess.run(["systemctl", "is-enabled", "council-tick.timer"],
+                         capture_output=True, text=True).stdout.strip()
+    print(f"  council-tick.timer: {_en or 'unknown'}")
+
     print(f"\n✅ Council convened. The cron tick driver will handle subsequent rounds.")
     print(f"   Manifest: {manifest_path}")
     print(f"   Planner: {args.planner} (deadline: {args.deadline}h)")

@@ -28,7 +28,6 @@ restart_policy:
   - vulcan
 model_policy:
   banned:
-  - deepseek/deepseek-v4-pro
   - openrouter/*
   banned_note: 'deepseek/deepseek-v4-pro MUST be called with thinking=high (FLEET-WIDE BINDING RULE 2026-05-10).
 
@@ -68,9 +67,15 @@ model_policy:
     - thinking=off for all subagent lanes
     - gemini-3.5-flash + kimi-k2.6 APPROVED for subagents (Peter 2026-06-16)
     - "model fallback: spawn fails \u2192 retry next in lane, max 3 attempts"
+    - 'DS V4 Flash + thinking=ON is BROKEN (Peter 2026-06-18): stream goes silent
+      \u2192 120s idle timeout \u2192 LLM request failed. STANDARD: heartbeat/hook slots run
+      deepseek-v4-pro with thinking ON. Do NOT use thinking:off to fix Flash in these
+      slots (Peter: does not work). Only explicit subagent lanes stay on Flash (thinking:off pinned).'
 shared_token_groups:
-  gateway: null
-  hooks: null
+  gateway:
+    vincent_group: [hector, phil, tom]
+  hooks:
+    vincent_group: [hector, phil, tom]
 openclaw_json_schema:
   allowed_root_keys:
   - meta
@@ -318,6 +323,12 @@ drift_from_previous_version:
 - "2026-06-16 (Peter): Atlas and Pan added to agent roster. Both disabled on Mac Mini since 2026-06-09 \u2014 Daen reinstalling\
   \ with Claude CLI OAuth."
 - '2026-06-16 (Peter): Subagent lane matrix added to model_policy. gemini-3.5-flash and kimi-k2.6 APPROVED for subagent use.'
+- '2026-06-18 (Peter): DS Flash+thinking gotcha RESOLVED. Fleet-wide heartbeat sweep DONE — all 31 exposed
+  agents bumped heartbeat.model deepseek-v4-flash -> deepseek-v4-pro (thinking ON) in their openclaw.json,
+  validated + chattr +i + hot-reloaded. Also fixed: daen Fleet hook -> v4-pro. Already-safe (skipped): niccolo
+  (Pro), vera (Sonnet), wonhoo (thinkingDefault off). Standard going forward: heartbeats/hooks = v4-pro thinking-on,
+  NOT thinking:off (Peter: off does not work). Roster heartbeat: entries below may still read flash (descriptor);
+  live configs are v4-pro.'
 agents:
   alex:
     title: Business Setup & Corporate Services Specialist / PRO
@@ -977,8 +988,8 @@ agents:
     anthropic_profile: true
     channel_token_policy: per_agent
     channel_token_shared_with: []
-    gateway_token_sha: b8b15b17532b
-    hooks_token_sha: a74c7e529bd9
+    gateway_token_sha: 5d09eb9598d0
+    hooks_token_sha: 9a98223dcdfe
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
     telegram_bot: '@gcg_hector_bot'
@@ -1024,7 +1035,7 @@ agents:
     - deepseek
     - gemini
     - moonshot
-    google_sa: false
+    google_sa: true
     anthropic_profile: true
     channel_token_policy: per_agent
     channel_token_shared_with: []
@@ -1602,8 +1613,8 @@ agents:
     anthropic_profile: true
     channel_token_policy: per_agent
     channel_token_shared_with: []
-    gateway_token_sha: 2e49e27afedf
-    hooks_token_sha: 5f0d5f1c7dda
+    gateway_token_sha: 5d09eb9598d0
+    hooks_token_sha: 9a98223dcdfe
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
     telegram_bot: '@gcg_phil_bot'
@@ -1742,8 +1753,8 @@ agents:
     anthropic_profile: true
     channel_token_policy: per_agent
     channel_token_shared_with: []
-    gateway_token_sha: a8b86be25a5a
-    hooks_token_sha: 0795aecdb8b2
+    gateway_token_sha: 5d09eb9598d0
+    hooks_token_sha: 9a98223dcdfe
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
     telegram_bot: '@gcg_tom_bot'

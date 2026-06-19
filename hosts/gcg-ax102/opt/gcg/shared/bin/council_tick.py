@@ -48,6 +48,22 @@ MAX_STUCK_ROUNDS = 3
 PLANNER_DEADLINE_HOURS = 2
 ESCALATED_AUTO_ARCHIVE_HOURS = 24
 
+# Guardian that relays terminal gates to Peter. There is NO `peter` inbox poller,
+# so `fleet send peter` is a dead-end — route Peter-facing notices through the
+# convener/guardian (daen), whose session IS wired to Peter's Telegram. Peter only
+# ever sees a terminal gate (final plan on PASS, or a decision on SPLIT/STUCK).
+GUARDIAN_AGENT = "daen"
+
+
+def notify_peter(text: str):
+    """Surface a terminal council gate to Peter via the guardian agent (daen).
+
+    Routes to GUARDIAN_AGENT (which has an inbox poller + Telegram), NOT to the
+    pollerless `peter` address. The prefix tells the guardian to relay to Peter.
+    """
+    subprocess.run(["fleet", "send", "--priority", "2", GUARDIAN_AGENT,
+                    f"🔔 SURFACE TO PETER (council gate):\n\n{text}"], check=False)
+
 
 # ── Pure helper functions (relocated from council_loop.py) ──────────────────
 
@@ -178,7 +194,11 @@ def dispatch_reviewer(plan_slug: str, plan_path: str, plan_hash: str, goal: str,
         f"7. CLOSE inbox: fleet done <message_id> && rm workspace/inbox/<message_id>.json"
     )
 
-    subprocess.run(["fleet", "send", agent_id, msg], check=True)
+    # Bypass the Cascade-First guard: reviewer prompts legitimately contain "?" +
+    # review verbs (e.g. Cassandra's "What does this become?"), which otherwise trips
+    # the guard and rejects the dispatch (exit 7). Matches council_loop.py.
+    subprocess.run(["fleet", "send", agent_id, msg], check=True,
+                   env={**os.environ, "FLEET_SKIP_CASCADE_GUARD": "1"})
     print(f"  → {reviewer}: dispatched (round {round_n})")
 
 
@@ -195,7 +215,11 @@ def dispatch_planner_revision(planner_agent: str, plan_slug: str, plan_path: str
         f"Save the revised plan (same path or versioned), then the next tick will detect the hash change\n"
         f"and open a new round."
     )
-    subprocess.run(["fleet", "send", planner_agent, msg], check=True)
+    # Bypass the Cascade-First guard (same as dispatch_reviewer) — the revision request
+    # legitimately contains review verbs that otherwise trip the guard (exit 7) and
+    # silently kill the loop at the revise step. Hardened 2026-06-18.
+    subprocess.run(["fleet", "send", planner_agent, msg], check=True,
+                   env={**os.environ, "FLEET_SKIP_CASCADE_GUARD": "1"})
     print(f"  → {planner_agent}: revision dispatch (round {round_n})")
 
 
@@ -216,9 +240,11 @@ def compute_gate(verdicts: dict[str, str]) -> str:
     if not fails and not conditionals and not timeouts:
         return "PASS"
     if fails and not timeouts:
-        # All present but some FAIL. Also check for SPLIT.
-        if passes and fails:
-            return "SPLIT"
+        # Any FAIL (even mixed with PASS) → FAIL → revise loop. Hardened 2026-06-18
+        # (Peter directive: "loop until it finishes", don't dump to Peter): a fresh
+        # PASS+FAIL mix is NOT a SPLIT-escalate — it revises. Genuine irreconcilable
+        # splits still escalate via stuck-detection (same required changes 2 rounds)
+        # in the FAIL/revise path. Supersedes the 2026-06-07 SPLIT-escalate policy.
         return "FAIL"
     if conditionals and not fails and not timeouts:
         # All present, only CONDITIONAL + PASS → fails the gate
@@ -318,22 +344,49 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
             dispatch_reviewer(slug, plan_path, plan_hash, goal,
                               r_name.upper(), round_n, key_finding, pattern)
 
+        manifest["last_dispatch"] = now.isoformat()
         save_manifest(slug, manifest)
         return "revised"
 
-    # ── 3. Handle 'revising' status — planner deadline escalation ──
+    # ── 3. Handle 'revising' status ──
     if status == "revising":
-        last_tick_dt = datetime.fromisoformat(last_tick) if last_tick else now
-        elapsed_h = (now - last_tick_dt).total_seconds() / 3600
+        # 3a. Planner produced a revision (plan hash changed) → open the next round.
+        # Without this, a revised plan sits undetected until the deadline and the
+        # loop wrongly escalates — the revision→re-review transition never fires.
+        if current_hash != plan_hash:
+            plan_hash = current_hash
+            round_n += 1
+            manifest["plan_hash"] = plan_hash
+            manifest["round"] = round_n
+            manifest["stuck_count"] = stuck_count  # carried; reset only on real progress below
+            manifest["status"] = "in_review"
+            for r in reviewers_expected:
+                vf = verdict_file(slug, r.upper(), round_n)
+                if vf.exists():
+                    vf.unlink()
+            print(f"  Planner revised plan (hash changed) — opening R{round_n}, re-dispatching reviewers")
+            for r_name in reviewers_expected:
+                dispatch_reviewer(slug, plan_path, plan_hash, goal,
+                                  r_name.upper(), round_n, key_finding, pattern)
+            manifest["last_dispatch"] = now.isoformat()
+            save_manifest(slug, manifest)
+            return "revised"
+
+        # 3b. No revision yet — escalate if planner blew the deadline.
+        # Measure from when revision was REQUESTED (revising_since), not last_tick
+        # (which updates every tick and would make the deadline unreachable).
+        revising_since = manifest.get("revising_since") or last_tick
+        since_dt = datetime.fromisoformat(revising_since) if revising_since else now
+        elapsed_h = (now - since_dt).total_seconds() / 3600
         if elapsed_h > planner_deadline_h:
             print(f"  Planner ({planner_agent}) unresponsive for {elapsed_h:.1f}h — escalating to Peter")
             manifest["status"] = "escalated"
             manifest["escalated_at"] = now.isoformat()
             # Notify Peter
-            subprocess.run(["fleet", "send", "peter",
-                            f"🚨 COUNCIL ESCALATION: {slug} — Planner {planner_agent} "
-                            f"unresponsive for {elapsed_h:.1f}h (deadline {planner_deadline_h}h). "
-                            f"Council stuck in 'revising' since round {round_n}."])
+            notify_peter(
+                f"🚨 COUNCIL ESCALATION: {slug} — Planner {planner_agent} "
+                f"unresponsive for {elapsed_h:.1f}h (deadline {planner_deadline_h}h). "
+                f"Council stuck in 'revising' since round {round_n}.")
             save_manifest(slug, manifest)
             return "escalated"
 
@@ -395,17 +448,26 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
                 if rh and rh != plan_hash:
                     stale_reviewers.append(r_name)
     
-    # ── 6b. Re-poke stragglers ──
+    # ── 6b. Re-poke stragglers (interval-gated: never more than once per REPOKE_MINUTES) ──
     repoke_targets = list(set(missing_reviewers + stale_reviewers))
     if repoke_targets:
+        last_dispatch = manifest.get("last_dispatch")
+        mins_since = ((now - datetime.fromisoformat(last_dispatch)).total_seconds() / 60
+                      if last_dispatch else REPOKE_MINUTES + 1)
+        if mins_since < REPOKE_MINUTES:
+            print(f"  Missing verdicts: {repoke_targets} — waiting "
+                  f"({mins_since:.0f}/{REPOKE_MINUTES}min since last dispatch, no re-poke yet)")
+            save_manifest(slug, manifest)
+            return "waiting"
         print(f"  Missing/stale verdicts: {repoke_targets}")
-        print(f"  Re-poking (interval {REPOKE_MINUTES}min)...")
+        print(f"  Re-poking ({mins_since:.0f}min since last dispatch ≥ {REPOKE_MINUTES}min)...")
         for r_name in repoke_targets:
             dispatch_reviewer(slug, plan_path, plan_hash, goal,
                               r_name.upper(), round_n, key_finding, pattern,
                               prior_fail=extract_required_changes(
                                   verdict_file(slug, r_name.upper(), round_n - 1)
                               ) if round_n > 1 else "")
+        manifest["last_dispatch"] = now.isoformat()
         save_manifest(slug, manifest)
         return "repoked"
 
@@ -420,9 +482,10 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
         save_manifest(slug, manifest)
         print(f"\n✅ ALL-5-PASS — {slug} complete")
         # Notify Peter
-        subprocess.run(["fleet", "send", "peter",
-                        f"✅ COUNCIL PASS: {slug} passed all-5-PASS (round {round_n}). "
-                        f"Plan: {plan_path}"])
+        notify_peter(
+            f"✅ COUNCIL PASS: {slug} passed all-5-PASS (round {round_n}).\n"
+            f"Final plan: {plan_path}\n"
+            f"This is a solution + plan ready for your go/no-go.")
         # Persist learnings
         try:
             subprocess.run([sys.executable,
@@ -442,10 +505,10 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
         manifest["escalated_at"] = now.isoformat()
         manifest["history"].append({"round": round_n, "gate": "SPLIT"})
         save_manifest(slug, manifest)
-        subprocess.run(["fleet", "send", "peter",
-                        f"🚨 COUNCIL SPLIT: {slug} round {round_n} — "
-                        f"reviewers disagree. Verdicts: {verdicts}. "
-                        f"Peter decision required."])
+        notify_peter(
+            f"🚨 COUNCIL SPLIT: {slug} round {round_n} — "
+            f"reviewers disagree. Verdicts: {verdicts}. "
+            f"Peter decision required.")
         return "split"
 
     elif gate == "FAIL":
@@ -471,14 +534,15 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
                 "fails": [r for r, v in verdicts.items() if v != "PASS"]
             })
             save_manifest(slug, manifest)
-            subprocess.run(["fleet", "send", "peter",
-                            f"🚨 COUNCIL STUCK: {slug} — {stuck_count} consecutive rounds without PASS. "
-                            f"Last round: {verdicts}. "
-                            f"Conditions from reviewers:\n" + "\n".join(conditions)])
+            notify_peter(
+                f"🚨 COUNCIL STUCK: {slug} — {stuck_count} consecutive rounds without PASS. "
+                f"Last round: {verdicts}. "
+                f"Conditions from reviewers:\n" + "\n".join(conditions))
             return "stuck_escalated"
 
         # Normal revision cycle
         manifest["status"] = "revising"
+        manifest["revising_since"] = now.isoformat()
         manifest["history"].append({
             "round": round_n, "gate": "FAIL",
             "fails": [r for r, v in verdicts.items() if v != "PASS"]

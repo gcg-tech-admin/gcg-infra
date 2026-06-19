@@ -141,6 +141,11 @@ def validate_agent(name, declared, live, banned_models=None):
     live_env = set(m.get("env_keys") or [])
     canonical = set()
     if "ANTHROPIC_API_KEY" in live_env: canonical.add("anthropic")
+    # OAuth profile or claude-cli primary also satisfies the anthropic key requirement
+    live_profiles = o.get("auth_profiles", []) or []
+    if any(p.startswith("anthropic:") for p in live_profiles): canonical.add("anthropic")
+    live_primary = o.get("model_primary") or declared.get("model_primary") or ""
+    if live_primary.startswith("claude-cli/"): canonical.add("anthropic")
     if "DEEPSEEK_API_KEY" in live_env: canonical.add("deepseek")
     if "MOONSHOT_API_KEY" in live_env: canonical.add("moonshot")
     if "GEMINI_API_KEY" in live_env: canonical.add("gemini")
