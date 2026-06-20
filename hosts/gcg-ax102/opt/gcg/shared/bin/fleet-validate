@@ -43,9 +43,15 @@ def load_yaml(path):
 def sha12(s):
     return hashlib.sha256((s or "").encode()).hexdigest()[:12]
 
-def load_live(name):
+def load_live(name, declared=None):
     """Read live state for one agent."""
     out = {}
+    # Skip agents declared on a different host
+    agent_host = (declared or {}).get("host")
+    current_host = os.uname().nodename
+    if agent_host and not current_host.startswith(agent_host):
+        out["_remote_host"] = agent_host
+        return out
     ocj = f"/opt/gcg/openclaw-{name}/openclaw.json"
     mfp = f"/run/openclaw-{name}/manifest.json"
     if os.path.exists(ocj):
@@ -244,13 +250,19 @@ def main():
     summary = {"total": 0, "green": 0, "drift": 0, "error": 0, "fatal": 0}
     for name in targets:
         decl = fleet_agents.get(name)
-        live = load_live(name)
+        live = load_live(name, decl)
         findings = validate_agent(name, decl, live, banned_models)
         # also check: in FLEET but not live, or in live but not FLEET
         if not decl:
             findings.insert(0, ("WARN", "in live but missing from FLEET.yaml"))
         if name in fleet_agents and name not in live_agents:
-            findings.insert(0, ("ERROR", "in FLEET.yaml but not live"))
+            # Only flag if the agent is expected on THIS host
+            agent_host = (decl.get("host") if decl else None)
+            current_host = os.uname().nodename
+            if agent_host and current_host.startswith(agent_host):
+                findings.insert(0, ("ERROR", "in FLEET.yaml but not live"))
+            elif agent_host and agent_host != current_host and not current_host.startswith(agent_host):
+                findings.insert(0, ("INFO", f"in FLEET.yaml but on remote host={agent_host} (not {current_host})"))
         results[name] = findings
         summary["total"] += 1
         if not findings:

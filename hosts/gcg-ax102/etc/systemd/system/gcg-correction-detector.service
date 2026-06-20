@@ -4,7 +4,6 @@ After=network.target
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
 User=root
 ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/correction_detector.py --hours 1
 WorkingDirectory=/opt/gcg/shared/scripts

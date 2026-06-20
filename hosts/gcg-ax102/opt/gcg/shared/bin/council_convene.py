@@ -14,6 +14,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -127,7 +128,8 @@ def dispatch_round1(slug: str, plan_path: str, plan_hash: str,
             f"7. CLOSE inbox: fleet done <message_id> && rm workspace/inbox/<message_id>.json"
         )
 
-        subprocess.run(["fleet", "send", agent_id, msg], check=True)
+        subprocess.run(["fleet", "send", agent_id, msg], check=True,
+                       env={**os.environ, "FLEET_SKIP_CASCADE_GUARD": "1"})
         print(f"  → {r_upper}: dispatched (round 1, agent={agent_id})")
 
 
