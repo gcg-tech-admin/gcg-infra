@@ -988,8 +988,8 @@ agents:
     anthropic_profile: true
     channel_token_policy: per_agent
     channel_token_shared_with: []
-    gateway_token_sha: 5d09eb9598d0
-    hooks_token_sha: 9a98223dcdfe
+    gateway_token_sha: b8b15b17532b
+    hooks_token_sha: a74c7e529bd9
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
     telegram_bot: '@gcg_hector_bot'
@@ -1613,8 +1613,8 @@ agents:
     anthropic_profile: true
     channel_token_policy: per_agent
     channel_token_shared_with: []
-    gateway_token_sha: 5d09eb9598d0
-    hooks_token_sha: 9a98223dcdfe
+    gateway_token_sha: 2e49e27afedf
+    hooks_token_sha: 5f0d5f1c7dda
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
     telegram_bot: '@gcg_phil_bot'
@@ -1753,8 +1753,8 @@ agents:
     anthropic_profile: true
     channel_token_policy: per_agent
     channel_token_shared_with: []
-    gateway_token_sha: 5d09eb9598d0
-    hooks_token_sha: 9a98223dcdfe
+    gateway_token_sha: a8b86be25a5a
+    hooks_token_sha: 0795aecdb8b2
     hooks_token_policy: per_agent
     hooks_token_shared_with: []
     telegram_bot: '@gcg_tom_bot'

@@ -27,13 +27,14 @@ COUNCILS_DIR = Path("/opt/gcg/shared/councils")
 VERDICT_DIR = Path("/opt/gcg/shared/plans/reviews")
 COUNCIL_LOOP_PATH = Path("/opt/gcg/shared/bin/council_loop.py")
 
-REVIEWERS = ["SOCRATES", "NEMESIS", "CASSANDRA", "CONFUCIUS", "WONHOO"]
+REVIEWERS = ["SOCRATES", "NEMESIS", "CASSANDRA", "CONFUCIUS", "WONHOO", "VULCAN"]
 REVIEWER_IDS = {
     "SOCRATES": "socrates",
     "NEMESIS": "nemesis",
     "CASSANDRA": "cassandra",
     "CONFUCIUS": "confucius",
     "WONHOO": "wonhoo",
+    "VULCAN": "vulcan",
 }
 REVIEWER_ROLES = {
     "SOCRATES": "Question every assumption. Probe logic, expose contradictions, ask what the builder took for granted.",
@@ -41,6 +42,7 @@ REVIEWER_ROLES = {
     "CASSANDRA": "Project the future. What does this plan become in 3-6 months? Technical debt, scaling walls, lock-in, second-order effects.",
     "CONFUCIUS": "Verify every factual claim. Read the actual files. Check real configs. Confirm paths exist. Do NOT speculate — go look.",
     "WONHOO": "Practical feasibility. Will this actually work when a real person or agent executes it? Are steps clear? Timeline realistic? Simpler way?",
+    "VULCAN": "QA verification: Read and verify the proposed changes against the live system. Confirm schema paths exist, test queries are valid, rollback steps are reversible. Reject any claim not verified against running infrastructure.",
 }
 
 REPOKE_MINUTES = 30

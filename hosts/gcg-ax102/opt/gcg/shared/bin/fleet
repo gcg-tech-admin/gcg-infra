@@ -477,7 +477,7 @@ cmd_cancel() {
 cmd_block() {
   local id="${1:?usage: fleet block <id> [--dep <blocking_id>] <reason>}"; shift
   local dep=""
-  if [ "$1" = "--dep" ]; then dep="${2:?--dep needs a blocking task id}"; shift 2; fi
+  if [ "${1:-}" = "--dep" ]; then dep="${2:?--dep needs a blocking task id}"; shift 2; fi
   local reason="${*:?usage: fleet block <id> [--dep <blocking_id>] <reason>}"
   if [ -n "$dep" ]; then
     # Structured dependency block — gcg-loop-driver auto-advances this when <dep> goes terminal.
