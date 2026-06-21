@@ -1,0 +1,17 @@
+[Unit]
+Description=GCG Orchestrator Watchdog (Vulcan cron) — fires alert if orchestrator tick stale
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/orchestrator_watchdog.py
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=FLEET_SKIP_CASCADE_GUARD=1
+Nice=10
+TimeoutStartSec=60
+MemoryMax=64M
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/gcg/shared/state
