@@ -284,6 +284,42 @@ def archive_manifest(slug: str, prefix: str = ""):
     print(f"  → Archived as: {archived.name}")
 
 
+# ── Manifest-driving: council→cascade wiring (Task 1.4) ─────────────────────
+
+CASCADE_DRIVER = Path("/opt/gcg/shared/bin/cascade-driver")
+
+
+def _trigger_cascade(slug: str, cascade_manifest_path: str):
+    """
+    On council PASS: auto-register the approved plan as a cascade.
+    Calls cascade-driver register <cascade_manifest_path> so the plan advances
+    task-by-task through agent_messages with 0 manual fleet send calls.
+    Idempotent — cascade-driver refuses to double-register the same plan_id.
+    """
+    mp = Path(cascade_manifest_path)
+    if not mp.exists():
+        print(f"  ⚠️  cascade_manifest_path not found: {mp} — skipping cascade registration")
+        return
+    if not CASCADE_DRIVER.exists():
+        print(f"  ⚠️  cascade-driver not found at {CASCADE_DRIVER} — skipping cascade registration")
+        return
+    print(f"  → Triggering cascade: cascade-driver register {mp}")
+    try:
+        result = subprocess.run(
+            [sys.executable, str(CASCADE_DRIVER), "register", str(mp)],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "FLEET_SKIP_CASCADE_GUARD": "1"},
+        )
+        for line in result.stdout.strip().splitlines():
+            print(f"    {line}")
+        if result.returncode != 0:
+            print(f"  ⚠️  cascade-driver returned exit {result.returncode}: {result.stderr.strip()}")
+        else:
+            print(f"  → Cascade registered for council '{slug}'")
+    except Exception as e:
+        print(f"  ⚠️  cascade registration failed (non-fatal): {e}")
+
+
 # ── Tick logic ──────────────────────────────────────────────────────────────
 
 def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
@@ -496,6 +532,10 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
             print("  → council-persist.py called")
         except Exception as e:
             print(f"  ⚠️  council-persist.py failed: {e}")
+        # Auto-register cascade if manifest specifies one (manifest-driving — Task 1.4)
+        cascade_manifest_path = manifest.get("cascade_manifest_path")
+        if cascade_manifest_path:
+            _trigger_cascade(slug, cascade_manifest_path)
         # Archive
         archive_manifest(slug)
         return "passed"

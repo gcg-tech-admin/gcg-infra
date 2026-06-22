@@ -1,0 +1,771 @@
+#!/bin/bash
+# gcg-inbox-poll — one-shot inbox drain + wake for a single agent.
+# POLLER_VERSION=13.9 (2026-06-21: A2A-PICKUP-FIX-v8 — Pass 2 retry window now uses acked_at instead of issued_at. Root cause of daen/talos drain bug: old issued_at on janitor-reset messages excluded them from re-pokes; zombie guard then killed them 12 min later. Fix: acked_at resets to NOW on each re-claim, giving freshly-recovered messages a full retry window.)
+# POLLER_VERSION=13.8 (2026-06-16: J2-FIX — Pass 6 now excludes human_gate task types (decision, revert_request) from auto-QA dispatch, matching derive_gate_kind. decision tasks with owner_type=agent are still human_gate and route directly to human approval.)
+# POLLER_VERSION=13.6 (2026-06-14: QA-DISPATCH-GATE — Pass 6 only dispatches QA for task_type IN ('standard','decision'). Fixes reply/result/message/notification types wrongly getting qa_review subtasks.
+# POLLER_VERSION=13.5 (2026-06-14: CASCADE-AUTO-ADVANCE — Pass 3b exempts plan_authorized tasks
+#                      from 30-min approval timeout. Pass 3d auto-dones plan_authorized parents
+#                      when QA subtask wedges. Fixes chain-break where plan_authorized tasks
+#                      auto-fail and cascade-kill dependents.
+# POLLER_VERSION=13.4 (2026-06-14: HARDENING — Pass 7 fleet-send failure now logs WARN instead of
+#                      silently eating the error; success path logs OK. Stamp already set before send
+#                      so original task is never affected on failure (best-effort, HW4).
+# POLLER_VERSION=13 (2026-06-14: de-gate utility tasks — Pass 3a only parks genuine human decisions
+#                    (task_type=decision, owner_type=human, needs_review, money carve-out) or real-work
+#                    qa_tier tasks; plain message/notification types go straight to done.
+#                    Pass 7: on-complete daen-ping — task_type=notification sent to daen on terminal done/failed)
+#
+# Three passes per tick (poller loops every ~5s, see gcg-inbox-poller@.service):
+#   0. CLASSIFY pending rows BEFORE claiming. Non-task rows (notifications,
+#      ghosts) are auto-closed — never materialized, never poked.
+#      0a. FYI/NOTIFICATION broadcasts: sender='cowork' AND priority>=5 AND
+#          payload text matches one of the notify_patterns set. → done, no file.
+#      0b. GHOST/undeliverable: empty payload OR repeated re-pokes past max
+#          (deliver_count>=2 AND no agent ever moved to in_progress). → failed.
+#      Real rows pass through to Pass 1.
+#   1. CLAIM   pending rows -> write JSON to workspace/inbox/, status -> 'delivered'
+#              (deliver_count+1). One JSON envelope per row, emitted by Postgres.
+#   2. RE-POKE 'delivered'/'acked' rows the agent has NOT started yet, still inside
+#              the active retry window, past the poke backoff -> re-fire the wake.
+#              Bumps acked_at ONLY (never deliver_count) so the janitor's
+#              deliver_count>=2 auto-cancel guard is never tripped by re-pokes.
+#
+# Why: the wake POST is best-effort. If it lands while the agent gateway is mid-
+# restart it fails silently, the row sits 'delivered' with the file on disk, and
+# nothing re-pokes it until the hourly janitor. Pass 2 self-heals that within
+# RETRY_BACKOFF instead of ~1h. Beyond RETRY_WINDOW the row is left for the janitor.
+#
+# Usage: gcg-inbox-poll <agent>   (safe to invoke ad-hoc)
+#
+# Env (optional): DRYRUN=1 -> log intended actions, no file writes / no poke.
+
+set -euo pipefail
+
+# Active retry window: re-poke only while a row is this young. Past it -> Pass 0's
+# zombie_repoke classifier catches it on the next tick.
+RETRY_WINDOW="${INBOX_RETRY_WINDOW:-30 minutes}"
+# Backoff: re-poke at most once per this interval (throttles pass 2).
+RETRY_BACKOFF="${INBOX_RETRY_BACKOFF:-25 seconds}"
+
+# ── Error handler ──────────────────────────────────────────────────
+_fatal() {
+  local rc=$?
+  local line=$1
+  echo "gcg-inbox-poll: FATAL at line ${line} (exit ${rc})" >&2
+  local frame=0
+  while caller $frame >/dev/null 2>&1; do
+    caller $frame >&2
+    frame=$((frame + 1))
+  done
+  /opt/gcg/shared/bin/fleet send daen "gcg-inbox-poll FAILED for ${AGENT:-?}: error at line ${line}, exit ${rc}" 2>/dev/null || true
+  exit ${rc}
+}
+trap '_fatal ${LINENO}' ERR
+
+AGENT="${1:?usage: gcg-inbox-poll <agent>}"
+
+# ── Version guard (v7): refuse to run if schema is out of date ─────────────
+# The v7 poller requires the input_required_at column added in SCHEMA-v2.
+# If absent (old schema), exit cleanly with a warning rather than silently
+# mishandling transitions. No production writes occur before this check.
+_SCHEMA_OK=$( PGPASSWORD=$(tr -d '\r\n' < "/opt/gcg/shared/credentials/db/gcg_fleet.pwd") \
+  psql "host=10.0.0.2 port=5432 user=gcg_fleet dbname=gcg_intelligence sslmode=disable" \
+  -tA -F '' -c "SELECT 1 FROM information_schema.columns WHERE table_name='agent_messages' AND column_name='input_required_at' LIMIT 1;" 2>/dev/null || echo "" )
+if [ -z "$_SCHEMA_OK" ]; then
+  echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] WARN: SCHEMA-v2 not applied (input_required_at missing). input-required gate disabled." >&2
+fi
+unset _SCHEMA_OK
+
+# Single-poller-per-agent invariant (R3 Finding 5): a tick that overruns the 5s
+# interval must never overlap a concurrent tick (claim is FOR UPDATE SKIP LOCKED,
+# but reconcile/re-poke re-materialization must not race). Non-blocking flock:
+# if another tick for THIS agent holds the lock, exit cleanly and let it finish.
+case "$AGENT" in (*[!a-z0-9_]*|'') echo "gcg-inbox-poll: invalid agent '$AGENT'" >&2; exit 2;; esac
+LOCKDIR="/run/lock"; [ -w "$LOCKDIR" ] || LOCKDIR="/tmp"
+exec 9>"${LOCKDIR}/gcg-inbox-poll.${AGENT}.lock" || { echo "gcg-inbox-poll: cannot open lock" >&2; exit 1; }
+flock -n 9 || { echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] tick overlap — skip" >&2; exit 0; }
+
+WS="/opt/gcg/openclaw-${AGENT}/workspace"
+INBOX_DIR="${WS}/inbox"
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+DRYRUN="${DRYRUN:-0}"
+
+[ ! -d "$WS" ] && { echo "gcg-inbox-poll: no workspace for $AGENT" >&2; _fatal 1; }
+[ ! -r "$PWD_FILE" ] && { echo "gcg-inbox-poll: cannot read $PWD_FILE" >&2; _fatal 1; }
+
+mkdir -p "$INBOX_DIR"
+chmod 0750 "$INBOX_DIR" 2>/dev/null || true
+
+PGPW=$(tr -d '\r\n' < "$PWD_FILE")
+export PGPASSWORD="$PGPW"
+
+_psql() {
+  psql "host=10.0.0.2 port=5432 user=gcg_fleet dbname=gcg_intelligence sslmode=disable" \
+    -v ON_ERROR_STOP=1 -tA -F $'\t' -v agent="$AGENT" "$@"
+}
+
+# Common JSON envelope projection used by both passes (operates on a CTE named `src`).
+ENVELOPE_SELECT="
+SELECT id,
+  jsonb_build_object(
+    'id', id, 'sender', sender, 'recipient', recipient,
+    'correlation_id', correlation_id, 'parent_id', parent_id,
+    'task_type', task_type, 'priority', priority,
+    'issued_at', to_char(issued_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+    'nonce', nonce, 'payload', payload
+  )::text AS envelope
+FROM src ORDER BY id;"
+
+# Write one envelope to inbox/<id>.json (atomic). Always overwrite — payload is authoritative.
+_write_file() {
+  local id="$1" envelope="$2"
+  [ "$DRYRUN" = "1" ] && { echo "DRYRUN would write ${INBOX_DIR}/${id}.json" >&2; return 0; }
+  local tmp="${INBOX_DIR}/.${id}.json.tmp" final="${INBOX_DIR}/${id}.json"
+  printf '%s\n' "$envelope" > "$tmp"
+  chmod 0640 "$tmp"
+  mv -f "$tmp" "$final"
+}
+
+# ── Pass 0: classify — auto-close notifications + ghosts ──────────
+# Runs BEFORE Pass 1's FOR UPDATE so non-task rows are never materialized.
+#
+# Batch-close matched notifications + ghosts in one UPDATE per type.
+# Log totals — one line if anything fired.
+#
+# NOTIFICATION PATTERNS — deterministic SQL LIKE, not prompt rules.
+# A row must match sender=cowork, priority>=5, AND payload text starting
+# with one of these tokens to be auto-closed (FYI, not a task).
+#
+# 0a. Notifications: sender=cowork, priority>=5, payload text matches notify_patterns.
+#     status -> done, done_at=NOW, no file written.
+NOTIFY_CLOSED=$(_psql -F '' <<SQL
+WITH src AS (
+  UPDATE agent_messages
+     SET status='done', done_at=NOW()
+   WHERE recipient = :'agent' AND status = 'pending'
+     AND sender = 'cowork' AND priority >= 5
+     AND (
+       payload->>'text' LIKE 'Fleet Sweep%' OR
+       payload->>'text' LIKE 'doc-index%' OR
+       payload->>'text' LIKE 'CASCADE STALL%' OR
+       payload->>'text' LIKE 'Fabrication%' OR
+       payload->>'text' LIKE 'STALE INBOX ALERT%' OR
+       payload->>'text' LIKE 'gcg-inbox-poll FAILED%'
+     )
+   RETURNING 1
+)
+SELECT COUNT(*) FROM src;
+SQL
+)
+NOTIFY_CLOSED=${NOTIFY_CLOSED:-0}
+
+# 0a2. Utility task-type sweeper: any pending task with a genuine fire-and-forget /
+#       terminal-output task_type (notification, ack, fyi, reply, result) goes straight to done.
+#       'message' and 'qa_review' REMOVED 2026-06-21 (born-done fix): they carry real asks/work
+#       and must be delivered, not swept. Mirrors the bin/fleet INSERT CASE change.
+UTILITY_SWEEP=$(_psql -F '' <<SQL
+WITH src AS (
+  UPDATE agent_messages
+     SET status='done', done_at=NOW()
+   WHERE recipient = :'agent' AND status = 'pending'
+     AND task_type IN ('notification','ack','fyi','reply','result')
+   RETURNING 1
+)
+SELECT COUNT(*) FROM src;
+SQL
+)
+UTILITY_SWEEP=${UTILITY_SWEEP:-0}
+
+# 0b. Ghost/undeliverable: empty payload OR delivered_count>=2 with no in_progress.
+#     status -> failed, reason='undeliverable', done_at=NOW.
+GHOST_CLOSED=$(_psql -F '' <<SQL
+WITH src AS (
+  UPDATE agent_messages
+     SET status='failed', blocked_reason='undeliverable', done_at=NOW()
+   WHERE recipient = :'agent' AND status IN ('pending','delivered')
+     AND (
+       payload IS NULL OR
+       payload = '{}'::jsonb OR
+       (payload->>'text' IS NULL) OR
+       (payload->>'text' = '')
+     )
+   RETURNING 1
+)
+SELECT COUNT(*) FROM src;
+SQL
+)
+GHOST_CLOSED=${GHOST_CLOSED:-0}
+
+# 0c. Zombie re-poke guard: any delivered/acked row with deliver_count>=2
+#     that has NEVER entered in_progress (started_at IS NULL) is stuck.
+#     Auto-fail instead of re-poking forever.
+ZOMBIE_CLOSED=$(_psql -F '' <<SQL
+WITH src AS (
+  UPDATE agent_messages
+     SET status='failed', blocked_reason='undeliverable (repoked>=2, never started)', done_at=NOW()
+   WHERE recipient = :'agent' AND status IN ('delivered','acked')
+     AND deliver_count >= 2
+     AND started_at IS NULL
+     AND acked_at < NOW() - INTERVAL '12 minutes'
+   RETURNING 1
+)
+SELECT COUNT(*) FROM src;
+SQL
+)
+# A2A-PICKUP-FIX(v7): zombie guard now uses acked_at (time of last re-claim) instead of
+# issued_at (original send time). Root cause: after gcg-inbox-janitor reprokes a message
+# (status→pending, deliver_count++), the next gcg-inbox-poll tick re-claims it
+# (deliver_count++ again → >=2) and the old guard immediately killed it because
+# issued_at was the original send time (always >2 min). The agent never had a chance
+# to process the reproked file. Fix: acked_at resets to NOW() on each re-claim, so
+# the 2-minute window starts fresh from the most recent delivery attempt.
+ZOMBIE_CLOSED=${ZOMBIE_CLOSED:-0}
+
+TOTAL_CLOSED=$((NOTIFY_CLOSED + UTILITY_SWEEP + GHOST_CLOSED + ZOMBIE_CLOSED))
+if [ "$TOTAL_CLOSED" -gt 0 ]; then
+  echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] classifier: notify=$NOTIFY_CLOSED utility_sweep=$UTILITY_SWEEP ghost=$GHOST_CLOSED zombie_repoke=$ZOMBIE_CLOSED" >&2
+fi
+
+# ── Pass 1: claim pending ──────────────────────────────────────────
+NEW_IDS=""; NEW_COUNT=0
+ROWS=$(_psql <<SQL
+WITH claimed AS (
+  SELECT id FROM agent_messages
+   WHERE recipient = :'agent' AND status = 'pending'
+   ORDER BY priority ASC, issued_at ASC
+   FOR UPDATE SKIP LOCKED LIMIT 50
+),
+src AS (
+  UPDATE agent_messages m
+     SET status='delivered', acked_at=NOW(), deliver_count=deliver_count+1
+    FROM claimed WHERE m.id = claimed.id
+  RETURNING m.*
+)
+${ENVELOPE_SELECT}
+SQL
+)
+if [ -n "$ROWS" ]; then
+  while IFS=$'\t' read -r ID ENVELOPE; do
+    [ -z "$ID" ] && continue
+    _write_file "$ID" "$ENVELOPE"
+    NEW_IDS="${NEW_IDS:+$NEW_IDS, }$ID"
+    NEW_COUNT=$((NEW_COUNT+1))
+  done <<< "$ROWS"
+fi
+
+# ── Pass 2: re-poke un-started rows in the active retry window ──────
+# Bump acked_at ONLY (throttle) — do NOT touch deliver_count.
+# A2A-PICKUP-FIX(v8): use acked_at (time of last delivery/re-claim) for the retry
+# window, not issued_at (original send time). Root cause: after gcg-inbox-janitor
+# resets a message to pending, Pass 1 re-claims it (acked_at=NOW, issued_at=ORIGINAL).
+# The old issued_at check then excluded the message from re-pokes. Without re-pokes,
+# acked_at was never refreshed, so the zombie guard killed the message 12 min later
+# — before the agent had a chance to process it. Fix: acked_at resets to NOW on each
+# re-claim, so the retry window starts fresh from the most recent delivery attempt.
+REPOKE_IDS=""; REPOKE_COUNT=0
+ROWS2=$(_psql <<SQL
+WITH due AS (
+  SELECT id FROM agent_messages
+   WHERE recipient = :'agent'
+     AND status IN ('delivered','acked')
+     AND acked_at  > NOW() - INTERVAL '${RETRY_WINDOW}'
+     AND acked_at  < NOW() - INTERVAL '${RETRY_BACKOFF}'
+   ORDER BY priority ASC, issued_at ASC
+   FOR UPDATE SKIP LOCKED LIMIT 50
+),
+src AS (
+  UPDATE agent_messages m SET acked_at=NOW()
+    FROM due WHERE m.id = due.id
+  RETURNING m.*
+)
+${ENVELOPE_SELECT}
+SQL
+)
+if [ -n "$ROWS2" ]; then
+  while IFS=$'\t' read -r ID ENVELOPE; do
+    [ -z "$ID" ] && continue
+    # Defensive: re-materialize the file if the agent removed it without closing.
+    [ -f "${INBOX_DIR}/${ID}.json" ] || _write_file "$ID" "$ENVELOPE"
+    REPOKE_IDS="${REPOKE_IDS:+$REPOKE_IDS, }$ID"
+    REPOKE_COUNT=$((REPOKE_COUNT+1))
+  done <<< "$ROWS2"
+fi
+
+# ── Pass 3: input-required gate (BEHIND FEATURE FLAG) ─────────────────────────
+# When /opt/gcg/shared/fleet-workspace/.enable-input-required exists:
+#   - Tasks marked done by this agent that have needs_review=true OR owner_type='human'
+#     are bounced to 'input-required' so a human must approve before terminal done.
+#   - Agent-owned tasks in 'input-required' >30 min are auto-failed (approval timeout).
+#     EXEMPT: owner_type='human' and task_type='decision'/'revert_request' — human gates
+#     are NEVER auto-failed; they receive a gentle reminder at 7 days (step 3c).
+# This pass is OFF by default. Flip: touch /opt/gcg/shared/fleet-workspace/.enable-input-required
+# ─────────────────────────────────────────────────────────────────────────────
+FEATURE_FLAG="/opt/gcg/shared/fleet-workspace/.enable-input-required"
+IR_BOUNCED=0; IR_TIMEDOUT=0
+if [ -f "$FEATURE_FLAG" ]; then
+  # 3a. Bounce newly-done tasks that need review to input-required.
+  # The agent that completed the task is the RECIPIENT (it received the task and called fleet done).
+  # `input_required_at IS NULL` prevents double-bounce if multiple pollers run.
+  # standard and high_stakes tasks are both bounced so Pass 6 can auto-dispatch agent QA.
+  IR_BOUNCED=$(_psql -F '' <<SQL
+WITH src AS (
+  UPDATE agent_messages
+     SET status            = 'input-required',
+         input_required_at = NOW()
+   WHERE recipient = :'agent'
+     AND status = 'done'
+     AND done_at > NOW() - INTERVAL '30 seconds'
+     AND input_required_at IS NULL
+     AND verified_by IS NULL
+     AND qa_tier IS DISTINCT FROM 'trivial'
+     -- Throwaway test tasks (sender='test') never enter the QA gate — they auto-complete.
+     -- Stops needs_acceptance_criteria FAIL spam on disposable test rows.
+     AND sender IS DISTINCT FROM 'test'
+     AND (
+       -- Human decision gate: always park these for human approval
+       task_type = 'decision'
+       OR owner_type = 'human'
+       OR needs_review = true
+       OR task_type IN ('money', 'wire', 'payment', 'payout', 'wire_transfer')
+       -- Real work needing QA: bounce only non-utility task types
+       -- Utility types (message, notification, qa_review, ack, fyi, reply, result) go straight to done.
+       OR (
+         qa_tier IN ('standard', 'high_stakes')
+         AND task_type IS NOT NULL
+         AND task_type NOT IN ('message', 'notification', 'qa_review', 'ack', 'fyi', 'reply', 'result')
+       )
+     )
+   RETURNING 1
+)
+SELECT COUNT(*) FROM src;
+SQL
+)
+  IR_BOUNCED=${IR_BOUNCED:-0}
+  [ "$IR_BOUNCED" -gt 0 ] && echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] ir_bounced=$IR_BOUNCED" >&2
+
+  # 3b. Auto-fail input-required tasks past the 30-min approval window.
+  # GATE_KIND: human_gate tasks (owner_type='human', task_type='decision'/'revert_request')
+  # are EXEMPT from auto-fail — they wait indefinitely for a human (gentle 7d reminder in 3c).
+  # work_qa_gate tasks (standard/high_stakes with agent owner) auto-fail after 30min.
+  # EXEMPTIONS:
+  #   - human-gated tasks (owner_type='human' OR task_type='decision') — wait for human; reminder at 7d
+  #   - tasks with qa_dispatched=true — waiting for agent QA (not human); QA subtask has its own timeout
+  #   - plan_authorized tasks — the plan IS the approval; never auto-fail these (Peter 2026-06-14)
+  IR_TIMEDOUT=$(_psql -F '' <<SQL
+WITH src AS (
+  UPDATE agent_messages
+     SET status        = 'failed',
+         blocked_reason = 'approval timeout (30 min exceeded)',
+         done_at        = NOW()
+   WHERE status = 'input-required'
+     AND input_required_at < NOW() - INTERVAL '30 minutes'
+     AND (accountable_owner = :'agent' OR sender = :'agent' OR recipient = :'agent')
+     AND owner_type IS DISTINCT FROM 'human'
+     AND task_type NOT IN ('decision', 'revert_request')
+     AND qa_dispatched = false
+     AND (plan_authorized IS NOT TRUE)
+     -- high_stakes post-QA approval gate is human-paced (Daen) — exempt from auto-fail.
+     -- Matches gate_kind.is_exempt_from_auto_fail(work_qa_gate, high_stakes)=True.
+     AND NOT (qa_tier = 'high_stakes' AND agent_qa_by IS NOT NULL)
+   RETURNING 1
+)
+SELECT COUNT(*) FROM src;
+SQL
+)
+  IR_TIMEDOUT=${IR_TIMEDOUT:-0}
+  [ "$IR_TIMEDOUT" -gt 0 ] && echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] ir_timeout=$IR_TIMEDOUT" >&2
+
+  # 3d. QA subtask timeout recovery: when a qa_review task is auto-failed (wedged QA agent),
+  # handle based on plan_authorized:
+  #   - plan_authorized parent → auto-done (plan approval IS the authorization; Peter 2026-06-14)
+  #   - non-plan_authorized parent → reset qa_dispatched=false for re-dispatch
+  QA_WEDGE_RESET=$(_psql -F '' <<SQL
+WITH failed_qa AS (
+  SELECT am.id AS qa_id, am.parent_id
+    FROM agent_messages am
+   WHERE am.task_type = 'qa_review'
+     AND am.status = 'failed'
+     AND am.blocked_reason LIKE 'approval timeout%'
+     AND am.done_at > NOW() - INTERVAL '2 minutes'
+     AND (am.accountable_owner = :'agent' OR am.sender = :'agent' OR am.recipient = :'agent')
+),
+auto_done AS (
+  UPDATE agent_messages p
+     SET status          = 'done',
+         verified_by     = 'qa-auto',
+         verified_actor_type = 'agent',
+         verified_at     = NOW(),
+         done_at         = NOW(),
+         blocked_reason  = NULL,
+         progress_note   = COALESCE(p.progress_note,'') ||
+                           E'\n[qa_wedge_auto_done] QA agent timed out; plan_authorized — auto-done'
+    FROM failed_qa fq
+   WHERE p.id = fq.parent_id
+     AND p.plan_authorized = true
+     AND p.status = 'input-required'
+  RETURNING p.id
+),
+reset AS (
+  UPDATE agent_messages p
+     SET qa_dispatched = false,
+         progress_note = COALESCE(p.progress_note,'') ||
+                         E'\n[qa_wedge_reset] QA agent timed out; re-dispatching'
+    FROM failed_qa fq
+   WHERE p.id = fq.parent_id
+     AND p.plan_authorized IS NOT TRUE
+     AND p.qa_dispatched = true
+     AND p.status = 'input-required'
+  RETURNING p.id
+)
+SELECT COALESCE((SELECT COUNT(*) FROM auto_done), 0) +
+       COALESCE((SELECT COUNT(*) FROM reset), 0);
+SQL
+)
+  QA_WEDGE_RESET=${QA_WEDGE_RESET:-0}
+  [ "$QA_WEDGE_RESET" -gt 0 ] && echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] qa_wedge_reset=$QA_WEDGE_RESET" >&2
+
+  # 3c. Gentle reminder for human-gated tasks waiting >7 days (not a fail — just a nudge).
+  # Stamps progress_note so each reminder fires at most once per 7 days.
+  IR_REMIND=$(_psql -F '' <<SQL
+WITH overdue AS (
+  SELECT id, recipient, input_required_at,
+         EXTRACT(DAY FROM NOW() - input_required_at)::int AS days_waiting
+    FROM agent_messages
+   WHERE status = 'input-required'
+     AND (owner_type = 'human' OR task_type IN ('decision','revert_request'))
+     AND input_required_at < NOW() - INTERVAL '7 days'
+     AND (accountable_owner = :'agent' OR sender = :'agent' OR recipient = :'agent')
+     AND (progress_note IS NULL
+          OR progress_note NOT LIKE '%[reminder]%'
+          OR progress_note < to_char(NOW() - INTERVAL '7 days', 'YYYY-MM-DD"T"HH24:MI"Z"'))
+),
+bumped AS (
+  UPDATE agent_messages am
+     SET progress_note = COALESCE(am.progress_note, '') ||
+                         E'\n[reminder ' || to_char(NOW(),'YYYY-MM-DD') ||
+                         '] human gate waiting ' || o.days_waiting::text || ' days'
+    FROM overdue o WHERE am.id = o.id
+  RETURNING am.id, am.recipient, o.days_waiting
+)
+SELECT COUNT(*) FROM bumped;
+SQL
+)
+  IR_REMIND=${IR_REMIND:-0}
+  [ "$IR_REMIND" -gt 0 ] && echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] ir_human_remind=$IR_REMIND" >&2
+
+  # Pass 4: cascade resume — fire stored on_complete hooks for newly-approved tasks.
+  # W1 wiring: when a human approves a task in the Approval Queue (status→done,
+  # verified_by set), and the task has artifacts.cascade_on_complete, the poller
+  # executes the hook to resume the cascade chain. Atomic claim prevents double-fire.
+  RESUME_DATA=$(_psql <<'SQL'
+WITH claimed AS (
+  UPDATE agent_messages
+     SET artifacts = artifacts || '{"cascade_resumed":"running"}'::jsonb
+   WHERE recipient = :'agent'
+     AND status = 'done'
+     AND verified_by IS NOT NULL
+     AND input_required_at IS NOT NULL
+     AND artifacts ? 'cascade_on_complete'
+     AND (artifacts->>'cascade_resumed') IS NULL
+   RETURNING id, artifacts->>'cascade_on_complete' AS hook
+)
+SELECT id, hook FROM claimed;
+SQL
+  )
+  if [ -n "$RESUME_DATA" ]; then
+    while IFS=$'\t' read -r TASK_ID CASCADE_HOOK; do
+      [ -z "$TASK_ID" ] && continue
+      echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] cascade_resume id=$TASK_ID" >&2
+      RESUME_LOG="${WS}/cascade-resume-${TASK_ID}.log"
+      if bash -c "$CASCADE_HOOK" >"$RESUME_LOG" 2>&1; then
+        _psql -v tid="$TASK_ID" <<'SQL'
+UPDATE agent_messages SET artifacts = artifacts || '{"cascade_resumed":"ok"}'::jsonb WHERE id = :'tid'::bigint;
+SQL
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] cascade_resume id=$TASK_ID OK" >&2
+      else
+        _psql -v tid="$TASK_ID" <<'SQL'
+UPDATE agent_messages
+   SET artifacts     = artifacts || '{"cascade_resumed":"error"}'::jsonb,
+       progress_note = COALESCE(progress_note, '') || E'\n[cascade_resume FAILED — see /tmp/gcg-cascade-resume-' || :'tid' || '.log]'
+ WHERE id = :'tid'::bigint;
+SQL
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] cascade_resume id=$TASK_ID FAILED — $(tail -2 "$RESUME_LOG" 2>/dev/null)" >&2
+      fi
+    done <<< "$RESUME_DATA"
+  fi
+
+  # Pass 5: trivial QA auto-check — look up command from qa_checks registry, run with timeout.
+  # qa_check column stores a REGISTERED NAME (FK → qa_checks.name), never raw shell.
+  # Fires on done tasks with qa_tier='trivial', qa_check IS NOT NULL, verified_by IS NULL.
+  TRIVIAL_DATA=$(_psql <<'SQL'
+WITH claimed AS (
+  UPDATE agent_messages
+     SET verified_by         = 'qa-auto',
+         verified_actor_type = 'agent',
+         verified_at         = NOW()
+   WHERE recipient = :'agent'
+     AND status = 'done'
+     AND qa_tier = 'trivial'
+     AND qa_check IS NOT NULL
+     AND verified_by IS NULL
+   RETURNING id, qa_check
+)
+SELECT c.id, q.command
+  FROM claimed c
+  JOIN qa_checks q ON q.name = c.qa_check;
+SQL
+  )
+  if [ -n "$TRIVIAL_DATA" ]; then
+    while IFS=$'\t' read -r TASK_ID QA_CMD; do
+      [ -z "$TASK_ID" ] && continue
+      QA_LOG="${WS}/qa-trivial-${TASK_ID}.log"
+      echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] trivial_qa id=$TASK_ID" >&2
+      # Run with 30s timeout; treat timeout (exit 124) as failure
+      if timeout 30 bash -c "$QA_CMD" >"$QA_LOG" 2>&1; then
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] trivial_qa id=$TASK_ID PASS" >&2
+      else
+        QA_EXIT=$?
+        QA_REASON="trivial QA check failed (exit $QA_EXIT)"
+        [ "$QA_EXIT" -eq 124 ] && QA_REASON="trivial QA check timed out (30s limit)"
+        _psql -v tid="$TASK_ID" -v reason="$QA_REASON" <<'SQL2'
+UPDATE agent_messages
+   SET verified_by         = NULL,
+       verified_actor_type = NULL,
+       verified_at         = NULL,
+       status              = 'input-required',
+       input_required_at   = NOW(),
+       blocked_reason      = :'reason'
+ WHERE id = :'tid'::bigint;
+SQL2
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] trivial_qa id=$TASK_ID FAILED ($QA_REASON) — bounced to input-required" >&2
+      fi
+    done <<< "$TRIVIAL_DATA"
+  fi
+
+  # ── Pass 6: auto-QA-dispatch ───────────────────────────────────────────────
+  # GATE_KIND: only work_qa_gate tasks get auto-QA-dispatched.
+  # human_gate tasks (owner_type='human', task_type='decision'/'revert_request')
+  # are excluded — they wait for a human approver, not an agent QA reviewer.
+  # Pass 6 matches derive_gate_kind: owner_type != human AND task_type NOT IN
+  # (decision, revert_request) → always work_qa_gate, never human_gate.
+  # For every task in input-required state that needs agent QA (standard/high_stakes,
+  # agent_qa_by IS NULL, not yet dispatched, not a human-gate task), auto-create a
+  # qa_review subtask for the QA agent with a full context bundle.
+  #
+  # QA agent selection (separation of duties):
+  #   - Default: vulcan.  Fallback round-robin: orpheus, nexus.
+  #   - NEVER the task's recipient (doer) or accountable_owner.
+  # Idempotency: qa_dispatched=true prevents a second dispatch on the next tick.
+  # Human gates (owner_type='human') are not auto-dispatched — they wait for a human.
+  QA_ALLOWLIST=("vulcan" "orpheus" "nexus")
+
+  QA_DISPATCH_DATA=$(_psql <<'SQL'
+SELECT am.id,
+       am.sender,
+       am.recipient,
+       COALESCE(am.accountable_owner, 'NONE') AS accountable_owner,
+       am.qa_tier,
+       am.plan_authorized,
+       replace(COALESCE(am.payload->>'text','(no text)'), E'\n', ' ') AS task_text,
+       replace(COALESCE(NULLIF(COALESCE(am.payload->>'acceptance',''), ''), '(none)'), E'\n', ' ') AS acceptance,
+       COALESCE(NULLIF(am.correlation_id::text, ''), gen_random_uuid()::text) AS corr_id,
+       replace(COALESCE(am.artifacts::text, '{}'), E'\n', ' ') AS artifacts_json,
+       replace(COALESCE(NULLIF(COALESCE(am.input_prompt, ''), ''), '(none)'), E'\n', ' ') AS input_prompt
+  FROM agent_messages am
+ WHERE am.status           = 'input-required'
+   AND am.qa_tier          IN ('standard','high_stakes')
+   AND am.agent_qa_by      IS NULL
+   AND am.qa_dispatched    = false
+   AND (am.owner_type      IS DISTINCT FROM 'human')
+   AND (am.task_type       NOT IN ('decision', 'revert_request'))
+   AND NOT (am.task_type = 'deploy_approval' AND am.plan_authorized = false)
+   AND am.sender IS DISTINCT FROM 'test'
+   AND (am.accountable_owner = :'agent' OR am.sender = :'agent' OR am.recipient = :'agent')
+ ORDER BY am.id
+ LIMIT 20;
+SQL
+  )
+
+  if [ -n "$QA_DISPATCH_DATA" ]; then
+    while IFS=$'\t' read -r TASK_ID T_SENDER T_RECIPIENT T_OWNER T_TIER T_PLAN_AUTH \
+                                     T_TEXT T_ACCEPTANCE T_CORR T_ARTIFACTS T_PROMPT; do
+      [ -z "$TASK_ID" ] && continue
+
+      # Pick a QA agent ≠ doer (recipient) ≠ creator (sender) ≠ accountable_owner
+      # Excluding sender prevents self-QA on reply/message tasks where vulcan
+      # is both the sender and a QA allowlist member (root cause: 2026-06-13 inbox-poll crash).
+      QA_AGENT=""
+      for candidate in "${QA_ALLOWLIST[@]}"; do
+        if [ "$candidate" != "$T_RECIPIENT" ] && [ "$candidate" != "$T_OWNER" ] && [ "$candidate" != "$T_SENDER" ]; then
+          QA_AGENT="$candidate"
+          break
+        fi
+      done
+      if [ -z "$QA_AGENT" ]; then
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] qa_dispatch ESCALATE id=$TASK_ID — no eligible QA agent (doer=$T_RECIPIENT owner=$T_OWNER)" >&2
+        _psql -v tid="$TASK_ID" <<'SQL2'
+UPDATE agent_messages
+   SET blocked_reason = 'no eligible QA agent — escalated to daen',
+       needs_review   = true
+ WHERE id = :'tid'::bigint AND qa_dispatched = false;
+SQL2
+        /opt/gcg/shared/bin/fleet send --from system daen \
+          "QA escalation: no eligible QA agent for task #$TASK_ID (doer=$T_RECIPIENT owner=$T_OWNER). Please assign a QA reviewer manually." 2>/dev/null || true
+        continue
+      fi
+
+      # Build full context bundle for the QA agent
+      QA_CONTEXT_TEXT="QA Review required for task #${TASK_ID} (${T_TIER})
+
+Original task:
+${T_TEXT}
+
+Acceptance criteria:
+${T_ACCEPTANCE:-NONE — if empty, infer concrete checks from the task text}
+
+(Optional doer notes — NOT required and NOT the basis for your verdict):
+${T_ARTIFACTS}
+
+Project correlation_id: ${T_CORR}
+
+Instructions — VERIFY AGAINST THE LIVE SYSTEM, not a self-reported artifacts blob
+(Peter directive 2026-06-16: artifacts gate SCRAPPED — proof is reality, not what the doer claims):
+1. Use the project-context skill / pgvector recall for relevant architecture/schema.
+2. Independently CHECK each acceptance criterion against reality yourself — curl the endpoint,
+   query the DB, load the page, run the test. The live system is the source of truth.
+3. Do NOT fail a task merely because the doer submitted no artifacts. Fail ONLY if the live
+   system does not meet the acceptance criteria.
+4. If acceptance criteria are missing AND you cannot infer concrete checks from the task text,
+   verdict = FAIL, reason = 'needs_acceptance_criteria'.
+5. Call POST /tasks/${TASK_ID}/qa-verify with your verdict (pass/fail) and your LIVE evidence.
+   - verdict=pass if the live system satisfies ALL acceptance criteria (state what you checked).
+   - verdict=fail otherwise (include which criterion failed, with the live evidence).
+6. Record exactly what you checked (URLs, queries, results) in your reasoning."
+
+      # Mark dispatched BEFORE inserting subtask (prevents race on concurrent pollers)
+      MARK_OK=$(_psql -F '' -v tid="$TASK_ID" <<'SQL3'
+UPDATE agent_messages
+   SET qa_dispatched = true
+ WHERE id = :'tid'::bigint
+   AND qa_dispatched = false
+RETURNING id;
+SQL3
+      )
+      if [ -z "$MARK_OK" ]; then
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] qa_dispatch id=$TASK_ID already dispatched (race) — skip" >&2
+        continue
+      fi
+
+      # Sanitize correlation_id: generate new UUID if empty/invalid
+      if [ -z "$T_CORR" ] || [ "$T_CORR" = "00000000-0000-0000-0000-000000000000" ]; then
+        T_CORR=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || echo "$(date +%s)-$$-RANDOM")
+      fi
+
+      # Insert QA subtask directly for atomicity
+      QA_SUBTASK_ID=$(_psql -F '' \
+        -v qa_agent="$QA_AGENT" \
+        -v sender="$AGENT" \
+        -v parent="$TASK_ID" \
+        -v corr="$T_CORR" \
+        -v tier="$T_TIER" \
+        -v qa_text="$QA_CONTEXT_TEXT" <<'SQL4'
+INSERT INTO agent_messages
+  (correlation_id, parent_id, sender, recipient, task_type, payload,
+   nonce, status, qa_tier, accountable_owner, owner_type, priority)
+VALUES
+  (:'corr'::uuid, :'parent'::bigint, :'sender', :'qa_agent',
+   'qa_review',
+   jsonb_build_object('text', :'qa_text', 'qa_parent_id', :'parent'::bigint),
+   gen_random_uuid(), 'pending', :'tier',
+   :'qa_agent', 'agent', 3)
+RETURNING id;
+SQL4
+      )
+      QA_SUBTASK_ID=$(echo "$QA_SUBTASK_ID" | grep -E '^[0-9]+$' | head -1)
+
+      if [ -n "$QA_SUBTASK_ID" ]; then
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] qa_dispatch id=$TASK_ID → qa_review #$QA_SUBTASK_ID assigned to $QA_AGENT" >&2
+      else
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] qa_dispatch id=$TASK_ID INSERT failed" >&2
+        _psql -v tid="$TASK_ID" <<'SQL5'
+UPDATE agent_messages SET qa_dispatched = false WHERE id = :'tid'::bigint;
+SQL5
+      fi
+
+    done <<< "$QA_DISPATCH_DATA"
+  fi
+
+fi  # end feature flag
+
+# ── Pass 7: on-complete daen-ping ─────────────────────────────────────────────
+# When any task associated with this agent reaches terminal done/failed (within
+# last 30s), send a lightweight notification (task_type='notification') to daen
+# so the watcher can wake on the event instead of polling.
+# Race-safe: artifacts.daen_notified stamp is set atomically before the fleet send;
+#            a concurrent poller for another agent sees the stamp and skips.
+# Loop-safe: notifications themselves (task_type='notification') are excluded so a
+#            completed notification does not trigger another notification.
+# Board-safe: task_type='notification' is not in REAL_WORK_TYPES so it never appears
+#             on The Forge board.
+NOTIFY_ROWS=$(_psql -F '|' <<'SQL'
+WITH stamped AS (
+  UPDATE agent_messages
+     SET artifacts = artifacts || '{"daen_notified": true}'::jsonb
+   WHERE (accountable_owner = :'agent' OR sender = :'agent' OR recipient = :'agent')
+     AND status IN ('done', 'failed')
+     AND done_at > NOW() - INTERVAL '30 seconds'
+     AND (artifacts->>'daen_notified') IS NULL
+     AND task_type IS DISTINCT FROM 'notification'
+   RETURNING id, status
+)
+SELECT id, status FROM stamped ORDER BY id;
+SQL
+)
+if [ -n "$NOTIFY_ROWS" ]; then
+  while IFS='|' read -r TASK_ID TASK_STATUS; do
+    [ -z "$TASK_ID" ] && continue
+    if /opt/gcg/shared/bin/fleet send --from system --type notification --qa-tier trivial daen \
+         "task #${TASK_ID} reached ${TASK_STATUS}" 2>/dev/null; then
+      echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] daen_ping id=$TASK_ID status=$TASK_STATUS OK" >&2
+    else
+      echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] daen_ping WARN id=$TASK_ID status=$TASK_STATUS fleet-send failed (best-effort, stamp set)" >&2
+    fi
+  done <<< "$NOTIFY_ROWS"
+fi
+
+TOTAL=$((NEW_COUNT + REPOKE_COUNT))
+[ "$TOTAL" -eq 0 ] && exit 0
+echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] new=$NEW_COUNT repoke=$REPOKE_COUNT" >&2
+
+# ── Wake the agent via its /hooks/fleet endpoint ───────────────────
+if [ "$DRYRUN" = "1" ]; then
+  echo "DRYRUN would poke (new: ${NEW_IDS:-none}; repoke: ${REPOKE_IDS:-none})" >&2
+  exit 0
+fi
+OPENCLAW_CFG="/opt/gcg/openclaw-${AGENT}/openclaw.json"
+[ -r "$OPENCLAW_CFG" ] || exit 0
+PORT=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print((c.get('gateway') or {}).get('port') or c.get('port') or '')" "$OPENCLAW_CFG" 2>/dev/null)
+TOKEN=$(python3 -c "import json,sys; cfg=json.load(open(sys.argv[1])); raw=(cfg.get('hooks') or {}).get('token') or ''; print(raw)" "$OPENCLAW_CFG" 2>/dev/null)
+case "$TOKEN" in
+  *'${'*)
+    DROPIN="/etc/systemd/system/openclaw-${AGENT}.service.d/20-env-secrets.conf"
+    if [ -r "$DROPIN" ]; then
+      TOKEN=$(sed -n 's/^Environment=HOOKS_TOKEN=//p' "$DROPIN")
+    fi
+  ;;
+esac
+[ -n "$PORT" ] && [ -n "$TOKEN" ] || exit 0
+
+ALL_IDS="${NEW_IDS}${NEW_IDS:+${REPOKE_IDS:+, }}${REPOKE_IDS}"
+MSG="You have ${TOTAL} inbox message(s) awaiting processing at workspace/inbox/ (ids: ${ALL_IDS}). Process per /opt/gcg/shared/docs/FLEET_INBOX.md: cat each, 'fleet start <id>', act, then 'fleet done <id>' and rm the file. Respond in English only."
+BODY=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1]}))" "$MSG")
+if curl -fsS --max-time 8 \
+     -X POST "http://127.0.0.1:${PORT}/hooks/fleet" \
+     -H "Authorization: Bearer ${TOKEN}" \
+     -H "Content-Type: application/json" \
+     -d "$BODY" >/dev/null 2>&1; then
+  echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] poked port=${PORT} (new=$NEW_COUNT repoke=$REPOKE_COUNT)" >&2
+else
+  # Poke failed (agent likely mid-restart). Row stays 'delivered'; pass 2 retries next tick.
+  echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] poke FAILED port=${PORT} — will retry" >&2
+fi

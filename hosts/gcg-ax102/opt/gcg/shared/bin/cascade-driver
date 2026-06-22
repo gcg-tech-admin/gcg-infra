@@ -1,0 +1,375 @@
+#!/opt/gcg/shared/venv/bin/python3
+"""
+cascade-driver — Fleet-bus cascade plan registration + status driver
+=====================================================================
+
+Registers a cascade plan manifest into agent_messages with proper blocked_by
+dependency chains. gcg-loop-driver then unblocks tasks automatically as deps
+complete; gcg-inbox-poll delivers them to agents.
+
+Usage:
+  cascade-driver register <plan.json>          # register plan into fleet bus
+  cascade-driver status   <plan.json>          # show task status from DB
+  cascade-driver register <plan.json> --dry-run  # preview without writing
+
+Plan manifest format (JSON):
+  {
+    "id": "my-plan-v1",
+    "name": "Human-readable plan name",
+    "sender": "daen",           # optional, defaults to daen
+    "tasks": [
+      {
+        "id": "t1",
+        "description": "What to build",
+        "owner": "coder-sonnet",          # fleet recipient
+        "depends_on": [],                  # [] = first task
+        "acceptance": "...",               # optional AC for payload
+        "priority": 2,                     # optional 1-3, default 2
+        "plan_authorized": true            # optional, default false
+      },
+      {
+        "id": "t2",
+        "description": "QA review",
+        "owner": "vulcan",
+        "depends_on": ["t1"],
+        "acceptance": "Vulcan verdict PASS"
+      }
+    ]
+  }
+
+State file: /opt/gcg/shared/state/cascade_driver_state.json
+  Maps plan_id → { registered_at, tasks: { task_id → { message_id, owner } } }
+
+Idempotent: re-running register on an already-registered plan is a no-op.
+             Use --force to re-register (issues new tasks alongside existing ones).
+
+Pipeline (register → gcg-loop-driver → gcg-inbox-poll → agent → fleet done → repeat):
+  1. register: send t1 as pending, t2..tN as blocked, fleet chain each dep
+  2. gcg-loop-driver (every ~10s): unblocks tasks whose blocked_by are all done
+  3. gcg-inbox-poll (per-agent): claims pending rows, delivers to agent
+  4. Agent does work, runs `fleet done <id>` (or fleet fail)
+  5. gcg-loop-driver sees t1 done → unblocks t2 → repeat
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATE_FILE  = Path("/opt/gcg/shared/state/cascade_driver_state.json")
+FLEET_BIN   = "/usr/local/bin/fleet"
+DEFAULT_SENDER = "daen"
+LOG_PREFIX  = "[cascade-driver]"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def log(msg):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[{ts}] {LOG_PREFIX} {msg}", flush=True)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_state(state: dict):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE_FILE.parent, prefix=".cds_tmp_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2)
+            f.write("\n")
+        os.rename(tmp, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _fleet_send(sender: str, recipient: str, msg: str, *,
+                blocked: bool = False,
+                priority: int = 2,
+                plan_authorized: bool = False,
+                acceptance: str = "",
+                dry_run: bool = False) -> int:
+    """Issue a fleet send and return the new message_id. Returns -1 on dry-run."""
+    cmd = [FLEET_BIN, "send",
+           "--from", sender,
+           "--priority", str(priority)]
+    if blocked:
+        cmd.append("--blocked")
+    if plan_authorized:
+        cmd.append("--plan-authorized")
+    if acceptance:
+        cmd += ["--acceptance", acceptance]
+    cmd += [recipient, msg]
+
+    if dry_run:
+        print(f"  [DRY-RUN] fleet send {' '.join(cmd[2:])}")
+        return -1
+
+    env = {**os.environ, "FLEET_SKIP_CASCADE_GUARD": "1"}
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=15)
+    if result.returncode != 0:
+        raise RuntimeError(f"fleet send failed: {result.stderr.strip()}")
+    # Output: id|correlation_id|status\nINSERT 0 1
+    first_line = result.stdout.strip().split("\n")[0]
+    msg_id = int(first_line.split("|")[0])
+    return msg_id
+
+
+def _fleet_chain(task_id: int, dep_id: int, dry_run: bool = False):
+    """Safely add dep_id to blocked_by of task_id (cycle-checked)."""
+    if dry_run:
+        print(f"  [DRY-RUN] fleet chain {task_id} {dep_id}")
+        return
+    env = {**os.environ, "FLEET_SKIP_CASCADE_GUARD": "1"}
+    result = subprocess.run(
+        [FLEET_BIN, "chain", str(task_id), str(dep_id)],
+        capture_output=True, text=True, env=env, timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"fleet chain failed: {result.stderr.strip()}")
+
+
+def _msg_status(message_id: int) -> str:
+    """Query agent_messages.status for a given id. Returns 'unknown' on error."""
+    import psycopg2
+    # Use gcg_fleet for broad RLS (can read any row regardless of sender/recipient)
+    cred_path = Path("/opt/gcg/shared/credentials/db/gcg_fleet.pwd")
+    if not cred_path.exists():
+        cred_path = Path("/opt/gcg/shared/credentials/db/gcg_daen.pwd")
+    cred = cred_path.read_text().strip()
+    user = "gcg_fleet" if "fleet" in str(cred_path) else "gcg_daen"
+    try:
+        conn = psycopg2.connect(
+            host=os.environ.get("GCG_DB_HOST", "10.0.0.2"),
+            port=5432, dbname="gcg_intelligence",
+            user=user, password=cred, connect_timeout=5,
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT status FROM agent_messages WHERE id=%s", (message_id,))
+        row = cur.fetchone()
+        conn.close()
+        return row[0] if row else "not-found"
+    except Exception as e:
+        return f"error:{e}"
+
+
+# ── Topological sort ──────────────────────────────────────────────────────────
+
+def _topo_sort(tasks: list) -> list:
+    """Return tasks in dependency order (roots first). Raises on cycles."""
+    by_id = {t["id"]: t for t in tasks}
+    visited, order = set(), []
+
+    def visit(tid, stack=()):
+        if tid in stack:
+            raise ValueError(f"Cycle detected: {' → '.join(stack)} → {tid}")
+        if tid in visited:
+            return
+        for dep in by_id[tid].get("depends_on", []):
+            visit(dep, stack + (tid,))
+        visited.add(tid)
+        order.append(by_id[tid])
+
+    for t in tasks:
+        visit(t["id"])
+    return order
+
+
+# ── Register command ──────────────────────────────────────────────────────────
+
+def cmd_register(plan_path: Path, *, dry_run: bool = False, force: bool = False):
+    """
+    Register a cascade plan into the fleet bus.
+    Issues tasks as pending (no deps) or blocked (has deps), then chains deps.
+    """
+    try:
+        plan = json.loads(plan_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"ERROR: cannot read plan file: {e}")
+        sys.exit(1)
+
+    plan_id   = plan.get("id") or plan_path.stem
+    plan_name = plan.get("name", plan_id)
+    sender    = plan.get("sender", DEFAULT_SENDER)
+    tasks     = plan.get("tasks", [])
+
+    if not tasks:
+        log("ERROR: plan has no tasks")
+        sys.exit(1)
+
+    # Topological sort
+    try:
+        ordered = _topo_sort(tasks)
+    except ValueError as e:
+        log(f"ERROR: {e}")
+        sys.exit(1)
+
+    # Idempotency check
+    state = _load_state()
+    if plan_id in state and not force:
+        log(f"Plan '{plan_id}' already registered. Use --force to re-register.")
+        log(f"  Registered at: {state[plan_id].get('registered_at')}")
+        log(f"  Tasks: {len(state[plan_id].get('tasks', {}))}")
+        sys.exit(0)
+
+    log(f"Registering plan '{plan_name}' ({plan_id}): {len(ordered)} tasks")
+    if dry_run:
+        log("DRY-RUN mode — no writes")
+
+    plan_state = {
+        "registered_at": now_iso(),
+        "name": plan_name,
+        "plan_file": str(plan_path.resolve()),
+        "tasks": {},
+    }
+
+    # Pass 1: issue all tasks
+    msg_id_by_task = {}
+    for task in ordered:
+        tid      = task["id"]
+        owner    = task["owner"]
+        desc     = task["description"]
+        deps     = task.get("depends_on", [])
+        prio     = task.get("priority", 2)
+        pa       = task.get("plan_authorized", False)
+        ac       = task.get("acceptance", "")
+        blocked  = bool(deps)
+
+        body = f"CASCADE TASK: {desc}"
+        if ac:
+            body += f"\n\nAcceptance: {ac}\n\n[plan_authorized=true]" if pa else f"\n\nAcceptance: {ac}"
+
+        log(f"  {'[blocked] ' if blocked else '[pending] '}{tid} → {owner}: {desc[:60]}")
+        msg_id = _fleet_send(sender, owner, body,
+                             blocked=blocked, priority=prio,
+                             plan_authorized=pa, acceptance=ac,
+                             dry_run=dry_run)
+        msg_id_by_task[tid] = msg_id
+        plan_state["tasks"][tid] = {
+            "message_id": msg_id,
+            "owner": owner,
+            "description": desc[:120],
+            "issued_at": now_iso(),
+        }
+
+    # Pass 2: wire dependencies
+    log("Wiring dependency chains...")
+    for task in ordered:
+        tid  = task["id"]
+        deps = task.get("depends_on", [])
+        for dep_tid in deps:
+            dep_msg_id  = msg_id_by_task.get(dep_tid)
+            task_msg_id = msg_id_by_task.get(tid)
+            if dep_msg_id is None or task_msg_id is None:
+                log(f"  WARN: cannot chain {tid}←{dep_tid}: missing message_id")
+                continue
+            if dep_msg_id < 0 or task_msg_id < 0:
+                log(f"  [DRY-RUN] chain {tid}(msg#{task_msg_id}) ← {dep_tid}(msg#{dep_msg_id})")
+                continue
+            log(f"  chain msg#{task_msg_id} ({tid}) ← msg#{dep_msg_id} ({dep_tid})")
+            _fleet_chain(task_msg_id, dep_msg_id, dry_run=dry_run)
+
+    # Save state
+    if not dry_run:
+        state[plan_id] = plan_state
+        _save_state(state)
+        log(f"State written to {STATE_FILE}")
+
+    log(f"Done. {len(ordered)} tasks registered for plan '{plan_id}'")
+    if not dry_run:
+        log("gcg-loop-driver will unblock tasks automatically as deps complete.")
+
+
+# ── Status command ────────────────────────────────────────────────────────────
+
+def cmd_status(plan_path: Path):
+    """Show current status of a registered plan from agent_messages."""
+    try:
+        plan = json.loads(plan_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"ERROR: cannot read plan file: {e}")
+        sys.exit(1)
+
+    plan_id   = plan.get("id") or plan_path.stem
+    plan_name = plan.get("name", plan_id)
+
+    state = _load_state()
+    if plan_id not in state:
+        log(f"Plan '{plan_id}' not registered. Run: cascade-driver register <plan.json>")
+        sys.exit(1)
+
+    plan_state = state[plan_id]
+    tasks      = plan_state.get("tasks", {})
+
+    print(f"\nPlan: {plan_name} ({plan_id})")
+    print(f"Registered: {plan_state.get('registered_at')}")
+    print(f"{'Task':<12} {'Owner':<20} {'Msg ID':<10} {'Status':<15} Description")
+    print("-" * 90)
+
+    done_count  = 0
+    total_count = len(tasks)
+
+    for task_id, t in tasks.items():
+        msg_id = t.get("message_id", -1)
+        status = _msg_status(msg_id) if msg_id and msg_id > 0 else "not-issued"
+        if status == "done":
+            done_count += 1
+        desc = t.get("description", "")[:45]
+        print(f"{task_id:<12} {t.get('owner','?'):<20} {msg_id:<10} {status:<15} {desc}")
+
+    print("-" * 90)
+    print(f"Progress: {done_count}/{total_count} tasks done")
+    if done_count == total_count:
+        print("STATUS: COMPLETE")
+    else:
+        print("STATUS: IN PROGRESS")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(
+        description="cascade-driver — register cascade plan into fleet bus",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    reg = sub.add_parser("register", help="Register plan into agent_messages")
+    reg.add_argument("plan", type=Path, help="Plan manifest JSON file")
+    reg.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    reg.add_argument("--force", action="store_true", help="Re-register even if already registered")
+
+    sta = sub.add_parser("status", help="Show task status from agent_messages")
+    sta.add_argument("plan", type=Path, help="Plan manifest JSON file")
+
+    args = p.parse_args()
+
+    if args.command == "register":
+        cmd_register(args.plan, dry_run=args.dry_run, force=getattr(args, "force", False))
+    elif args.command == "status":
+        cmd_status(args.plan)
+
+
+if __name__ == "__main__":
+    main()

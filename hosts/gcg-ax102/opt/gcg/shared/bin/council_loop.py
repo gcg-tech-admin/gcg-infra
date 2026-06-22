@@ -199,9 +199,24 @@ def push_revise_to_convener(agent: str, message: str, priority: int = 3) -> bool
 
 
 def verdict_file(plan_slug: str, reviewer: str, round_n: int) -> Path:
-    if round_n == 1:
-        return VERDICT_DIR / f"{plan_slug}-{reviewer}.md"
-    return VERDICT_DIR / f"{plan_slug}-{reviewer}-R{round_n}.md"
+    fname = (f"{plan_slug}-{reviewer}.md" if round_n == 1
+             else f"{plan_slug}-{reviewer}-R{round_n}.md")
+    canonical = VERDICT_DIR / fname
+    if canonical.exists():
+        return canonical
+    # Robustness: some reviewers run with WorkingDirectory=their workspace and
+    # write the verdict to <workspace>/plans/reviews/ instead of the absolute
+    # shared path they were given. Harvest it into the canonical location so the
+    # poll loop + consolidation find it regardless of where the agent wrote.
+    agent_id = REVIEWER_IDS.get(reviewer.upper(), reviewer.lower())
+    ws_fallback = Path(
+        f"/opt/gcg/openclaw-{agent_id}/workspace/plans/reviews/{fname}")
+    if ws_fallback.exists():
+        try:
+            canonical.write_bytes(ws_fallback.read_bytes())
+        except Exception:
+            return ws_fallback
+    return canonical
 
 
 def parse_verdict(path: Path) -> str:

@@ -1,0 +1,67 @@
+#!/bin/bash
+# gcg-inbox-stale-check — fleet-wide stale-inbox monitor (R3 Finding 3).
+#
+# For every REAL agent (one with an openclaw-<agent>.service), runs
+#   fleet check --inbox-stale --threshold N --agent <agent>
+# and alerts daen ONCE per distinct stale set. Scoping to agents-with-a-poller
+# deliberately excludes orphan pseudo-recipients (cowork/peter/pan) whose pending
+# rows are a data-hygiene issue, NOT a stuck-delivery problem.
+#
+# Dedup: the set of stale ids is hashed; daen is alerted only when the hash
+# changes vs the last alert (state file) — a persistent stuck row alerts once,
+# not every tick. NO-SPAM compliant.
+#
+# Env: THRESHOLD (sec, default 300), DRYRUN=1 (print, no send), STATE_DIR.
+set -euo pipefail
+
+THRESHOLD="${THRESHOLD:-300}"
+DRYRUN="${DRYRUN:-0}"
+STATE_DIR="${STATE_DIR:-/var/lib/gcg-inbox-stale-check}"
+STATE_FILE="${STATE_DIR}/last-alert.hash"
+FLEET=/opt/gcg/shared/bin/fleet
+
+mkdir -p "$STATE_DIR" 2>/dev/null || STATE_DIR=/tmp
+STATE_FILE="${STATE_DIR}/last-alert.hash"
+
+# Real agents = those with an openclaw unit on this host.
+agents=$(systemctl list-units 'openclaw-*.service' --no-legend --plain 2>/dev/null \
+         | awk '{print $1}' | sed -E 's/^openclaw-(.*)\.service$/\1/' | sort -u)
+[ -z "$agents" ] && { echo "gcg-inbox-stale-check: no openclaw agents on this host"; exit 0; }
+
+report=""
+for a in $agents; do
+  case "$a" in (*[!a-z0-9_]*|'') continue;; esac
+  # Self-heal first: re-materialize delivered-without-file rows + clear zombies.
+  # This closes Vulcan F1 — the orphaned-delivered tail auto-heals every 5min
+  # without loading the 5s poller. Reconcile is idempotent + bounded.
+  rec=$("$FLEET" reconcile "$a" 2>/dev/null || true)
+  case "$rec" in *rematerialized=0*zombies_removed=0*) : ;; *) [ -n "$rec" ] && echo "$(date -u +%FT%TZ) $rec" ;; esac
+  # Then flag anything still status-stale regardless of file state.
+  out=$("$FLEET" check --inbox-stale --threshold "$THRESHOLD" --agent "$a" 2>/dev/null) && continue
+  # non-zero exit => stale rows present; $out has the listing
+  report="${report}### ${a}\n${out}\n"
+done
+
+if [ -z "$report" ]; then
+  echo "$(date -u +%FT%TZ) stale-check OK (threshold ${THRESHOLD}s, all agents clear)"
+  : > "$STATE_FILE" 2>/dev/null || true   # clear state so next stale alerts fresh
+  exit 0
+fi
+
+# Dedup on the stale id set
+hash=$(printf '%b' "$report" | grep -oE '^[0-9]+' | sort -u | sha1sum | awk '{print $1}')
+last=$(cat "$STATE_FILE" 2>/dev/null || echo "")
+if [ "$hash" = "$last" ]; then
+  echo "$(date -u +%FT%TZ) stale-check: same stale set as last alert (hash ${hash:0:8}) — suppressing dup"
+  exit 1
+fi
+
+msg=$(printf 'STALE INBOX ALERT (>%ss unpicked, real agents):\n%b' "$THRESHOLD" "$report")
+if [ "$DRYRUN" = "1" ]; then
+  echo "DRYRUN would alert daen:"; printf '%b\n' "$msg"
+  exit 1
+fi
+"$FLEET" send --priority 2 daen "$msg" >/dev/null 2>&1 || true
+printf '%s' "$hash" > "$STATE_FILE" 2>/dev/null || true
+echo "$(date -u +%FT%TZ) stale-check: alerted daen (hash ${hash:0:8})"
+exit 1

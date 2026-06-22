@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""spine-metrics — Fleet coordination spine observability.
+
+Generates an HTML dashboard with:
+  1. Rows by status+agent+age-bucket (non-terminal current + terminal last 24h)
+  2. Wake-latency p50/p95 (issued_at → acked_at)
+  3. Pending AND age>5min alert (fires fleet send to daen on new violations)
+
+Publishes to AX42: /opt/gcg/nginx-edge/gcg-reports/SPINE_METRICS.html
+Accessible at: https://staging-intelligence.gcgstr.com/reports/SPINE_METRICS.html
+
+Run directly for text summary; run with --html to publish to AX42.
+Scheduled every 5 min by gcg-spine-metrics.timer.
+"""
+import os, sys, html as _h, subprocess, datetime, hashlib
+
+# ── DB ──────────────────────────────────────────────────────────────────────
+PGHOST = "10.0.0.2"
+PGPORT = "5432"
+PGUSER = "gcg_fleet"
+PGDB   = "gcg_intelligence"
+PWD_FILE = "/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+
+# ── Publishing ───────────────────────────────────────────────────────────────
+SSH_KEY  = "/etc/gcg/fleet-ax42-access"
+AX42     = "root@10.0.0.2"
+AX42_DIR = "/opt/gcg/nginx-edge/gcg-reports"
+OUTFILE  = "SPINE_METRICS.html"
+
+# ── Alert state ──────────────────────────────────────────────────────────────
+STATE_DIR  = "/var/lib/gcg-spine-metrics"
+STATE_FILE = os.path.join(STATE_DIR, "last-alert.hash")
+FLEET      = "/opt/gcg/shared/bin/fleet"
+
+
+def _pwd():
+    return open(PWD_FILE).read().strip()
+
+def psql(sql):
+    env = os.environ.copy()
+    env["PGPASSWORD"] = _pwd()
+    r = subprocess.run(
+        ["psql", f"host={PGHOST} port={PGPORT} user={PGUSER} dbname={PGDB} sslmode=require",
+         "-tA", "--no-align", "-F", "\t", "-c", sql],
+        capture_output=True, text=True, env=env, timeout=15
+    )
+    if r.returncode != 0:
+        raise RuntimeError(f"psql error: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def query_spine_rows():
+    """Returns list of (status, recipient, age_bucket, count) for dashboard table."""
+    sql = """
+SELECT
+  status,
+  recipient,
+  CASE
+    WHEN extract(epoch from now()-issued_at) < 300     THEN 'a_lt5m'
+    WHEN extract(epoch from now()-issued_at) < 900     THEN 'b_5-15m'
+    WHEN extract(epoch from now()-issued_at) < 3600    THEN 'c_15m-1h'
+    WHEN extract(epoch from now()-issued_at) < 86400   THEN 'd_1h-24h'
+    ELSE 'e_gt24h'
+  END AS age_bucket,
+  count(*) AS cnt
+FROM agent_messages
+WHERE status NOT IN ('done','cancelled','failed')
+   OR issued_at > now() - interval '24 hours'
+GROUP BY 1,2,3
+ORDER BY 1,2,3;
+"""
+    rows = []
+    for line in psql(sql).splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) == 4:
+            rows.append((parts[0], parts[1], parts[2], int(parts[3])))
+    return rows
+
+
+def query_wake_latency():
+    """Returns dict with p50/p95/count for last 24h and 7d."""
+    sql = """
+SELECT
+  '24h' AS window,
+  round(percentile_cont(0.5)  WITHIN GROUP (ORDER BY extract(epoch from acked_at - issued_at)))::int AS p50_sec,
+  round(percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from acked_at - issued_at)))::int AS p95_sec,
+  count(*) AS n
+FROM agent_messages
+WHERE acked_at IS NOT NULL
+  AND issued_at > now() - interval '24 hours'
+UNION ALL
+SELECT
+  '7d',
+  round(percentile_cont(0.5)  WITHIN GROUP (ORDER BY extract(epoch from acked_at - issued_at)))::int,
+  round(percentile_cont(0.95) WITHIN GROUP (ORDER BY extract(epoch from acked_at - issued_at)))::int,
+  count(*)
+FROM agent_messages
+WHERE acked_at IS NOT NULL
+  AND issued_at > now() - interval '7 days';
+"""
+    result = {}
+    for line in psql(sql).splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) == 4:
+            window, p50, p95, n = parts[0], parts[1], parts[2], parts[3]
+            result[window] = {"p50": int(p50) if p50 else 0,
+                              "p95": int(p95) if p95 else 0,
+                              "n":   int(n)  if n   else 0}
+    return result
+
+
+def query_pending_stale():
+    """Returns list of (id, recipient, age_minutes) for pending rows older than 5min."""
+    sql = """
+SELECT
+  id,
+  recipient,
+  round(extract(epoch from now()-issued_at)/60)::int AS age_min
+FROM agent_messages
+WHERE status = 'pending'
+  AND issued_at < now() - interval '5 minutes'
+  AND payload->>'text' NOT LIKE 'STALE INBOX ALERT%'
+ORDER BY issued_at ASC
+LIMIT 100;
+"""
+    rows = []
+    for line in psql(sql).splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) == 3:
+            rows.append((int(parts[0]), parts[1], int(parts[2])))
+    return rows
+
+
+def fmt_sec(s):
+    if s is None or s == 0:
+        return "—"
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s//60}m{s%60:02d}s"
+    return f"{s//3600}h{(s%3600)//60:02d}m"
+
+
+def age_label(bucket):
+    return {"a_lt5m": "<5m", "b_5-15m": "5–15m", "c_15m-1h": "15m–1h",
+            "d_1h-24h": "1h–24h", "e_gt24h": ">24h"}.get(bucket, bucket)
+
+
+STATUS_ORDER = ["pending", "delivered", "in_progress", "input-required",
+                "blocked", "done", "failed", "cancelled"]
+STATUS_COLOR = {
+    "pending":        "#f39c12",
+    "delivered":      "#3498db",
+    "in_progress":    "#2ecc71",
+    "input-required": "#9b59b6",
+    "blocked":        "#e74c3c",
+    "done":           "#27ae60",
+    "failed":         "#e74c3c",
+    "cancelled":      "#7f8c8d",
+}
+AGE_COLOR = {
+    "a_lt5m":    "#27ae60",
+    "b_5-15m":   "#2ecc71",
+    "c_15m-1h":  "#f39c12",
+    "d_1h-24h":  "#e67e22",
+    "e_gt24h":   "#e74c3c",
+}
+
+
+def e(s):
+    return _h.escape(str(s) if s is not None else "")
+
+
+def build_html(spine_rows, wake, pending_stale, now_str):
+    w24 = wake.get("24h", {})
+    p50_24h = fmt_sec(w24.get("p50", 0))
+    p95_24h = fmt_sec(w24.get("p95", 0))
+    alert_html = ""
+    if pending_stale:
+        rows_html = "\n".join(
+            f"<tr><td>{e(r[0])}</td><td>{e(r[1])}</td>"
+            f"<td style='color:#e74c3c'>{e(r[2])}m</td></tr>"
+            for r in pending_stale
+        )
+        alert_html = f"""
+<div class="alert-box">
+  <div class="alert-title">⚠ ALERT: {len(pending_stale)} pending message(s) older than 5 minutes</div>
+  <table class="mini-table">
+    <thead><tr><th>ID</th><th>Recipient</th><th>Age</th></tr></thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+</div>
+"""
+    else:
+        alert_html = '<div class="ok-box">✓ No pending messages older than 5 min</div>'
+
+    # Build spine rows table
+    spine_table_rows = ""
+    current_status = None
+    for (status, recipient, age_bucket, cnt) in spine_rows:
+        row_bg = "#1e2530" if status != current_status else ""
+        current_status = status
+        sc = STATUS_COLOR.get(status, "#aaa")
+        ac = AGE_COLOR.get(age_bucket, "#aaa")
+        bg_style = f"background:{row_bg}" if row_bg else ""
+        spine_table_rows += (
+            f"<tr style='{bg_style}'>"
+            f"<td><span class='badge' style='background:{sc}20;color:{sc};border:1px solid {sc}40'>{e(status)}</span></td>"
+            f"<td>{e(recipient)}</td>"
+            f"<td><span class='badge' style='background:{ac}20;color:{ac};border:1px solid {ac}40'>{age_label(age_bucket)}</span></td>"
+            f"<td class='num'>{e(cnt)}</td>"
+            f"</tr>"
+        )
+
+    # Wake latency table
+    wake_rows = ""
+    for window in ("24h", "7d"):
+        w = wake.get(window, {})
+        p50 = fmt_sec(w.get("p50", 0))
+        p95 = fmt_sec(w.get("p95", 0))
+        n   = w.get("n", 0)
+        p95_color = "#e74c3c" if w.get("p95", 0) > 300 else ("#f39c12" if w.get("p95", 0) > 60 else "#27ae60")
+        wake_rows += (
+            f"<tr><td>{window}</td><td class='num'>{n}</td>"
+            f"<td class='num'>{p50}</td>"
+            f"<td class='num' style='color:{p95_color}'>{p95}</td></tr>"
+        )
+
+    total_active = sum(cnt for s, _, __, cnt in spine_rows if s not in ("done", "cancelled", "failed"))
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="300">
+<title>GCG Spine Metrics</title>
+<style>
+:root {{
+  --bg: #0a0e14; --surface: #131820; --surface2: #1a202c;
+  --border: #2a3344; --text: #cdd6e7; --text2: #8e9bb4;
+  --accent: #5c9ce6; --ok: #27ae60; --warn: #f39c12; --crit: #e74c3c;
+}}
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+        background:var(--bg); color:var(--text); line-height:1.5;
+        max-width:1200px; margin:0 auto; padding:0 20px; }}
+header {{ background:linear-gradient(135deg,#0d1b2a 0%,#1a2332 50%,#0d1b2a 100%);
+          border-bottom:2px solid var(--accent); padding:30px 20px;
+          text-align:center; margin:0 -20px 24px; }}
+header h1 {{ font-size:1.9em; color:#fff; margin-bottom:4px; }}
+header .sub {{ color:var(--accent); font-size:1em; }}
+header .ts  {{ color:var(--text2); font-size:0.78em; margin-top:6px; }}
+.grid {{ display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-bottom:20px; }}
+.card {{ background:var(--surface); border:1px solid var(--border); border-radius:8px;
+         padding:18px; }}
+.card h2 {{ font-size:1em; color:var(--accent); margin-bottom:12px;
+            border-bottom:1px solid var(--border); padding-bottom:8px; }}
+.full-card {{ grid-column:1/-1; }}
+table {{ width:100%; border-collapse:collapse; font-size:0.85em; }}
+th {{ text-align:left; color:var(--text2); font-weight:600; padding:6px 8px;
+      border-bottom:1px solid var(--border); white-space:nowrap; }}
+td {{ padding:5px 8px; border-bottom:1px solid #1a1f2a; }}
+td.num {{ text-align:right; font-variant-numeric:tabular-nums; }}
+tr:hover td {{ background:#1d2535; }}
+.badge {{ display:inline-block; padding:1px 8px; border-radius:10px; font-size:0.8em; font-weight:600; }}
+.alert-box {{ background:#2a1515; border:1px solid var(--crit); border-radius:8px;
+              padding:16px; margin-bottom:20px; }}
+.alert-title {{ color:var(--crit); font-weight:700; font-size:1em; margin-bottom:10px; }}
+.ok-box {{ background:#0d1f12; border:1px solid var(--ok); border-radius:8px;
+           padding:12px 16px; margin-bottom:20px; color:var(--ok); font-weight:600; }}
+.mini-table {{ margin-top:8px; font-size:0.82em; }}
+.stat-bar {{ display:flex; gap:12px; flex-wrap:wrap; margin-bottom:20px; }}
+.stat {{ background:var(--surface); border:1px solid var(--border); border-radius:8px;
+         padding:14px 20px; }}
+.stat .val {{ font-size:1.8em; font-weight:700; color:var(--accent); }}
+.stat .lbl {{ font-size:0.75em; color:var(--text2); margin-top:2px; }}
+footer {{ text-align:center; color:var(--text2); font-size:0.75em; padding:20px 0; margin-top:10px; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>GCG Spine Metrics</h1>
+  <div class="sub">Fleet coordination backbone — agent_messages</div>
+  <div class="ts">Generated {e(now_str)} UTC · auto-refresh 5m</div>
+</header>
+
+{alert_html}
+
+<div class="stat-bar">
+  <div class="stat">
+    <div class="val">{total_active}</div>
+    <div class="lbl">Active (non-terminal)</div>
+  </div>
+  <div class="stat">
+    <div class="val">{len(pending_stale)}</div>
+    <div class="lbl" style="color:{'var(--crit)' if pending_stale else 'var(--text2)'}">Pending &gt;5min</div>
+  </div>
+  <div class="stat">
+    <div class="val">{p50_24h}</div>
+    <div class="lbl">Wake-latency p50 (24h)</div>
+  </div>
+  <div class="stat">
+    <div class="val">{p95_24h}</div>
+    <div class="lbl">Wake-latency p95 (24h)</div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Wake-Latency (issued → acked)</h2>
+    <table>
+      <thead><tr><th>Window</th><th>N</th><th>p50</th><th>p95</th></tr></thead>
+      <tbody>{wake_rows}</tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card full-card">
+  <h2>Rows by Status + Agent + Age — non-terminal current; terminal last 24h</h2>
+  <div style="overflow-x:auto">
+    <table>
+      <thead><tr><th>Status</th><th>Recipient</th><th>Age</th><th>Count</th></tr></thead>
+      <tbody>{spine_table_rows}</tbody>
+    </table>
+  </div>
+</div>
+
+<footer>GCG Spine Metrics · Phase 4.2 · {e(now_str)} UTC</footer>
+</body>
+</html>
+"""
+
+
+def publish_html(html_str):
+    tmp = "/tmp/.spine_metrics.html"
+    open(tmp, "w", encoding="utf-8").write(html_str)
+    rc = subprocess.call(
+        ["scp", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=no",
+         "-o", "ConnectTimeout=8",
+         tmp, f"{AX42}:{AX42_DIR}/.{OUTFILE}.tmp"],
+        timeout=30
+    )
+    if rc != 0:
+        raise RuntimeError("scp failed")
+    rc = subprocess.call(
+        ["ssh", "-i", SSH_KEY, "-o", "StrictHostKeyChecking=no",
+         "-o", "ConnectTimeout=8", AX42,
+         f"mv -f {AX42_DIR}/.{OUTFILE}.tmp {AX42_DIR}/{OUTFILE}"],
+        timeout=15
+    )
+    if rc != 0:
+        raise RuntimeError("remote mv failed")
+
+
+def check_and_alert(pending_stale):
+    """Alert daen if pending>5min set has changed since last alert."""
+    if not pending_stale:
+        return
+    os.makedirs(STATE_DIR, exist_ok=True)
+    ids_str = ",".join(str(r[0]) for r in pending_stale)
+    h = hashlib.sha1(ids_str.encode()).hexdigest()[:12]
+    prev = ""
+    if os.path.exists(STATE_FILE):
+        prev = open(STATE_FILE).read().strip()
+    if h == prev:
+        return  # same set, already alerted
+    open(STATE_FILE, "w").write(h)
+    summary = "; ".join(f"#{r[0]} {r[1]} {r[2]}m" for r in pending_stale[:8])
+    if len(pending_stale) > 8:
+        summary += f" (+{len(pending_stale)-8} more)"
+    msg = f"SPINE ALERT: {len(pending_stale)} pending message(s) older than 5min: {summary}. Dashboard: https://staging-intelligence.gcgstr.com/reports/SPINE_METRICS.html"
+    subprocess.call([FLEET, "send", "--from", "spine-metrics", "--priority", "3",
+                     "daen", msg], timeout=15)
+
+
+def print_text(spine_rows, wake, pending_stale):
+    print("=== SPINE METRICS ===")
+    if pending_stale:
+        print(f"\n⚠  ALERT: {len(pending_stale)} pending >5min")
+        for mid, rec, age in pending_stale:
+            print(f"   #{mid} {rec} {age}m")
+    else:
+        print("\n✓ No pending >5min")
+    print("\n--- Wake-latency (issued→acked) ---")
+    for window in ("24h", "7d"):
+        w = wake.get(window, {})
+        print(f"  {window}: n={w.get('n',0)} p50={fmt_sec(w.get('p50',0))} p95={fmt_sec(w.get('p95',0))}")
+    print("\n--- Active rows (non-terminal) ---")
+    for status, recipient, age_bucket, cnt in spine_rows:
+        if status not in ("done", "cancelled", "failed"):
+            print(f"  {status:16s} {recipient:24s} {age_label(age_bucket):8s} {cnt}")
+
+
+def main():
+    html_mode = "--html" in sys.argv
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    spine_rows    = query_spine_rows()
+    wake          = query_wake_latency()
+    pending_stale = query_pending_stale()
+
+    if html_mode:
+        html = build_html(spine_rows, wake, pending_stale, now_str)
+        publish_html(html)
+        check_and_alert(pending_stale)
+        print(f"OK published {OUTFILE} · {now_str} · pending_stale={len(pending_stale)}")
+    else:
+        print_text(spine_rows, wake, pending_stale)
+
+
+if __name__ == "__main__":
+    main()

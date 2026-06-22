@@ -1,0 +1,11 @@
+[Unit]
+Description=Run GCG spine metrics every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=gcg-spine-metrics.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

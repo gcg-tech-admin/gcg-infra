@@ -1,5 +1,6 @@
 #!/bin/bash
 # gcg-inbox-poll — one-shot inbox drain + wake for a single agent.
+# POLLER_VERSION=13.9 (2026-06-21: A2A-PICKUP-FIX-v8 — Pass 2 retry window now uses acked_at instead of issued_at. Root cause of daen/talos drain bug: old issued_at on janitor-reset messages excluded them from re-pokes; zombie guard then killed them 12 min later. Fix: acked_at resets to NOW on each re-claim, giving freshly-recovered messages a full retry window.)
 # POLLER_VERSION=13.8 (2026-06-16: J2-FIX — Pass 6 now excludes human_gate task types (decision, revert_request) from auto-QA dispatch, matching derive_gate_kind. decision tasks with owner_type=agent are still human_gate and route directly to human approval.)
 # POLLER_VERSION=13.6 (2026-06-14: QA-DISPATCH-GATE — Pass 6 only dispatches QA for task_type IN ('standard','decision'). Fixes reply/result/message/notification types wrongly getting qa_review subtasks.
 # POLLER_VERSION=13.5 (2026-06-14: CASCADE-AUTO-ADVANCE — Pass 3b exempts plan_authorized tasks
@@ -158,6 +159,23 @@ SQL
 )
 NOTIFY_CLOSED=${NOTIFY_CLOSED:-0}
 
+# 0a2. Utility task-type sweeper: any pending task with a genuine fire-and-forget /
+#       terminal-output task_type (notification, ack, fyi, reply, result) goes straight to done.
+#       'message' and 'qa_review' REMOVED 2026-06-21 (born-done fix): they carry real asks/work
+#       and must be delivered, not swept. Mirrors the bin/fleet INSERT CASE change.
+UTILITY_SWEEP=$(_psql -F '' <<SQL
+WITH src AS (
+  UPDATE agent_messages
+     SET status='done', done_at=NOW()
+   WHERE recipient = :'agent' AND status = 'pending'
+     AND task_type IN ('notification','ack','fyi','reply','result')
+   RETURNING 1
+)
+SELECT COUNT(*) FROM src;
+SQL
+)
+UTILITY_SWEEP=${UTILITY_SWEEP:-0}
+
 # 0b. Ghost/undeliverable: empty payload OR delivered_count>=2 with no in_progress.
 #     status -> failed, reason='undeliverable', done_at=NOW.
 GHOST_CLOSED=$(_psql -F '' <<SQL
@@ -203,9 +221,9 @@ SQL
 # the 2-minute window starts fresh from the most recent delivery attempt.
 ZOMBIE_CLOSED=${ZOMBIE_CLOSED:-0}
 
-TOTAL_CLOSED=$((NOTIFY_CLOSED + GHOST_CLOSED + ZOMBIE_CLOSED))
+TOTAL_CLOSED=$((NOTIFY_CLOSED + UTILITY_SWEEP + GHOST_CLOSED + ZOMBIE_CLOSED))
 if [ "$TOTAL_CLOSED" -gt 0 ]; then
-  echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] classifier: notify=$NOTIFY_CLOSED ghost=$GHOST_CLOSED zombie_repoke=$ZOMBIE_CLOSED" >&2
+  echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] classifier: notify=$NOTIFY_CLOSED utility_sweep=$UTILITY_SWEEP ghost=$GHOST_CLOSED zombie_repoke=$ZOMBIE_CLOSED" >&2
 fi
 
 # ── Pass 1: claim pending ──────────────────────────────────────────
@@ -237,13 +255,20 @@ fi
 
 # ── Pass 2: re-poke un-started rows in the active retry window ──────
 # Bump acked_at ONLY (throttle) — do NOT touch deliver_count.
+# A2A-PICKUP-FIX(v8): use acked_at (time of last delivery/re-claim) for the retry
+# window, not issued_at (original send time). Root cause: after gcg-inbox-janitor
+# resets a message to pending, Pass 1 re-claims it (acked_at=NOW, issued_at=ORIGINAL).
+# The old issued_at check then excluded the message from re-pokes. Without re-pokes,
+# acked_at was never refreshed, so the zombie guard killed the message 12 min later
+# — before the agent had a chance to process it. Fix: acked_at resets to NOW on each
+# re-claim, so the retry window starts fresh from the most recent delivery attempt.
 REPOKE_IDS=""; REPOKE_COUNT=0
 ROWS2=$(_psql <<SQL
 WITH due AS (
   SELECT id FROM agent_messages
    WHERE recipient = :'agent'
      AND status IN ('delivered','acked')
-     AND issued_at > NOW() - INTERVAL '${RETRY_WINDOW}'
+     AND acked_at  > NOW() - INTERVAL '${RETRY_WINDOW}'
      AND acked_at  < NOW() - INTERVAL '${RETRY_BACKOFF}'
    ORDER BY priority ASC, issued_at ASC
    FOR UPDATE SKIP LOCKED LIMIT 50
@@ -691,6 +716,13 @@ WITH stamped AS (
      AND done_at > NOW() - INTERVAL '30 seconds'
      AND (artifacts->>'daen_notified') IS NULL
      AND task_type IS DISTINCT FROM 'notification'
+     -- Firehose throttle 2026-06-21: only ping daen on FAILURES or REAL-WORK completions.
+     -- Routine utility-type closes (notification/ack/fyi/message/reply/result/qa_review) no
+     -- longer ping — that was ~7228 pings/10d of noise, the cause behind drain/janitor/stale-check.
+     AND (
+       status = 'failed'
+       OR task_type NOT IN ('notification','ack','fyi','message','reply','result','qa_review')
+     )
    RETURNING id, status
 )
 SELECT id, status FROM stamped ORDER BY id;

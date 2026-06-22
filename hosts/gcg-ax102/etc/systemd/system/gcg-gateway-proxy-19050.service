@@ -1,0 +1,16 @@
+[Unit]
+Description=GCG vSwitch Gateway Proxy — forwards 10.0.0.1:19050 → 127.0.0.1:19050 (Marcus gateway)
+After=network.target
+Before=openclaw-marcus.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/socat TCP-LISTEN:19050,bind=10.0.0.1,fork,reuseaddr TCP:127.0.0.1:19050
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/gcg-gateway-proxy-19050.log
+StandardError=append:/var/log/gcg-gateway-proxy-19050.log
+
+[Install]
+WantedBy=multi-user.target

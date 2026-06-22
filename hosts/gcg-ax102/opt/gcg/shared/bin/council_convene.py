@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -23,6 +24,62 @@ from pathlib import Path
 
 COUNCILS_DIR = Path("/opt/gcg/shared/councils")
 REVIEWERS = ["SOCRATES", "NEMESIS", "CASSANDRA", "CONFUCIUS", "WONHOO"]
+
+# Routes blocked-gate alerts to Peter via daen's inbox poller + Telegram.
+GUARDIAN_AGENT = "daen"
+
+# Patterns that match "## Internal findings" / "**Internal findings**" etc.
+_RE_INTERNAL = re.compile(r'(?im)^(?:#+\s*|[\*_]+)internal\s+findings')
+_RE_EXTERNAL = re.compile(r'(?im)^(?:#+\s*|[\*_]+)external\s+findings')
+
+
+def check_research_gate(slug: str, plan_path: str,
+                        research_artifact: str = "") -> tuple[bool, str]:
+    """Return (ok, detail).
+
+    Checks that a research artifact with BOTH an 'Internal findings' block
+    AND an 'External findings' block exists before reviewers are dispatched.
+    Searches (in order):
+      1. Explicit --research-artifact path (if supplied)
+      2. The plan file itself
+      3. <plan-dir>/*research*.md  (any file in the plan's directory)
+      4. /opt/gcg/shared/council-inbox/<slug>-research.md
+      5. /opt/gcg/shared/plans/<slug>-research.md
+    """
+    plan_dir = Path(plan_path).parent
+
+    candidates: list[Path] = []
+    if research_artifact:
+        candidates.append(Path(research_artifact))
+    candidates.append(Path(plan_path))
+    candidates += sorted(plan_dir.glob("*research*.md"))
+    candidates.append(Path("/opt/gcg/shared/council-inbox") / f"{slug}-research.md")
+    candidates.append(Path("/opt/gcg/shared/plans") / f"{slug}-research.md")
+
+    for f in candidates:
+        if not f.exists() or not f.is_file():
+            continue
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        has_internal = bool(_RE_INTERNAL.search(text))
+        has_external = bool(_RE_EXTERNAL.search(text))
+        if has_internal and has_external:
+            return True, str(f)
+        # File has one block but not both — it's a partial research artifact.
+        # Stop here and report what's missing (don't silently skip to the next
+        # candidate, or a half-done research file would be masked by a sidecar).
+        if has_internal or has_external:
+            missing = []
+            if not has_internal:
+                missing.append("Internal findings")
+            if not has_external:
+                missing.append("External findings")
+            return False, f"found {f.name} but missing: {', '.join(missing)}"
+        # Neither block in this file — not the research artifact; keep looking.
+
+    return False, "no research artifact found (need ## Internal findings + ## External findings)"
 REVIEWER_IDS = {
     "SOCRATES": "socrates",
     "NEMESIS": "nemesis",
@@ -111,8 +168,16 @@ def dispatch_round1(slug: str, plan_path: str, plan_hash: str,
             f"MANDATORY SEQUENCE:\n"
             f"1. READ workspace/SOUL.md — your identity and review principles.\n"
             f"2. READ workspace/memory/review-log.md — scan ALL past entries for patterns applicable to this plan.\n"
-            f"3. REVIEW the plan against your role. Read the actual plan file at: {plan_path}\n"
-            f"4. WRITE verdict to {vf_path} using EXACTLY this format:\n\n"
+            f"3. PICK UP HISTORY (prevents re-running councils + re-finding old bugs): "
+            f"ls /opt/gcg/shared/plans/reviews/ and READ prior verdicts for RELATED plans "
+            f"(match the slug stem and *inbox* *a2a* *spine* *cascade* *orchestrator*), "
+            f"plus your own earlier verdict for this slug if one exists. "
+            f"Engage with bugs ALREADY found — if this plan repeats a previously-flagged mistake, "
+            f"say so explicitly and cite the prior verdict. Do NOT re-derive from scratch.\n"
+            f"4. REVIEW the plan against your role. Read the actual plan file at: {plan_path}\n"
+            f"5. WRITE verdict to the ABSOLUTE path {vf_path} "
+            f"(use this EXACT absolute path — do NOT write to a workspace-relative path; "
+            f"the loop reads only this location) using EXACTLY this format:\n\n"
             f"## Verdict\n"
             f"**VERDICT: [PASS|FAIL|CONDITIONAL]**\n\n"
             f"### Prior patterns applied\n"
@@ -122,10 +187,10 @@ def dispatch_round1(slug: str, plan_path: str, plan_hash: str,
             f"- [Finding 2]\n\n"
             f"### Required changes (FAIL/CONDITIONAL only)\n"
             f"- [ROOT CAUSE + specific change required before PASS — not a symptom fix]\n\n"
-            f"5. EMBED to pgvector: ...\n"
-            f"6. APPEND hash footer:\n"
+            f"6. EMBED to pgvector: ...\n"
+            f"7. APPEND hash footer:\n"
             f"   reviewed-hash: {plan_hash}\n"
-            f"7. CLOSE inbox: fleet done <message_id> && rm workspace/inbox/<message_id>.json"
+            f"8. CLOSE inbox: fleet done <message_id> && rm workspace/inbox/<message_id>.json"
         )
 
         subprocess.run(["fleet", "send", agent_id, msg], check=True,
@@ -145,6 +210,8 @@ def main():
     parser.add_argument("--reviewers", nargs="+",
                         default=["socrates", "nemesis", "cassandra", "confucius", "wonhoo"],
                         help="Reviewer agents (default: all 5)")
+    parser.add_argument("--research-artifact", default="",
+                        help="Explicit path to research artifact (overrides auto-search)")
     args = parser.parse_args()
 
     COUNCILS_DIR.mkdir(parents=True, exist_ok=True)
@@ -170,6 +237,25 @@ def main():
     print("Validating plan...")
     plan_hash = validate_plan(args.plan)
     print(f"  Plan exists, readable, OK.")
+
+    # Research gate (SKILL.md Step 1 — hard gate before reviewers dispatch)
+    print("Checking research gate...")
+    gate_ok, gate_detail = check_research_gate(
+        args.slug, args.plan, getattr(args, "research_artifact", "")
+    )
+    if not gate_ok:
+        block_msg = (
+            f"COUNCIL {args.slug} blocked: research gate ({gate_detail}). "
+            f"Write a research artifact with both '## Internal findings' and "
+            f"'## External findings' blocks, then re-convene."
+        )
+        print(f"\nERROR: {block_msg}", file=sys.stderr)
+        subprocess.run(
+            ["fleet", "send", "--priority", "2", GUARDIAN_AGENT, block_msg],
+            check=False, env={**os.environ, "FLEET_SKIP_CASCADE_GUARD": "1"},
+        )
+        sys.exit(2)
+    print(f"  Research gate OK — artifact: {gate_detail}")
 
     # Build manifest
     print("Building manifest...")

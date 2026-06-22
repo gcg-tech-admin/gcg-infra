@@ -1,0 +1,18 @@
+[Unit]
+Description=GCG Orchestrator Tick — state registry reconcile + milestone surface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/orchestrator_tick.py
+ExecStopPost=/bin/sh -c 'rm -rf /run/gcg-orchestrator/state.lock /run/gcg-orchestrator/state.heartbeat 2>/dev/null || true'
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=FLEET_SKIP_CASCADE_GUARD=1
+Nice=10
+TimeoutStartSec=120
+MemoryMax=128M
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/gcg/shared/state /run/gcg-orchestrator

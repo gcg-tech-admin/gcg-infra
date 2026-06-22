@@ -1,0 +1,16 @@
+[Unit]
+Description=GCG spine metrics dashboard + pending>5min alert
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/spine-metrics --html
+SuccessExitStatus=0 1
+Nice=10
+MemoryMax=64M
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=gcg-spine-metrics
+ReadWritePaths=/var/lib/gcg-spine-metrics /opt/gcg /tmp

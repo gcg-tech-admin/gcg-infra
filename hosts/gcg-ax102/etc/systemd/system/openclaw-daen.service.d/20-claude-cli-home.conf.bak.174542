@@ -1,0 +1,3 @@
+[Service]
+Environment=HOME=/opt/gcg/claude-profiles/sub-sonja
+Environment=IS_SANDBOX=1

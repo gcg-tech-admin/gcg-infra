@@ -228,15 +228,27 @@ cmd_send() {
       *)                   break;;
     esac
   done
-  # ── Cascade-First guard (Phase 1.5): message-type asks must use fleet decide ──
+  # ── Cascade-First guard (Phase 1.5): message-type APPROVAL asks must use fleet decide ──
   # Detected BEFORE the INSERT so we reject early and suggest the correct command.
-  # Bypass for legitimate system/automated senders (e.g. council_loop dispatch, which
-  # contains "?" in reviewer prompts): set FLEET_SKIP_CASCADE_GUARD=1. (Daen 2026-06-16:
-  # the bare \? in the pattern was blocking the Council's own dispatch.)
+  # Bypass for legitimate system/automated senders: set FLEET_SKIP_CASCADE_GUARD=1.
+  #
+  # 2026-06-21 (review-FP fix, reported by Varys, confirmed Peter): the old pattern
+  #   (please|...).*(review|approve|sign off|check|verify|...)|\?
+  # produced BOTH false positives and false negatives:
+  #   - FALSE POSITIVE: "can you review the architecture and build the routes" gated
+  #     on bare politeness + weak verb "review" — a BUILD/design handoff, not a gate.
+  #   - FALSE NEGATIVE: "approve this before I deploy" / "need your sign-off" did NOT
+  #     gate (no polite lead-in, no "?"). Real approval gates slipped through.
+  # Replaced with a STRONG, multi-signal pattern that anchors on actual decision-
+  # transfer phrasing (approve / authorize / sign-off / go-ahead / go-no-go /
+  # green-light / "need your <decision|approval|...>" / "ok to <proceed|deploy|...>" /
+  # "shall I <proceed|...>" / "can I <push|deploy|...>"). Bare "review", "check",
+  # "look at", "verify", and a lone "?" are NO LONGER sufficient on their own — so
+  # design/build handoffs that merely mention "review"/"architecture" pass through.
   if [ "$ttype" = "message" ] && [ "${FLEET_SKIP_CASCADE_GUARD:-}" != "1" ]; then
     local _cf_lower; _cf_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
-    if echo "$_cf_lower" | grep -qE '(please|pls|can you|could you).*(review|approve|sign off|check|verify|decide|confirm|authorize|look at|take a look)|\?'; then
-      echo "refused: this message looks like a review/approval request (Cascade-First)." >&2
+    if echo "$_cf_lower" | grep -qE '\b(approve|authori[sz]e)\b|\b(sign[ -]?off|signoff|go[ -]?ahead|go ?/ ?no ?-? ?go|green[ -]?light)\b|need your (decision|approval|sign[ -]?off|signoff|go[ -]?ahead|ok|okay|green[ -]?light|blessing)|your call\b|ok(ay)? to (proceed|deploy|ship|merge|push|go|release)|are we (good|clear|ok) to (go|ship|deploy|proceed|push|merge)|shall i (proceed|deploy|ship|merge|push|go)|can i (proceed|deploy|ship|merge|push|go ahead)'; then
+      echo "refused: this message looks like an approval/decision request (Cascade-First)." >&2
       echo "Use 'fleet decide ${1} \"${*}\"' instead — decision tasks have proper gate tracking." >&2
       exit 7
     fi
@@ -244,6 +256,23 @@ cmd_send() {
   local raw_to="${1:?usage: fleet send [--from S] <to> <msg>}"; shift
   local to; to=$(_canonical_recipient "$raw_to")
   local msg="${*:?usage: fleet send [--from S] <to> <msg>}"
+
+  # ── Workstream R guard (Phase 1.4): reject human-relay message bodies ──
+  # Root cause of the nik misroute (2026-06-21): 28 daen→nik cards with body
+  # "Relay to Peter Telegram 418059105: …" — an agent used as a relay for human delivery.
+  # Guardian→human delivery must use the escalator path, NOT fleet send <agent>.
+  # Standing rule: /opt/gcg/shared/docs/rls-infra/INDEX.md #2.
+  # Bypass for legitimate system/automated use: set FLEET_SKIP_CASCADE_GUARD=1.
+  if [ "${FLEET_SKIP_CASCADE_GUARD:-}" != "1" ]; then
+    local _wr_lower; _wr_lower=$(echo "$msg" | tr '[:upper:]' '[:lower:]')
+    if echo "$_wr_lower" | grep -qiE '\brelay to (peter|maruf|the user|a user|the human|a human|the person|telegram|[0-9]{5,})\b|\bforward .{0,40}to (peter|maruf|the user|the human)\b|\bpass (this |it |on |along )?to (peter|maruf|the user|the human)\b|\b(tell|notify|inform) (peter|maruf|the user|the human)\b'; then
+      echo "refused (Workstream R): message body looks like a human-relay instruction." >&2
+      echo "Guardian→human delivery must use the escalator path, not 'fleet send <agent>'." >&2
+      echo "See /opt/gcg/shared/docs/rls-infra/INDEX.md standing rule #2." >&2
+      exit 8
+    fi
+  fi
+
   _validate_agent "$to"
   [ -z "$sender" ] && sender=$(_resolve_sender)
   [ -z "$corr" ] && corr=$(_uuid)
@@ -293,6 +322,10 @@ VALUES
    CASE
      WHEN :'input_required' = 'true' THEN 'input-required'
      WHEN :'blocked' = 'true' THEN 'blocked'
+     -- Fire-and-forget types auto-terminalize. 'message'/'qa_review' removed 2026-06-21,
+     -- 'reply'/'result' removed 2026-06-21 22:13 (bleed-stop): they carry real asks/QA
+     -- verdicts and MUST park as pending so the poller wakes the recipient + they show in inbox.
+     WHEN :'ttype' IN ('notification','ack','fyi') THEN 'done'
      ELSE 'pending'
    END,
    CASE WHEN :'input_required' = 'true' THEN NOW() ELSE NULL END,
@@ -374,7 +407,7 @@ SELECT id, sender, task_type, status, priority,
        left(coalesce(progress_note, blocked_reason, payload->>'text'), 60) AS preview
   FROM agent_messages
  WHERE recipient = :'agent'
-   AND status IN ('pending','delivered','acked','in_progress','blocked')
+   AND status IN ('pending','delivered','acked','in_progress','blocked','input-required')
  ORDER BY priority ASC, issued_at ASC;
 SQL
   fi

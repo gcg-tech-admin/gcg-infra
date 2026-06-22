@@ -1,0 +1,1123 @@
+#!/bin/bash
+# fleet — GCG fleet CLI
+# Adds durable a2a inbox via Postgres `agent_messages` table on AX42.
+# Backed by gcg_fleet role (INSERT/SELECT/UPDATE only).
+#
+# Subcommands:
+#   list                          — list agents + service status
+#   status <agent>                — service status of one agent
+#   ping <agent> <msg>            — drop NOTICE.md in agent's workspace (legacy)
+#   broadcast <msg>               — NOTICE.md to every agent (legacy)
+#   exec <agent> <cmd...>         — run command from agent's workspace
+#   send [--from S] <to> <msg>    — durable a2a message via Postgres
+#   inbox <agent> [--all]         — show open (pending|delivered|acked|in_progress|blocked) messages
+#   ack <id>                      — legacy: mark delivered (use `start` going forward)
+#   start <id>                    — agent claims it: status=in_progress
+#   progress <id> <note>          — update progress_note (status unchanged)
+#   block <id> <reason>           — agent stuck: status=blocked + reason
+#   done <id>                     — mark complete: status=done
+#   fail <id> <reason>            — could not process: status=failed + reason
+#   cancel <id>                   — sender/operator withdraws: status=cancelled
+#   reply <id> <msg>              — reply to a message (preserves correlation_id)
+#   tail [agent] [N]              — last N messages (default 20), optionally filtered
+#   reconcile <agent>             — DB-is-truth heal: re-materialize missing delivered
+#                                   files + remove zombie files (no poke; gcg_fleet)
+#   check --inbox-stale --threshold N [--agent A]
+#                                 — exit 1 + list if any pending/delivered row older than N s
+#   chain <id> <dep_id>           — safely add dep_id to blocked_by for id, REJECT if cycle
+#   qa-pass <id> [reason]         — QA verdict: pass (DB-direct, self-auth via tokens.json)
+#   qa-fail <id> <reason>         — QA verdict: fail (bounces to input-required)
+#
+# DB credentials: /opt/gcg/shared/credentials/db/gcg_fleet.pwd
+
+set -euo pipefail
+
+PGUSER_FLEET="gcg_fleet"
+PGHOST="10.0.0.2"
+PGPORT="5432"
+PGDB="gcg_intelligence"
+PWD_FILE="/opt/gcg/shared/credentials/db/gcg_fleet.pwd"
+
+# ----- helpers -----
+
+_psql() {
+  # Pipe SQL on stdin OR pass it as $1. Uses fleet role.
+  if [ ! -r "$PWD_FILE" ]; then
+    echo "fleet: cannot read $PWD_FILE" >&2; exit 1
+  fi
+  local _fleet_actor="${AGENT_NAME:-cowork}"
+  PGPASSWORD=$(tr -d '\r\n' < "$PWD_FILE") \
+  PGOPTIONS="-c app.current_actor=${_fleet_actor} -c app.caused_by=fleet-cli -c app.actor_type=agent" \
+    psql "host=$PGHOST port=$PGPORT user=$PGUSER_FLEET dbname=$PGDB sslmode=require" \
+    -v ON_ERROR_STOP=1 "$@"
+}
+
+_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then uuidgen; else
+    cat /proc/sys/kernel/random/uuid
+  fi
+}
+
+_resolve_sender() {
+  # If --from passed, use it. Else default to 'cowork' (or $FLEET_SENDER).
+  echo "${FLEET_SENDER:-cowork}"
+}
+
+# Lookup hostname of the *agent* running this CLI, if any.
+# When fleet is invoked from inside an openclaw service unit, AGENT_NAME may be set.
+_self_agent() { echo "${AGENT_NAME:-}"; }
+
+# Validate an agent name: lowercase letters, digits, underscores, hyphens.
+# Stops path-traversal and weird input from leaking into shell or SQL contexts.
+_validate_agent() {
+  case "$1" in
+    *[!a-z0-9_-]*|'') echo "fleet: invalid agent name '$1'" >&2; exit 2;;
+  esac
+}
+
+# _ghost_guard <parent_id> <task_type> <recipient>
+# Pre-INSERT check: prevents creating live work tasks referencing already-terminal parents.
+# Ghost-task guard: refuse to create any task (work or coordination) when parent is terminal.
+# Work types: standard, decision, build, fix, deploy_approval, remediation, escalation,
+#   feature_request, proposal, qa_review, review, task, qa.
+# Coordination types also blocked when parented: notification, ack, fyi, result, reply.
+# Exception: message — loosely-coupled FYI with no structural parent dependency.
+# Exit 0 = safe, exit 6 with message to stderr = BLOCKED.
+# Source: GHOST-TASK-GUARD-v2 (#153788)
+_ghost_guard() {
+  local parent="$1" ttype="$2" recipient="$3"
+  # Only check when parent is set
+  [ "$parent" = "NULL" ] && return 0
+  # message type: always pass (no structural parent dependency — informational only)
+  [ "$ttype" = "message" ] && return 0
+  # Check parent status
+  local pstatus
+  pstatus=$(_psql -tA -F '' -c "SELECT status FROM agent_messages WHERE id = ${parent}::bigint;" 2>/dev/null || echo "")
+  if [ -z "$pstatus" ]; then
+    echo "ghost guard: parent #${parent} not found — allowed (new tree)" >&2
+    return 0
+  fi
+  case "$pstatus" in
+    done|failed|cancelled)
+      echo "refused: ghost-task blocked — parent #${parent} is already ${pstatus}; cannot create ${ttype} from a terminal task" >&2
+      exit 6
+      ;;
+    *)
+      return 0  # parent is still alive
+      ;;
+  esac
+}
+
+# _validate_acceptance <message>
+# For standard/decision tasks, rejects if no valid Acceptance: line.
+# Caller must have already checked $ttype is standard or decision.
+# Exit 0 = valid, non-zero with message to stderr = rejected.
+_validate_acceptance() {
+  local msg="$1"
+
+  # Extract Acceptance: line. Case-insensitive, handles pipefail.
+  local acc
+  acc=$(echo "$msg" | grep -i '^Acceptance:' | head -1 | sed 's/^[Aa][Cc][Cc][Ee][Pp][Tt][Aa][Nn][Cc][Ee]:[[:space:]]*//' || true)
+
+  if [ -z "$acc" ]; then
+    echo "refused: standard/decision tasks require an Acceptance: line" >&2
+    exit 5
+  fi
+
+  # Normalize for vagueness check
+  local lower
+  lower=$(echo "$acc" | tr '[:upper:]' '[:lower:]' | xargs)
+
+  # Under ~15 chars = too vague
+  if [ ${#lower} -lt 15 ]; then
+    echo "refused: acceptance criteria too short (${#lower} chars) — needs a concrete verifiable condition" >&2
+    exit 5
+  fi
+
+  # Blocklist: exact-match vague filler only
+  case "$lower" in
+    works|done|correctly|"as expected"|"it works"|complete|"works correctly"|ok|okay|fine|good|yes|no|pass|passed|success|successful|"all good"|working|ready|finished|completed|verified|confirmed|approved|accepted|merged|deployed|built|tested|validated|checked|runs|"runs fine"|"runs ok"|"runs correctly"|"should work"|"will work"|"must work")
+      echo "refused: acceptance criteria too vague — '$acc' — needs a concrete verifiable condition (command, exit code, file path, row count, URL, or number)" >&2
+      exit 5
+      ;;
+  esac
+
+  # Require at least one concrete token: exit code, file path, URL, row/table count, or number
+  if ! echo "$lower" | grep -qE '([0-9]+|/[a-zA-Z]|https?://|\b(table|row|count|exit|file|path|command|output|returns?)\b|\.(py|sh|json|sql|md|yaml|yml|txt|csv|html|css|js|ts|tsx))'; then
+    echo "refused: acceptance criteria needs a concrete verifiable token (exit code, file path, URL, row count, or number)" >&2
+    exit 5
+  fi
+}
+
+# ----- subcommands -----
+
+cmd_list() {
+  systemctl list-units 'openclaw-*.service' --no-legend --plain | awk '{print $1, $4}'
+}
+
+cmd_status() {
+  local agent="${1:?usage: fleet status <agent>}"
+  _validate_agent "$agent"
+  systemctl status "openclaw-${agent}.service" --no-pager -l | head -20
+}
+
+cmd_ping() {
+  local agent="${1:?usage: fleet ping <agent> <msg>}"; shift
+  _validate_agent "$agent"
+  local msg="${*:?usage: fleet ping <agent> <msg>}"
+  local ws="/opt/gcg/openclaw-${agent}/workspace"
+  [ ! -d "$ws" ] && { echo "no workspace for $agent" >&2; exit 1; }
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  {
+    echo "## NOTICE from $(_resolve_sender) — $ts"
+    echo "$msg"
+  } > "$ws/NOTICE.md"
+  echo "delivered to $ws/NOTICE.md"
+}
+
+cmd_broadcast() {
+  local msg="${*:?usage: fleet broadcast <msg>}"
+  local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  local n=0
+  for ws in /opt/gcg/openclaw-*/workspace; do
+    { echo "## NOTICE from $(_resolve_sender) — $ts"; echo "$msg"; } > "$ws/NOTICE.md"
+    n=$((n+1))
+  done
+  echo "delivered to $n agents"
+}
+
+cmd_exec() {
+  local agent="${1:?usage: fleet exec <agent> <cmd>}"; shift
+  _validate_agent "$agent"
+  local ws="/opt/gcg/openclaw-${agent}/workspace"
+  [ ! -d "$ws" ] && { echo "fleet exec: no workspace for '$agent'" >&2; exit 1; }
+  cd "$ws" && "$@"
+}
+
+cmd_send() {
+  # Optional: --from <sender>, --correlation <uuid>, --parent <id>, --priority <1-9>, --type <task_type>
+  # W1 cascade extensions: --needs-review, --accountable-owner <name>, --owner-type <human|agent>, --on-complete <cmd>
+  # W2 extensions: --qa-tier <standard|high_stakes>, --input-required, --input-prompt <text>
+  # W3 extensions: --plan-authorized  (set plan_authorized=true; auto-proceeds after QA without human gate)
+  # W4 extensions: --project <name>  (tag task to a named project)
+  # W5 extensions: --acceptance <text>  (structured acceptance, auto-extracted from msg otherwise)
+  local sender corr parent prio ttype needs_review accountable_owner owner_type on_complete
+  local qa_tier input_required input_prompt plan_authorized project blocked acceptance
+  sender=""; corr=""; parent="NULL"; prio=5; ttype="message"
+  needs_review="false"; accountable_owner=""; owner_type=""; on_complete=""
+  qa_tier="standard"; input_required="false"; input_prompt=""; plan_authorized="false"; project=""; blocked="false"; acceptance=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)              sender="$2"; shift 2;;
+      --correlation)       corr="$2"; shift 2;;
+      --parent)            parent="$2"; shift 2;;
+      --priority)          prio="$2"; shift 2;;
+      --type)              ttype="$2"; shift 2;;
+      --needs-review)      needs_review="true"; shift;;
+      --accountable-owner) accountable_owner="$2"; shift 2;;
+      --owner-type)        owner_type="$2"; shift 2;;
+      --on-complete)       on_complete="$2"; shift 2;;
+      --qa-tier)           qa_tier="$2"; shift 2;;
+      --input-required)    input_required="true"; shift;;
+      --input-prompt)      input_prompt="$2"; shift 2;;
+      --plan-authorized)   plan_authorized="true"; shift;;
+      --project)           project="$2"; shift 2;;
+      --blocked)           blocked="true"; shift;;
+      --acceptance)        acceptance="$2"; shift 2;;
+      --)                  shift; break;;
+      *)                   break;;
+    esac
+  done
+  # ── Cascade-First guard (Phase 1.5): message-type asks must use fleet decide ──
+  # Detected BEFORE the INSERT so we reject early and suggest the correct command.
+  # Bypass for legitimate system/automated senders (e.g. council_loop dispatch, which
+  # contains "?" in reviewer prompts): set FLEET_SKIP_CASCADE_GUARD=1. (Daen 2026-06-16:
+  # the bare \? in the pattern was blocking the Council's own dispatch.)
+  if [ "$ttype" = "message" ] && [ "${FLEET_SKIP_CASCADE_GUARD:-}" != "1" ]; then
+    local _cf_lower; _cf_lower=$(echo "$*" | tr '[:upper:]' '[:lower:]')
+    if echo "$_cf_lower" | grep -qE '(please|pls|can you|could you).*(review|approve|sign off|check|verify|decide|confirm|authorize|look at|take a look)|\?'; then
+      echo "refused: this message looks like a review/approval request (Cascade-First)." >&2
+      echo "Use 'fleet decide ${1} \"${*}\"' instead — decision tasks have proper gate tracking." >&2
+      exit 7
+    fi
+  fi
+  local raw_to="${1:?usage: fleet send [--from S] <to> <msg>}"; shift
+  local to; to=$(_canonical_recipient "$raw_to")
+  local msg="${*:?usage: fleet send [--from S] <to> <msg>}"
+  _validate_agent "$to"
+  [ -z "$sender" ] && sender=$(_resolve_sender)
+  [ -z "$corr" ] && corr=$(_uuid)
+  local nonce; nonce=$(_uuid)
+
+  # ── Acceptance criteria gate for standard/decision tasks ──
+  case "$ttype" in standard|decision) _validate_acceptance "$msg" ;; esac
+
+  # ── Ghost-task guard: refuse live tasks on already-terminal parents ──
+  _ghost_guard "$parent" "$ttype" "$to"
+
+  # Auto-extract acceptance from message text if --acceptance not explicitly provided
+  if [ -z "$acceptance" ] && { [ "$ttype" = "standard" ] || [ "$ttype" = "decision" ]; }; then
+    acceptance=$(echo "$msg" | grep -i '^Acceptance:' | head -1 | sed 's/^[Aa][Cc][Cc][Ee][Pp][Tt][Aa][Nn][Cc][Ee]:[[:space:]]*//' || true)
+  fi
+
+  # Build artifacts JSON — embed cascade on_complete hook if provided
+  local artifacts_json="{}"
+  if [ -n "$on_complete" ]; then
+    artifacts_json=$(python3 -c "import json,sys; print(json.dumps({'cascade_on_complete': sys.argv[1]}))" "$on_complete")
+  fi
+
+  # Use psql variables so the message is safely quoted regardless of contents
+  local send_result
+  send_result=$(_psql -tA \
+    -v corr="$corr" -v parent="$parent" -v sender="$sender" -v to="$to" \
+    -v ttype="$ttype" -v prio="$prio" -v nonce="$nonce" -v msg="$msg" \
+    -v needs_review="$needs_review" -v accountable_owner="$accountable_owner" \
+    -v owner_type="$owner_type" -v artifacts="$artifacts_json" \
+    -v qa_tier="$qa_tier" -v input_required="$input_required" \
+    -v input_prompt="$input_prompt" -v plan_authorized="$plan_authorized" \
+    -v project="$project" -v blocked="$blocked" -v acceptance="$acceptance" <<'SQL'
+INSERT INTO agent_messages
+  (correlation_id, parent_id, sender, recipient, task_type, payload, priority, nonce,
+   needs_review, accountable_owner, owner_type, artifacts,
+   qa_tier, status, input_required_at, input_prompt, plan_authorized, project,
+   blocked_at, blocked_reason)
+VALUES
+  (:'corr', NULLIF(:'parent','NULL')::bigint, :'sender', :'to', :'ttype',
+   jsonb_strip_nulls(jsonb_build_object('text', :'msg', 'acceptance', NULLIF(:'acceptance',''))),
+   :'prio'::smallint, :'nonce',
+   :'needs_review'::boolean,
+   NULLIF(:'accountable_owner', ''),
+   NULLIF(:'owner_type', ''),
+   :'artifacts'::jsonb,
+   NULLIF(:'qa_tier', ''),
+   CASE
+     WHEN :'input_required' = 'true' THEN 'input-required'
+     WHEN :'blocked' = 'true' THEN 'blocked'
+     -- Fire-and-forget / terminal-output types auto-terminalize. 'message' and 'qa_review'
+     -- removed 2026-06-21 (born-done fix): they carry real asks/work and must park as pending.
+     WHEN :'ttype' IN ('notification','ack','fyi','reply','result') THEN 'done'
+     ELSE 'pending'
+   END,
+   CASE WHEN :'input_required' = 'true' THEN NOW() ELSE NULL END,
+   NULLIF(:'input_prompt', ''),
+   :'plan_authorized'::boolean,
+   NULLIF(:'project', ''),
+   CASE WHEN :'blocked' = 'true' THEN NOW() ELSE NULL END,
+   CASE WHEN :'blocked' = 'true' THEN 'waiting on deps' ELSE NULL END)
+RETURNING id, correlation_id, status;
+SQL
+  )
+  echo "$send_result"
+  # Dispatch logger hook: record start for token/latency baseline (Phase 0.0)
+  local dispatch_id; dispatch_id=$(echo "$send_result" | cut -d'|' -f1 | head -1)
+  if [ -n "$dispatch_id" ] && [ -x /opt/gcg/shared/scripts/dispatch_logger.py ]; then
+    /opt/gcg/shared/scripts/dispatch_logger.py start --id "$dispatch_id" --agent "$sender" --task "$(echo "$msg" | head -1 | cut -c1-120)" 2>/dev/null &
+    # Snapshot recipient's session store for later token-delta computation
+    /opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/dispatch_snapshot.py "$dispatch_id" "$to" 2>/dev/null &
+  fi
+}
+
+cmd_decide() {
+  # fleet decide [--from <sender>] <approver> "<question>"
+  # Creates a human-decision gate: accountable_owner=sender (proposer), recipient=approver.
+  # This enforces owner≠approver so the approver can self-approve without hitting the
+  # self-verify guard.
+  # Always high_stakes, input-required, owner_type=human.
+  local sender=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) sender="$2"; shift 2;;
+      --)     shift; break;;
+      *)      break;;
+    esac
+  done
+  local approver="${1:?usage: fleet decide [--from <sender>] <approver> \"<question>\"}"; shift
+  local question="${*:?usage: fleet decide [--from <sender>] <approver> \"<question>\"}"
+  [ -z "$sender" ] && sender=$(_resolve_sender)
+  _validate_agent "$approver"
+  local corr; corr=$(_uuid)
+  local nonce; nonce=$(_uuid)
+  _psql -tA \
+    -v corr="$corr" -v sender="$sender" -v approver="$approver" \
+    -v question="$question" -v nonce="$nonce" <<'SQL'
+INSERT INTO agent_messages
+  (correlation_id, sender, recipient, task_type, payload, nonce,
+   status, input_required_at, input_prompt,
+   accountable_owner, owner_type, qa_tier, needs_review, priority)
+VALUES
+  (:'corr', :'sender', :'approver', 'decision',
+   jsonb_build_object('text', :'question'), :'nonce',
+   'input-required', NOW(), :'question',
+   :'sender', 'human', 'high_stakes', true, 5)
+RETURNING id, correlation_id, status;
+SQL
+  echo "Decision gate created — owner=${sender} (proposer), approver=${approver}"
+}
+
+cmd_inbox() {
+  local agent="${1:?usage: fleet inbox <agent> [--all]}"; shift || true
+  _validate_agent "$agent"
+  if [ "${1:-}" = "--all" ]; then
+    _psql -v agent="$agent" <<'SQL'
+\pset border 2
+SELECT id, sender, task_type, status, priority,
+       to_char(issued_at, 'YYYY-MM-DD HH24:MI:SS') AS issued,
+       left(payload->>'text', 80) AS preview
+  FROM agent_messages
+ WHERE recipient = :'agent'
+ ORDER BY issued_at DESC
+ LIMIT 50;
+SQL
+  else
+    # "open" inbox = anything not yet done / failed / cancelled
+    _psql -v agent="$agent" <<'SQL'
+\pset border 2
+SELECT id, sender, task_type, status, priority,
+       to_char(issued_at, 'YYYY-MM-DD HH24:MI:SS') AS issued,
+       left(coalesce(progress_note, blocked_reason, payload->>'text'), 60) AS preview
+  FROM agent_messages
+ WHERE recipient = :'agent'
+   AND status IN ('pending','delivered','acked','in_progress','blocked')
+ ORDER BY priority ASC, issued_at ASC;
+SQL
+  fi
+}
+
+cmd_ack()    { local id="${1:?usage: fleet ack <id>}";    _set_status "$id" acked       acked_at;   }
+
+# _dispatch_log_finish <id> <outcome>
+# Reads wall_ms from DB timestamps, reads token file if present, fires dispatch_logger finish.
+# Always runs in background (non-blocking). Source: token+latency logger (#153893).
+_dispatch_log_finish() {
+  local id="$1" outcome="$2"
+  [ -x /opt/gcg/shared/scripts/dispatch_logger.py ] || return 0
+  {
+    local timing in_tok out_tok wall_ms tok_file agent_name
+    timing=$(_psql -tA -F $'\t' -v id="$id" <<'SQL'
+SELECT extract(epoch FROM COALESCE(done_at, NOW()))::bigint,
+       extract(epoch FROM COALESCE(started_at, issued_at, NOW()))::bigint,
+       COALESCE(recipient, 'unknown')
+  FROM agent_messages WHERE id = :'id'::bigint LIMIT 1;
+SQL
+    )
+    local done_ep start_ep
+    done_ep=$(echo "$timing"    | cut -f1)
+    start_ep=$(echo "$timing"   | cut -f2)
+    agent_name=$(echo "$timing" | cut -f3)
+    wall_ms=$(( (${done_ep:-0} - ${start_ep:-0}) * 1000 ))
+    [ "$wall_ms" -lt 0 ] && wall_ms=0
+
+    in_tok=0; out_tok=0
+    tok_file="/tmp/fleet_tokens_${id}"
+    if [ -f "$tok_file" ]; then
+      in_tok=$(python3 -c "import json; d=json.load(open('$tok_file')); print(d.get('input_tokens',0))" 2>/dev/null || echo 0)
+      out_tok=$(python3 -c "import json; d=json.load(open('$tok_file')); print(d.get('output_tokens',0))" 2>/dev/null || echo 0)
+      rm -f "$tok_file" 2>/dev/null || true
+    fi
+    /opt/gcg/shared/scripts/dispatch_logger.py finish \
+      --id "$id" --agent "${agent_name:-unknown}" --wall-ms "$wall_ms" \
+      --input-tokens "$in_tok" --output-tokens "$out_tok" \
+      --outcome "$outcome" 2>/dev/null
+  } &
+}
+
+cmd_done() {
+  local id="${1:?usage: fleet done <id>}"
+  # GATE GUARD (2026-06-15): a task parked at input-required can ONLY be cleared by a human
+  # approve (The Forge / POST /tasks/<id>/approve), NEVER by the doer calling `fleet done`.
+  # Root cause of the 2026-06-15 unreviewed-prod-migration incident: doer re-ran `fleet done`
+  # on an input-required task and Pass 3a couldn't re-bounce (input_required_at already set).
+  local cur; cur=$(_psql -tA -v id="$id" <<'SQL'
+SELECT status FROM agent_messages WHERE id = :'id'::bigint;
+SQL
+  )
+  cur=$(printf '%s' "$cur" | tr -d '[:space:]')
+  if [ "$cur" = "input-required" ]; then
+    echo "refused: task #$id is input-required (awaiting human approval). Resolve in The Forge or POST /tasks/$id/approve — not 'fleet done'." >&2
+    _dispatch_log_finish "$id" refused 2>/dev/null || true
+    return 1
+  fi
+  local result; result=$(_psql -tA -v id="$id" <<'SQL'
+UPDATE agent_messages SET status = 'done', done_at = NOW()
+ WHERE id = :'id'::bigint
+   AND status <> 'input-required'
+RETURNING id, status, done_at;
+SQL
+  )
+  echo "$result"
+  _dispatch_log_finish "$id" success
+}
+
+# start is idempotent: re-starting an already in_progress row is a no-op success
+# (original started_at preserved); a terminal row (done/failed/cancelled) is never resurrected.
+cmd_start()  {
+  local id="${1:?usage: fleet start <id>}"
+  _psql -tA -v id="$id" <<'SQL'
+UPDATE agent_messages
+   SET status = 'in_progress',
+       started_at = COALESCE(started_at, NOW())
+ WHERE id = :'id'::bigint
+   AND status IN ('pending','delivered','acked','in_progress')
+RETURNING id, status, started_at;
+SQL
+}
+cmd_fail()   {
+  local id="${1:?usage: fleet fail <id> <reason>}"; shift
+  local reason="${*:?usage: fleet fail <id> <reason>}"
+  local result; result=$(_psql -tA -v id="$id" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET status = 'failed', done_at = NOW(), blocked_reason = :'reason'
+ WHERE id = :'id'::bigint
+RETURNING id, status;
+SQL
+  )
+  echo "$result"
+  _dispatch_log_finish "$id" fail
+}
+cmd_cancel() {
+  local id="${1:?usage: fleet cancel <id>}"; _set_status "$id" cancelled done_at
+}
+cmd_block() {
+  local id="${1:?usage: fleet block <id> [--dep <blocking_id>] <reason>}"; shift
+  local dep=""
+  if [ "${1:-}" = "--dep" ]; then dep="${2:?--dep needs a blocking task id}"; shift 2; fi
+  local reason="${*:?usage: fleet block <id> [--dep <blocking_id>] <reason>}"
+  if [ -n "$dep" ]; then
+    # Structured dependency block — gcg-loop-driver auto-advances this when <dep> goes terminal.
+    _psql -tA -v id="$id" -v reason="$reason" -v dep="$dep" <<'SQL'
+UPDATE agent_messages
+   SET status = 'blocked', blocked_at = NOW(), blocked_reason = :'reason',
+       blocked_by = ARRAY[:'dep'::bigint]
+ WHERE id = :'id'::bigint
+RETURNING id, status, blocked_by;
+SQL
+  else
+    # ponytail: a block with no structured dep is NOT dependency-blocked — it needs attention.
+    # Route to input-required (surfaced) instead of 'blocked'. The loop-driver only resolves
+    # 'blocked' via blocked_by, so a depless 'blocked' rots in limbo forever (the recurring bug).
+    _psql -tA -v id="$id" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET status = 'input-required', blocked_at = NOW(), blocked_reason = :'reason',
+       input_required_at = NOW()
+ WHERE id = :'id'::bigint
+RETURNING id, status;
+SQL
+  fi
+}
+cmd_progress() {
+  local id="${1:?usage: fleet progress <id> <note>}"; shift
+  local note="${*:?usage: fleet progress <id> <note>}"
+  _psql -tA -v id="$id" -v note="$note" <<'SQL'
+UPDATE agent_messages
+   SET progress_note = :'note'
+ WHERE id = :'id'::bigint
+RETURNING id, status, progress_note;
+SQL
+}
+
+_set_status() {
+  local id="$1"; local new="$2"; local tscol="$3"
+  # Hard whitelist on the timestamp column — only these are valid.
+  # Prevents future refactors from accidentally introducing SQL injection.
+  case "$tscol" in
+    acked_at|done_at|started_at|blocked_at) ;;
+    *) echo "_set_status: invalid tscol '$tscol'" >&2; exit 2;;
+  esac
+  # id is interpolated as ::bigint via psql var; rejected if non-numeric.
+  # Terminal-state guard: never resurrect a done/cancelled/failed row.
+  # W1 gate guard: agents cannot bypass the approval queue by calling fleet done
+  # on an input-required task — only the human approval API can clear that state.
+  # A no-op flip returns 0 rows but exit 0 (silent no-op, not an error).
+  local guard
+  if [ "$new" = "done" ]; then
+    guard="'done','cancelled','failed','input-required'"
+  else
+    guard="'done','cancelled','failed'"
+  fi
+  _psql -tA -v id="$id" -v new="$new" <<SQL
+UPDATE agent_messages
+   SET status = :'new', $tscol = NOW()
+ WHERE id = :'id'::bigint
+   AND status NOT IN ($guard)
+RETURNING id, status, $tscol;
+SQL
+}
+
+cmd_chain() {
+  # fleet chain <id> <dep_id>
+  # Safely adds dep_id to blocked_by for id ONLY if it would not create a cycle.
+  # Uses recursive CTE to walk the dependency graph from dep_id; if id is found
+  # in that reachable set, the edge would create a cycle → rejected with exit 3.
+  # Also rejects self-dependency (id == dep_id) via exit 3.
+  local id="${1:?usage: fleet chain <id> <dep_id>}"
+  local dep="${2:?usage: fleet chain <id> <dep_id>}"
+
+  # Numeric validation
+  case "$id"  in (*[!0-9]*|'') echo "fleet chain: invalid id '$id'"  >&2; exit 2;; esac
+  case "$dep" in (*[!0-9]*|'') echo "fleet chain: invalid dep '$dep'" >&2; exit 2;; esac
+
+  # Self-dependency fast-path
+  if [ "$id" = "$dep" ]; then
+    echo "fleet chain: cycle rejected — self-dependency ($id depends on itself)" >&2
+    exit 3
+  fi
+
+  # Cycle detection: walk the dependency graph from dep using recursive CTE.
+  # If id appears anywhere in dep's transitive blocked_by set, adding this edge
+  # would close a cycle. psql variables can't be used inside DO blocks, so we
+  # use a multi-statement approach: detect first, then update only if safe.
+  local cycle_count
+  cycle_count=$(_psql -tA <<SQL
+WITH RECURSIVE cycle_check AS (
+  SELECT blocked_by
+    FROM agent_messages
+   WHERE id = ${dep}::bigint
+  UNION ALL
+  SELECT am.blocked_by
+    FROM agent_messages am
+    JOIN cycle_check cc ON am.id = ANY(cc.blocked_by)
+)
+SELECT COUNT(*) FROM cycle_check WHERE ${id}::bigint = ANY(blocked_by);
+SQL
+)
+
+  if [ "${cycle_count:-0}" -gt 0 ]; then
+    echo "fleet chain: cycle rejected — adding ${id} -> ${dep} would create a dependency cycle" >&2
+    exit 3
+  fi
+
+  # Check dep exists
+  local dep_exists
+  dep_exists=$(_psql -tA -c "SELECT COUNT(*) FROM agent_messages WHERE id = ${dep}::bigint;")
+  if [ "${dep_exists:-0}" -eq 0 ]; then
+    echo "fleet chain: dep_id ${dep} not found" >&2
+    exit 2
+  fi
+
+  # Safe — add the dependency
+  _psql -tA <<SQL
+UPDATE agent_messages
+   SET blocked_by = array_append(blocked_by, ${dep}::bigint),
+       status     = CASE WHEN status = 'pending' THEN 'blocked' ELSE status END,
+       blocked_at = CASE WHEN status = 'pending' THEN NOW() ELSE blocked_at END,
+       blocked_reason = CASE WHEN status = 'pending'
+                              THEN 'waiting on task ' || ${dep}::text
+                              ELSE blocked_reason END
+ WHERE id = ${id}::bigint
+   AND NOT (${dep}::bigint = ANY(blocked_by))
+RETURNING id, blocked_by;
+SQL
+}
+
+# Canonical sender mapping — rewrites reply recipients so multi-instance agents
+# (e.g. Atlas on Mac Mini) don't siphon replies away from the primary instance.
+# Source: ROOTCAUSE_misroute-daen-atlas-2026-06-14
+_canonical_recipient() {
+  local raw="$1"
+  local map_file="/opt/gcg/shared/fleet-workspace/config/sender-map.json"
+  if [ -r "$map_file" ]; then
+    local mapped
+    mapped=$(python3 -c "import json,sys; m=json.load(open('$map_file')).get('map',{}); print(m.get(sys.argv[1], sys.argv[1]))" "$raw" 2>/dev/null)
+    echo "${mapped:-$raw}"
+  else
+    echo "$raw"
+  fi
+}
+
+cmd_reply() {
+  local id="${1:?usage: fleet reply <id> <msg>}"; shift
+  local msg="${*:?usage: fleet reply <id> <msg>}"
+  local sender; sender=$(_resolve_sender)
+  local nonce; nonce=$(_uuid)
+
+  # Ghost-task guard: refuse to reply to an already-terminal task
+  local parent_status; parent_status=$(_psql -tA -F '' -c "SELECT status FROM agent_messages WHERE id = ${id}::bigint;" 2>/dev/null || echo '')
+  case "$parent_status" in
+    done|failed|cancelled)
+      echo "fleet reply: parent task #${id} is already ${parent_status} — reply refused (ghost guard)" >&2
+      exit 2;;
+  esac
+
+  # Resolve original sender through canonical mapping so replies always
+  # route to the primary instance (e.g. atlas→daen per ROOTCAUSE 2026-06-14).
+  local raw_sender; raw_sender=$(_psql -tA -v id="$id" <<<'SELECT sender FROM agent_messages WHERE id = :'\''id'\''::bigint;')
+  local mapped_recipient; mapped_recipient=$(_canonical_recipient "$raw_sender")
+  local reply_result
+  reply_result=$(_psql -tA -v id="$id" -v sender="$sender" -v recip="$mapped_recipient" -v nonce="$nonce" -v msg="$msg" <<'SQL'
+WITH src AS (
+  SELECT correlation_id, sender, recipient FROM agent_messages WHERE id = :'id'::bigint
+)
+INSERT INTO agent_messages
+  (correlation_id, parent_id, sender, recipient, task_type, payload, nonce)
+SELECT src.correlation_id, :'id'::bigint, :'sender', :'recip', 'reply',
+       jsonb_build_object('text', :'msg'), :'nonce'
+  FROM src
+RETURNING id, correlation_id, sender, recipient, status;
+SQL
+  )
+  echo "$reply_result"
+  local dispatch_id; dispatch_id=$(echo "$reply_result" | cut -d'|' -f1 | head -1)
+  if [ -n "$dispatch_id" ] && [ -x /opt/gcg/shared/scripts/dispatch_logger.py ]; then
+    /opt/gcg/shared/scripts/dispatch_logger.py start --id "$dispatch_id" --agent "$sender" --task "$(echo "$msg" | head -1 | cut -c1-120)" 2>/dev/null &
+  fi
+}
+
+cmd_revert() {
+  # fleet revert <task_id>           — preview: show last 10 events for the task
+  # fleet revert <task_id> <event_id> — stage a revert: creates a high_stakes input-required
+  #                                     approval request. Revert executes atomically on approve.
+  local id="${1:?usage: fleet revert <task_id> [event_id]}"
+  local event_id="${2:-}"
+
+  # Numeric validation
+  case "$id" in (*[!0-9]*|'') echo "fleet revert: invalid task_id '$id'" >&2; exit 2;; esac
+
+  if [ -z "$event_id" ]; then
+    # Preview mode: show recent events for the task
+    echo "Recent events for task $id:"
+    _psql <<SQL
+SELECT event_id, to_char(occurred_at, 'MM-DD HH24:MI:SS') AS at,
+       actor, caused_by, from_status, to_status
+  FROM task_events
+ WHERE task_id = ${id}::bigint
+ ORDER BY event_id DESC
+ LIMIT 10;
+SQL
+    echo ""
+    echo "To stage a revert: fleet revert ${id} <event_id>"
+    return 0
+  fi
+
+  case "$event_id" in (*[!0-9]*|'') echo "fleet revert: invalid event_id '$event_id'" >&2; exit 2;; esac
+
+  # Look up from_status at the target event (revert restores the state BEFORE that event)
+  local revert_to
+  revert_to=$(_psql -tA -F '' <<SQL
+SELECT from_status FROM task_events
+ WHERE task_id = ${id}::bigint AND event_id = ${event_id}::bigint;
+SQL
+)
+
+  if [ -z "$revert_to" ]; then
+    echo "fleet revert: no event_id=${event_id} found for task ${id}" >&2; exit 2
+  fi
+  if [ "$revert_to" = "" ]; then
+    echo "fleet revert: event ${event_id} is the initial INSERT (from_status is NULL — nothing to revert to)" >&2; exit 2
+  fi
+
+  local current_status
+  current_status=$(_psql -tA -F '' -c "SELECT status FROM agent_messages WHERE id = ${id}::bigint;")
+
+  echo "Staging revert: task ${id} ${current_status} → ${revert_to} (via event ${event_id})"
+  echo "Creating high_stakes input-required approval request (parks in The Forge)..."
+
+  local nonce; nonce=$(_uuid)
+  local owner
+  owner=$(_psql -tA -F '' -c "SELECT accountable_owner FROM agent_messages WHERE id = ${id}::bigint;")
+  owner="${owner:-peter}"
+
+  local revert_id
+  revert_id=$(_psql -tA -F '' -v nonce="$nonce" <<SQL | grep -E '^[0-9]+$' | head -1
+INSERT INTO agent_messages
+  (correlation_id, sender, recipient, task_type, payload,
+   status, input_required_at, input_prompt, accountable_owner, owner_type,
+   qa_tier, needs_review, nonce, priority)
+VALUES
+  (gen_random_uuid(), 'fleet-revert', '${owner}', 'revert_request',
+   jsonb_build_object(
+     'text', 'Approve revert: task ${id} ${current_status} → ${revert_to} (event ${event_id})',
+     'target_task_id', ${id}::bigint,
+     'revert_to_status', '${revert_to}',
+     'revert_event_id', ${event_id}::bigint,
+     'current_status', '${current_status}'
+   ),
+   'input-required', NOW(),
+   'Revert task ${id} from ''${current_status}'' back to ''${revert_to}'' (undoing event ${event_id}). Approve to execute.',
+   '${owner}', 'human', 'high_stakes', true, :'nonce'::uuid, 5)
+RETURNING id;
+SQL
+)
+
+  echo "Revert staged as approval request #${revert_id} (high_stakes)"
+  echo "Visible in The Forge: https://staging-intelligence.gcgstr.com/forge"
+  echo "To approve: fleet approve ${revert_id}  (or via The Forge UI)"
+}
+
+cmd_qa_pass() {
+  # fleet qa-pass <id> [reason] — DB-direct QA verdict (no HTTP endpoint needed).
+  # Phase 1.3: replaces the non-existent /api/tasks/{id}/qa-verify HTTP endpoint.
+  # Phase 2 (2026-06-16): branches on qa_tier — standard→done, high_stakes→input-required(daen).
+  # Self-auth via /opt/gcg/shared/credentials/fleet-api-tokens.json.
+  local id="${1:?usage: fleet qa-pass <id> [reason]}"; shift
+  local reason="${*:-QA passed}"
+  local actor; actor=$(_resolve_sender)
+
+  # Self-auth: caller must have a token entry
+  local tok_file="/opt/gcg/shared/credentials/fleet-api-tokens.json"
+  if ! python3 -c "
+import json
+data = json.load(open('$tok_file'))
+found = any(e['actor'] == '$actor' for e in data.get('tokens', {}).values())
+exit(0 if found else 1)
+" 2>/dev/null; then
+    echo "fleet qa-pass: actor '$actor' not authorized (no token in fleet-api-tokens.json)" >&2
+    exit 1
+  fi
+
+  # Read qa_tier + agent_qa_by + verified_by to branch standard vs high_stakes
+  local meta; meta=$(_psql -tA -v id="$id" <<<"SELECT qa_tier, agent_qa_by, verified_by FROM agent_messages WHERE id = :'id'::bigint LIMIT 1;" 2>/dev/null || true)
+  if [ -z "$meta" ]; then
+    echo "fleet qa-pass: task #$id not found" >&2
+    exit 2
+  fi
+  local qa_tier;  qa_tier=$(echo "$meta" | cut -d'|' -f1)
+  local existing_qa; existing_qa=$(echo "$meta" | cut -d'|' -f2)
+  local existing_vb; existing_vb=$(echo "$meta" | cut -d'|' -f3)
+  qa_tier="${qa_tier:-standard}"
+
+  # Idempotent: already QA'd (agent_qa_by for high_stakes, verified_by for standard)
+  if [ -n "$existing_qa" ] || [ -n "$existing_vb" ]; then
+    local who="${existing_qa:-$existing_vb}"
+    echo "fleet qa-pass: task #$id already QA'd by ${who} (no-op)" >&2
+    exit 0
+  fi
+
+  local result
+  if [ "$qa_tier" = "high_stakes" ]; then
+    # ── HIGH_STAKES: QA pass → park for Daen approval (NOT auto-done) ──
+    # Owner stays 'agent' (daen), owner≠approver enforces non-self-approval.
+    # Exempt from 30-min auto-fail (Daen's review is human-paced).
+    result=$(_psql -tA -v id="$id" -v actor="$actor" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET agent_qa_by         = :'actor',
+       verified_by         = :'actor',
+       verified_actor_type = 'agent',
+       verified_at         = NOW(),
+       status              = 'input-required',
+       input_required_at   = NOW(),
+       accountable_owner   = 'daen',
+       owner_type          = 'agent',
+       blocked_reason      = NULL,
+       progress_note       = COALESCE(progress_note, '') ||
+                             E'\n[qa-pass high_stakes] ' || :'actor' || ': ' || :'reason' ||
+                             E'\n[gate] awaiting daen approval'
+ WHERE id = :'id'::bigint
+   AND agent_qa_by IS NULL
+RETURNING id, agent_qa_by;
+SQL
+    )
+    if [ -z "$result" ]; then
+      echo "fleet qa-pass: task #$id already QA'd (no-op)" >&2
+      exit 0
+    fi
+    echo "qa-pass: task #$id verified by $actor — parked for daen approval (high_stakes)"
+  else
+    # ── STANDARD: QA pass → done (no human gate) ──
+    result=$(_psql -tA -v id="$id" -v actor="$actor" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET verified_by         = :'actor',
+       verified_actor_type = 'agent',
+       verified_at         = NOW(),
+       status              = 'done',
+       done_at             = NOW(),
+       progress_note       = COALESCE(progress_note, '') ||
+                             E'\n[qa-pass] ' || :'actor' || ': ' || :'reason'
+ WHERE id = :'id'::bigint
+   AND verified_by IS NULL
+RETURNING id, verified_by;
+SQL
+    )
+    if [ -z "$result" ]; then
+      local existing; existing=$(_psql -tA -v id="$id" <<<"SELECT verified_by FROM agent_messages WHERE id = :'id'::bigint;" 2>/dev/null || true)
+      echo "fleet qa-pass: task #$id already verified by ${existing:-?} (no-op)" >&2
+      exit 0
+    fi
+    echo "qa-pass: task #$id verified by $actor — done"
+  fi
+}
+
+cmd_qa_fail() {
+  # fleet qa-fail <id> <reason> — DB-direct QA failure verdict.
+  # Phase 1.3: same self-auth as qa-pass.
+  # Bounces task back to input-required with failure reason.
+  local id="${1:?usage: fleet qa-fail <id> <reason>}"; shift
+  local reason="${*:?reason required}"
+  local actor; actor=$(_resolve_sender)
+
+  local tok_file="/opt/gcg/shared/credentials/fleet-api-tokens.json"
+  if ! python3 -c "
+import json
+data = json.load(open('$tok_file'))
+found = any(e['actor'] == '$actor' for e in data.get('tokens', {}).values())
+exit(0 if found else 1)
+" 2>/dev/null; then
+    echo "fleet qa-fail: actor '$actor' not authorized (no token in fleet-api-tokens.json)" >&2
+    exit 1
+  fi
+
+  local exists; exists=$(_psql -tA -v id="$id" <<<"SELECT 1 FROM agent_messages WHERE id = :'id'::bigint LIMIT 1;" 2>/dev/null || true)
+  if [ -z "$exists" ]; then
+    echo "fleet qa-fail: task #$id not found" >&2
+    exit 2
+  fi
+
+  local result
+  result=$(_psql -tA -v id="$id" -v actor="$actor" -v reason="$reason" <<'SQL'
+UPDATE agent_messages
+   SET verified_by         = :'actor',
+       verified_actor_type = 'agent',
+       verified_at         = NOW(),
+       blocked_reason      = COALESCE(blocked_reason || ' ', '') ||
+                             'QA FAIL [' || :'actor' || ']: ' || :'reason',
+       status              = 'input-required',
+       input_required_at   = NOW(),
+       progress_note       = COALESCE(progress_note, '') ||
+                             E'\n[qa-fail] ' || :'actor' || ': ' || :'reason'
+ WHERE id = :'id'::bigint
+RETURNING id, verified_by;
+SQL
+  )
+  if [ -z "$result" ]; then
+    echo "fleet qa-fail: task #$id not found or already terminal" >&2
+    exit 2
+  fi
+  echo "qa-fail: task #$id failed QA by $actor — $reason"
+}
+
+cmd_deploy_gate() {
+  # fleet deploy-gate [--from <sender>] [--task <code_task_id>] [--commit <sha>] "<description>"
+  # Raises a high_stakes deploy-approval that parks in The Forge for Daen (prod DECISION owner).
+  # accountable_owner = sender (proposer), recipient = daen.
+  # Follows the canonical SOP: Vulcan QA PASS → Daen decision → Talos push.
+  local sender="" code_task_id="" commit_sha=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)   sender="$2"; shift 2;;
+      --task)   code_task_id="$2"; shift 2;;
+      --commit) commit_sha="$2"; shift 2;;
+      --)       shift; break;;
+      *)        break;;
+    esac
+  done
+  local desc="${*:?usage: fleet deploy-gate [--from <sender>] [--task <id>] [--commit <sha>] \"<description>\"}"
+  [ -z "$sender" ] && sender=$(_resolve_sender)
+  local nonce; nonce=$(_uuid)
+
+  local prompt="Deploy to prod: ${desc}"
+  [ -n "$commit_sha" ] && prompt="${prompt} (commit: ${commit_sha})"
+  [ -n "$code_task_id" ] && prompt="${prompt} — code task #${code_task_id} passed Vulcan QA."
+  prompt="${prompt} Daen: approve to let Talos push main, reject to hold."
+
+  local parent_val="NULL"
+  [ -n "$code_task_id" ] && parent_val="${code_task_id}"
+
+  _psql -tA \
+    -v sender="$sender" -v desc="$desc" -v prompt="$prompt" \
+    -v nonce="$nonce" -v parent="$parent_val" <<'SQL'
+INSERT INTO agent_messages
+  (correlation_id, parent_id, sender, recipient, task_type, payload, nonce,
+   status, input_required_at, input_prompt,
+   accountable_owner, owner_type, qa_tier, needs_review, priority)
+VALUES
+  (gen_random_uuid(),
+   NULLIF(:'parent','NULL')::bigint,
+   :'sender', 'daen', 'deploy_approval',
+   jsonb_build_object('text', :'desc'), :'nonce',
+   'input-required', NOW(), :'prompt',
+   :'sender', 'human', 'high_stakes', true, 3)
+RETURNING id, correlation_id, status;
+SQL
+  echo "Deploy gate raised for Daen (prod DECISION). Visible in The Forge."
+  echo "On PASS: Talos merges staging→main and pushes per canonical SOP."
+}
+
+cmd_tail() {
+  local agent="${1:-}"; local n="${2:-20}"
+  # Validate n is numeric
+  case "$n" in (*[!0-9]*|'') n=20;; esac
+  if [ -z "$agent" ]; then
+    _psql -v n="$n" <<'SQL'
+\pset border 2
+SELECT id, sender, recipient, task_type, status,
+       to_char(issued_at, 'MM-DD HH24:MI:SS') AS t,
+       left(payload->>'text', 60) AS preview
+  FROM agent_messages
+ ORDER BY id DESC
+ LIMIT :'n'::int;
+SQL
+  else
+    _psql -v agent="$agent" -v n="$n" <<'SQL'
+\pset border 2
+SELECT id, sender, recipient, task_type, status,
+       to_char(issued_at, 'MM-DD HH24:MI:SS') AS t,
+       left(payload->>'text', 60) AS preview
+  FROM agent_messages
+ WHERE recipient = :'agent' OR sender = :'agent'
+ ORDER BY id DESC
+ LIMIT :'n'::int;
+SQL
+  fi
+}
+
+# Common JSON envelope projection — MUST stay byte-identical to gcg-inbox-poll's
+# ENVELOPE_SELECT so reconcile re-materializes files identical to the poller's.
+_ENVELOPE_SELECT="
+SELECT id,
+  jsonb_build_object(
+    'id', id, 'sender', sender, 'recipient', recipient,
+    'correlation_id', correlation_id, 'parent_id', parent_id,
+    'task_type', task_type, 'priority', priority,
+    'issued_at', to_char(issued_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+    'nonce', nonce, 'payload', payload
+  )::text AS envelope
+FROM src ORDER BY id;"
+
+# fleet reconcile <agent> — DB-is-truth heal pass. Runs as gcg_fleet, NO poke.
+# 1. Re-materialize missing/0-byte inbox files for 'delivered' rows in the window
+#    (heals the crash window: row committed delivered, file never written).
+# 2. Zombie cleanup: rm inbox/<id>.json whose row is in_progress/done/failed/cancelled.
+# Bounded by window + LIMIT; excludes legacy 'acked' backlog and 'pending' (poller's job).
+RECONCILE_WINDOW="${INBOX_RECONCILE_WINDOW:-24 hours}"
+RECONCILE_LIMIT="${INBOX_RECONCILE_LIMIT:-200}"
+cmd_reconcile() {
+  local agent="${1:?usage: fleet reconcile <agent>}"
+  _validate_agent "$agent"
+  local inbox="/opt/gcg/openclaw-${agent}/workspace/inbox"
+  [ -d "$inbox" ] || { echo "fleet reconcile: no inbox for $agent" >&2; exit 1; }
+
+  # --- Pass 1: re-materialize missing/truncated files for OPEN rows ---
+  # Includes in_progress: a claimed message whose session died still needs its
+  # file restored so the next run can see it (else it's invisible forever).
+  local rows
+  rows=$(_psql -tA -F $'\t' -v agent="$agent" <<SQL
+WITH src AS (
+  SELECT * FROM agent_messages
+   WHERE recipient = :'agent' AND status IN ('delivered','in_progress')
+     AND issued_at > NOW() - INTERVAL '${RECONCILE_WINDOW}'
+   ORDER BY id LIMIT ${RECONCILE_LIMIT}
+)
+${_ENVELOPE_SELECT}
+SQL
+)
+  local rematerialized=0
+  if [ -n "$rows" ]; then
+    while IFS=$'\t' read -r id envelope; do
+      [ -z "$id" ] && continue
+      local f="${inbox}/${id}.json"
+      if [ ! -s "$f" ]; then
+        local tmp="${inbox}/.${id}.json.tmp"
+        printf '%s\n' "$envelope" > "$tmp"
+        chmod 0640 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$f"
+        rematerialized=$((rematerialized+1))
+      fi
+    done <<< "$rows"
+  fi
+
+  # --- Pass 2: zombie cleanup — files whose row is TERMINAL (done/failed/cancelled) ---
+  # NOTE: in_progress is deliberately EXCLUDED. A claimed-but-unfinished message
+  # must keep its file — removing it (the old behavior) silently lost any message
+  # whose session died mid-work, since nothing re-materializes it.
+  local ids=""
+  shopt -s nullglob
+  for f in "${inbox}"/*.json; do
+    local b; b=$(basename "$f" .json)
+    case "$b" in (*[!0-9]*|'') continue;; esac
+    ids="${ids:+$ids,}$b"
+  done
+  shopt -u nullglob
+  local removed=0
+  if [ -n "$ids" ]; then
+    local zombies
+    zombies=$(_psql -tA -v agent="$agent" -v ids="$ids" <<'SQL'
+SELECT id FROM agent_messages
+ WHERE recipient = :'agent'
+   AND status IN ('done','failed','cancelled')
+   AND id = ANY(string_to_array(:'ids', ',')::bigint[]);
+SQL
+)
+    if [ -n "$zombies" ]; then
+      while read -r zid; do
+        [ -z "$zid" ] && continue
+        rm -f "${inbox}/${zid}.json" && removed=$((removed+1))
+      done <<< "$zombies"
+    fi
+  fi
+  echo "reconcile[$agent]: rematerialized=$rematerialized zombies_removed=$removed"
+}
+
+# fleet check --inbox-stale --threshold N [--agent A]
+# Exit 1 (+ list) if any pending/delivered row older than N seconds; else exit 0.
+# Excludes legacy 'acked' backlog by design. Scheduled by the stale-monitor timer.
+cmd_check() {
+  local mode="" thr=300 agent=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --inbox-stale) mode="inbox-stale"; shift;;
+      --threshold)   thr="$2"; shift 2;;
+      --agent)       agent="$2"; shift 2;;
+      *) echo "fleet check: unknown arg '$1'" >&2; exit 2;;
+    esac
+  done
+  [ "$mode" = "inbox-stale" ] || { echo "usage: fleet check --inbox-stale --threshold N [--agent A]" >&2; exit 2; }
+  case "$thr" in (*[!0-9]*|'') echo "fleet check: --threshold must be integer seconds" >&2; exit 2;; esac
+  [ -n "$agent" ] && _validate_agent "$agent"
+  local out
+  out=$(_psql -tA -v thr="$thr" -v agent="$agent" <<'SQL'
+SELECT id || '  ' || recipient || '  ' || status || '  age=' ||
+       EXTRACT(EPOCH FROM NOW()-issued_at)::int || 's'
+  FROM agent_messages
+ WHERE status IN ('pending','delivered')
+   AND issued_at < NOW() - make_interval(secs => :'thr'::int)
+   AND (:'agent' = '' OR recipient = :'agent')
+   -- Exclude fire-and-forget auto-notifications: they need NO pickup, so flagging
+   -- them as "stale" is false. This also breaks the self-feeding loop where a
+   -- STALE INBOX ALERT itself sat unpicked and got re-flagged as stale.
+   AND payload->>'text' NOT LIKE 'STALE INBOX ALERT%'
+   AND NOT (sender = 'cowork' AND priority >= 5)
+ ORDER BY issued_at ASC
+ LIMIT 100;
+SQL
+)
+  if [ -n "$out" ]; then
+    echo "STALE (>${thr}s):"
+    echo "$out"
+    exit 1
+  fi
+  exit 0
+}
+
+# ----- dispatch -----
+
+CMD="${1:-list}"
+shift || true
+case "$CMD" in
+  list)      cmd_list "$@" ;;
+  status)    cmd_status "$@" ;;
+  ping)      cmd_ping "$@" ;;
+  broadcast) cmd_broadcast "$@" ;;
+  exec)      cmd_exec "$@" ;;
+  send)      cmd_send "$@" ;;
+  inbox)     cmd_inbox "$@" ;;
+  ack)       cmd_ack "$@" ;;
+  start)     cmd_start "$@" ;;
+  progress)  cmd_progress "$@" ;;
+  block)     cmd_block "$@" ;;
+  done)      cmd_done "$@" ;;
+  fail)      cmd_fail "$@" ;;
+  cancel)    cmd_cancel "$@" ;;
+  reply)     cmd_reply "$@" ;;
+  tail)      cmd_tail "$@" ;;
+  reconcile) cmd_reconcile "$@" ;;
+  check)     cmd_check "$@" ;;
+  chain)     cmd_chain "$@" ;;
+  revert)       cmd_revert "$@" ;;
+  decide)       cmd_decide "$@" ;;
+  deploy-gate)  cmd_deploy_gate "$@" ;;
+  qa-pass)      cmd_qa_pass "$@" ;;
+  qa-fail)      cmd_qa_fail "$@" ;;
+  help|-h|--help)
+    sed -n '2,28p' "$0" ; exit 0 ;;
+  *)
+    echo "unknown: $CMD (try: fleet help)" >&2 ; exit 2 ;;
+esac

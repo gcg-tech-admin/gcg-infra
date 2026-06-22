@@ -23,10 +23,76 @@ FLEET=/opt/gcg/shared/bin/fleet
 mkdir -p "$STATE_DIR" 2>/dev/null || STATE_DIR=/tmp
 STATE_FILE="${STATE_DIR}/last-alert.hash"
 
+# ── Wedge recovery (liveness) ───────────────────────────────────────────────
+# A "wedge" = the poller delivered + re-poked a message >=N times yet the
+# session never started it, AND the agent has nothing in_progress (idle, not
+# busy). That is the exact failure that silently swallowed Cassandra's council
+# review tonight: process up, agent loop dead, pokes ignored. The only recovery
+# for a wedged session is a restart. Heavily guarded:
+#   - busy-guard: never restart an agent with an in_progress row (it's alive)
+#   - signature-only: delivered + started_at NULL + deliver_count>=N + aged
+#   - 30-min per-agent cooldown: no restart loops
+#   - WEDGE_RECOVERY=0 disables; DRYRUN=1 logs without acting
+#   - DB unreachable => skip (fail safe, never restart blindly)
+WEDGE_RECOVERY="${WEDGE_RECOVERY:-1}"
+WEDGE_COOLDOWN="${WEDGE_COOLDOWN:-1800}"
+WEDGE_MINPOKES="${WEDGE_MINPOKES:-3}"
+PGHOST="${PGHOST:-10.0.0.2}"; PGPORT="${PGPORT:-5432}"
+PGUSER_FLEET="${PGUSER_FLEET:-gcg_fleet}"; PGDB="${PGDB:-gcg_intelligence}"
+PWD_FILE="${PWD_FILE:-/opt/gcg/shared/credentials/db/gcg_fleet.pwd}"
+
+_wpsql() {
+  [ -r "$PWD_FILE" ] || return 1
+  PGPASSWORD=$(tr -d '\r\n' < "$PWD_FILE") \
+    psql "host=$PGHOST port=$PGPORT user=$PGUSER_FLEET dbname=$PGDB sslmode=require" \
+    -tA -v ON_ERROR_STOP=1 "$@"
+}
+
+# Computed once per run: space-padded set of agents that match the wedge
+# signature AND have nothing in_progress (busy-guard built into the query).
+# Common case (no wedge) => the per-agent function makes zero DB calls.
+WEDGED_AGENTS=""
+compute_wedged_agents() {
+  [ "$WEDGE_RECOVERY" = "1" ] || return 0
+  local set
+  set=$(_wpsql -c "SELECT recipient FROM agent_messages WHERE issued_at > now() - interval '1 day' GROUP BY recipient HAVING count(*) FILTER (WHERE status='in_progress')=0 AND count(*) FILTER (WHERE status='delivered' AND started_at IS NULL AND deliver_count>=$WEDGE_MINPOKES AND issued_at < now()-interval '$THRESHOLD seconds')>0;" 2>/dev/null | tr '\n' ' ' || echo "")
+  WEDGED_AGENTS=" $set "
+}
+
+wedge_recover() {
+  local a="$1"
+  [ "$WEDGE_RECOVERY" = "1" ] || return 0
+  case "$WEDGED_AGENTS" in *" $a "*) ;; *) return 0 ;; esac
+  local ids
+  ids=$(_wpsql -c "SELECT id FROM agent_messages WHERE recipient='$a' AND status='delivered' AND started_at IS NULL AND deliver_count>=$WEDGE_MINPOKES AND issued_at < now() - interval '$THRESHOLD seconds' ORDER BY id;" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')
+  [ -n "$ids" ] || return 0
+  local cd="$STATE_DIR/wedge-restart.$a"
+  if [ -f "$cd" ]; then
+    local age=$(( $(date +%s) - $(stat -c %Y "$cd" 2>/dev/null || echo 0) ))
+    if [ "$age" -lt "$WEDGE_COOLDOWN" ]; then
+      echo "$(date -u +%FT%TZ) wedge[$a]: rows=[$ids] but in cooldown (${age}s<${WEDGE_COOLDOWN}s) — skip"
+      return 0
+    fi
+  fi
+  if [ "$DRYRUN" = "1" ]; then
+    echo "$(date -u +%FT%TZ) wedge[$a]: DRYRUN would restart + requeue ids=[$ids]"
+    return 0
+  fi
+  systemctl restart "openclaw-$a" 2>/dev/null || true
+  touch "$cd" 2>/dev/null || true
+  local csv; csv=$(echo "$ids" | tr ' ' ',')
+  _wpsql -c "UPDATE agent_messages SET status='pending', deliver_count=0 WHERE id IN ($csv);" >/dev/null 2>&1 || true
+  echo "$(date -u +%FT%TZ) wedge[$a]: RESTARTED session + requeued ids=[$ids]"
+  "$FLEET" send --priority 2 daen "WEDGE RECOVERY: $a session was unresponsive (delivered+never-started rows $ids); auto-restarted + requeued." >/dev/null 2>&1 || true
+  return 0
+}
+
 # Real agents = those with an openclaw unit on this host.
 agents=$(systemctl list-units 'openclaw-*.service' --no-legend --plain 2>/dev/null \
          | awk '{print $1}' | sed -E 's/^openclaw-(.*)\.service$/\1/' | sort -u)
 [ -z "$agents" ] && { echo "gcg-inbox-stale-check: no openclaw agents on this host"; exit 0; }
+
+compute_wedged_agents   # one DB query; populates $WEDGED_AGENTS (empty if none)
 
 report=""
 for a in $agents; do
@@ -36,6 +102,8 @@ for a in $agents; do
   # without loading the 5s poller. Reconcile is idempotent + bounded.
   rec=$("$FLEET" reconcile "$a" 2>/dev/null || true)
   case "$rec" in *rematerialized=0*zombies_removed=0*) : ;; *) [ -n "$rec" ] && echo "$(date -u +%FT%TZ) $rec" ;; esac
+  # Liveness: recover a wedged (alive-but-unresponsive) session before alerting.
+  wedge_recover "$a" || true
   # Then flag anything still status-stale regardless of file state.
   out=$("$FLEET" check --inbox-stale --threshold "$THRESHOLD" --agent "$a" 2>/dev/null) && continue
   # non-zero exit => stale rows present; $out has the listing
