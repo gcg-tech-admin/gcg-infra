@@ -1,0 +1,23 @@
+[Unit]
+Description=GCG Dispatch Queue Drainer (AX102 local executor — drains dispatch_queue @ AX42 via vSwitch)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/lib/gcg-dispatch
+ExecStartPre=/bin/mkdir -p /var/lib/gcg-dispatch
+Environment=GCG_DB_HOST=10.0.0.2
+Environment=GCG_DB_PASSWORD=efd23a6dc1a2d4c8649bcd4d07f8ca7c86c2e9954b99ed58cca5364ede18e9f0
+Environment=PYTHONPATH=/opt/gcg/shared/gcg_tools
+Environment=HOME=/opt/gcg/claude-profiles/sub-peter
+Environment=CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/dispatch_drainer.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/gcg-dispatch-drainer.log
+StandardError=append:/var/log/gcg-dispatch-drainer.log
+
+[Install]
+WantedBy=multi-user.target

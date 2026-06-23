@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+import sys
+import json
+import urllib.request
+import urllib.error
+
+TOKEN_FILE = '/opt/gcg/shared/credentials/beeper_api_token.txt'
+BEEPER_URL = 'http://100.109.177.127:23373/v0/mcp'
+
+def get_token():
+    try:
+        with open(TOKEN_FILE, 'r') as f:
+            return f.read().strip()
+    except Exception as e:
+        sys.stderr.write(f"Error reading token file {TOKEN_FILE}: {e}\n")
+        # Fallback to known good token if file is missing
+        return 'bdapi_KslBZd9NKivahzQQyJXBSSkhGXDvSRctzqtZidn-H4c'
+
+def forward_request(payload_str, token):
+    req = urllib.request.Request(
+        BEEPER_URL,
+        data=payload_str.encode('utf-8'),
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream'
+        },
+        method='POST'
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            for line in resp.read().decode('utf-8').split('\n'):
+                if line.startswith('data: '):
+                    data_str = line[6:]
+                    sys.stdout.write(data_str + '\n')
+                    sys.stdout.flush()
+    except urllib.error.HTTPError as e:
+        sys.stderr.write(f"HTTP Error: {e.code} {e.reason}\n")
+    except Exception as e:
+        sys.stderr.write(f"Error forwarding: {e}\n")
+
+def main():
+    token = get_token()
+    sys.stderr.write("Beeper MCP Bridge started\n")
+    sys.stderr.flush()
+    
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            forward_request(line, token)
+        except Exception as e:
+            sys.stderr.write(f"Error processing line: {e}\n")
+            sys.stderr.flush()
+
+if __name__ == '__main__':
+    main()

@@ -1,5 +1,9 @@
 #!/bin/bash
 # gcg-inbox-poll — one-shot inbox drain + wake for a single agent.
+# POLLER_VERSION=14.0 (2026-06-22: LIVENESS-AWARE — Pass 8 absorbs wedge-recovery duty from
+#   gcg-inbox-stale-check. When LIVENESS_AWARE=1 the relay detects wedged sessions (delivered+
+#   never-started+multi-poked+aged+no in_progress) and self-heals: restart session + requeue
+#   rows + alert daen. Cooldown 30min prevents loops. Canary: gcg-inbox-poller@daen.)
 # POLLER_VERSION=13.9 (2026-06-21: A2A-PICKUP-FIX-v8 — Pass 2 retry window now uses acked_at instead of issued_at. Root cause of daen/talos drain bug: old issued_at on janitor-reset messages excluded them from re-pokes; zombie guard then killed them 12 min later. Fix: acked_at resets to NOW on each re-claim, giving freshly-recovered messages a full retry window.)
 # POLLER_VERSION=13.8 (2026-06-16: J2-FIX — Pass 6 now excludes human_gate task types (decision, revert_request) from auto-QA dispatch, matching derive_gate_kind. decision tasks with owner_type=agent are still human_gate and route directly to human approval.)
 # POLLER_VERSION=13.6 (2026-06-14: QA-DISPATCH-GATE — Pass 6 only dispatches QA for task_type IN ('standard','decision'). Fixes reply/result/message/notification types wrongly getting qa_review subtasks.
@@ -741,6 +745,67 @@ if [ -n "$NOTIFY_ROWS" ]; then
 fi
 
 TOTAL=$((NEW_COUNT + REPOKE_COUNT))
+
+# ── Pass 8: liveness-aware wedge check (absorbed from gcg-inbox-stale-check) ─
+# Active when LIVENESS_AWARE=1 (canary: gcg-inbox-poller@daen; fleet-wide at Phase 3.2).
+# Wedge signature: delivered/acked + never started + multi-poked + aged + no in_progress.
+# Root cause this guards against: Cassandra 2026-06-21 — process up, agent loop dead,
+# pokes silently ignored; session needed a restart to recover.
+# Recovery: systemctl restart openclaw-<agent> + reset rows to pending + alert daen.
+# Cooldown file: ${WS}/.wedge-cd (30min) prevents restart loops.
+# Runs BEFORE the TOTAL=0 early exit so liveness fires even when no new messages landed.
+if [ "${LIVENESS_AWARE:-0}" = "1" ]; then
+  _WEDGE_THRESH="${WEDGE_THRESHOLD_SEC:-300}"   # seconds stale before recovery fires
+  _WEDGE_MINPOKES="${WEDGE_MINPOKES:-3}"         # min deliver_count to flag as wedged
+  _WEDGE_COOLDOWN="${WEDGE_COOLDOWN_SEC:-1800}"  # seconds between restart attempts
+  _WEDGE_CD="${WS}/.wedge-cd"                    # per-agent cooldown stamp (in ReadWritePaths)
+
+  _P8_SKIP=0
+  if [ -f "$_WEDGE_CD" ]; then
+    _P8_AGE=$(( $(date +%s) - $(stat -c %Y "$_WEDGE_CD" 2>/dev/null || echo 0) ))
+    [ "$_P8_AGE" -lt "$_WEDGE_COOLDOWN" ] && _P8_SKIP=1 && \
+      echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] liveness: cooldown (${_P8_AGE}s<${_WEDGE_COOLDOWN}s)" >&2
+  fi
+
+  if [ "$_P8_SKIP" = "0" ]; then
+    _WEDGE_IDS=$(_psql -F '' <<WSQL
+WITH busy AS (
+  SELECT 1 FROM agent_messages
+   WHERE recipient = :'agent' AND status = 'in_progress' LIMIT 1
+)
+SELECT COALESCE(string_agg(id::text, ','), '')
+  FROM agent_messages
+ WHERE recipient = :'agent'
+   AND status IN ('delivered','acked')
+   AND started_at IS NULL
+   AND deliver_count >= ${_WEDGE_MINPOKES}
+   AND issued_at < NOW() - INTERVAL '${_WEDGE_THRESH} seconds'
+   AND NOT EXISTS (SELECT 1 FROM busy);
+WSQL
+    ) || _WEDGE_IDS=""
+  else
+    _WEDGE_IDS=""
+  fi
+
+  if [ -n "$_WEDGE_IDS" ]; then
+    echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] LIVENESS WEDGE ids=[$_WEDGE_IDS] — recovering" >&2
+    if [ "$DRYRUN" = "1" ]; then
+      echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] DRYRUN: would restart openclaw-$AGENT + requeue ids=[$_WEDGE_IDS]" >&2
+    else
+      systemctl restart "openclaw-${AGENT}" 2>/dev/null && \
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] LIVENESS: openclaw-$AGENT restarted OK" >&2 || \
+        echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] LIVENESS: restart failed — msgs still requeued" >&2
+      touch "$_WEDGE_CD" 2>/dev/null || true
+      _psql -F '' <<WSQL
+UPDATE agent_messages SET status='pending', deliver_count=0 WHERE id IN ($_WEDGE_IDS);
+WSQL
+      /opt/gcg/shared/bin/fleet send --from system --priority 2 daen \
+        "gcg-inbox-poll LIVENESS RECOVERY: $AGENT wedged (ids=[$_WEDGE_IDS]); session restarted + msgs requeued." \
+        2>/dev/null || true
+    fi
+  fi
+fi
+
 [ "$TOTAL" -eq 0 ] && exit 0
 echo "$(date -u +%FT%TZ) gcg-inbox-poll[$AGENT] new=$NEW_COUNT repoke=$REPOKE_COUNT" >&2
 
@@ -764,7 +829,37 @@ esac
 [ -n "$PORT" ] && [ -n "$TOKEN" ] || exit 0
 
 ALL_IDS="${NEW_IDS}${NEW_IDS:+${REPOKE_IDS:+, }}${REPOKE_IDS}"
-MSG="You have ${TOTAL} inbox message(s) awaiting processing at workspace/inbox/ (ids: ${ALL_IDS}). Process per /opt/gcg/shared/docs/FLEET_INBOX.md: cat each, 'fleet start <id>', act, then 'fleet done <id>' and rm the file. Respond in English only."
+if [ "$AGENT" = "talos" ]; then
+  # CONTENT-INJECT CANARY (2026-06-22): inject the actual ask as work, not a queue-drain poke.
+  # Root cause of "ACK but no action": old wake sent only IDs + lifecycle ritual; the task
+  # content sat unread on disk, so runs performed start->done instead of the work. Here we
+  # read each claimed payload and lead with it. Other agents keep the legacy MSG below.
+  MSG=$(python3 - "$INBOX_DIR" "$ALL_IDS" <<'PYINJECT'
+import json, sys, os
+inbox = sys.argv[1]
+ids = [i.strip() for i in sys.argv[2].replace(',', ' ').split() if i.strip()]
+parts = []
+for i in ids:
+    try:
+        d = json.load(open(os.path.join(inbox, f"{i}.json")))
+        sender = d.get('sender', '?')
+        tt = d.get('task_type', '') or ''
+        txt = ((d.get('payload') or {}).get('text') or '').strip()
+        parts.append(f"#{i} from {sender}{(' ['+tt+']') if tt else ''}:\n{txt or '(no text)'}")
+    except Exception as e:
+        parts.append(f"#{i}: (could not read payload: {e}) — cat workspace/inbox/{i}.json")
+body = "\n\n".join(parts)
+print(f"""You have {len(ids)} A2A task(s) below. These are REAL asks — DO THE WORK NOW. Do not drain start->done without acting; ACK is not DONE.
+
+{body}
+
+For EACH: `fleet start <id>` (bookkeeping), then actually do the work and produce evidence (a file written, command output, or a substantive reply). Only then `fleet done <id>` citing that evidence, and rm the file. If it's a question/decision/ruling for someone else, `fleet reply` or escalate — never silently mark it done. Respond in English only.""")
+PYINJECT
+)
+  [ -n "$MSG" ] || MSG="You have ${TOTAL} A2A task(s) (ids: ${ALL_IDS}) at workspace/inbox/ — cat each, DO THE WORK, produce evidence, then fleet done. ACK is not DONE."
+else
+  MSG="You have ${TOTAL} inbox message(s) awaiting processing at workspace/inbox/ (ids: ${ALL_IDS}). Process per /opt/gcg/shared/docs/FLEET_INBOX.md: cat each, 'fleet start <id>', act, then 'fleet done <id>' and rm the file. Respond in English only."
+fi
 BODY=$(python3 -c "import json,sys; print(json.dumps({'message': sys.argv[1]}))" "$MSG")
 if curl -fsS --max-time 8 \
      -X POST "http://127.0.0.1:${PORT}/hooks/fleet" \

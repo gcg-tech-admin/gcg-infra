@@ -1,12 +1,1 @@
-[Unit]
-Description=GCG cascade driver — advance active plans every 5 min
-Documentation=https://github.com/Gcg-tech
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-Persistent=true
-Unit=gcg-cascade-driver.service
-
-[Install]
-WantedBy=timers.target
+/dev/null

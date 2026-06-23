@@ -1,0 +1,15 @@
+[Unit]
+Description=GCG inbox janitor v4 (stuck-acked alerts + retention)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/gcg/shared/bin/gcg-inbox-janitor
+Nice=10
+MemoryMax=64M
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=gcg-inbox-janitor
+ReadWritePaths=/var/lib/gcg-inbox-janitor

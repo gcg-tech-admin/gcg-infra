@@ -1,0 +1,12 @@
+# /etc/systemd/system/gcg-inbox-evidence-check.timer
+[Unit]
+Description=Run GCG inbox done!=acted drain detector every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Unit=gcg-inbox-evidence-check.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

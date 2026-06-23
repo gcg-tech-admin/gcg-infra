@@ -137,9 +137,25 @@ def normalize_changes(text: str) -> str:
 
 
 def verdict_file(plan_slug: str, reviewer: str, round_n: int) -> Path:
-    if round_n == 1:
-        return VERDICT_DIR / f"{plan_slug}-{reviewer}.md"
-    return VERDICT_DIR / f"{plan_slug}-{reviewer}-R{round_n}.md"
+    """Resolve a reviewer's verdict file.
+
+    CASE-FORK FIX (2026-06-22): reviewer agents save under inconsistent casing
+    (NEMESIS-R4 / nemesis-R4 / Confucius-R5 / nemesis-r3). If we only looked for
+    one casing, the tick missed the file, re-dispatched, and forked parallel
+    verdict tracks that disagreed (one FAIL, one PASS). We now resolve ANY existing
+    file case-insensitively (reviewer name + round suffix), returning the NEWEST on
+    conflict; if none exists yet (dispatch), we return a canonical lowercase target
+    so future writes converge to one track.
+    """
+    rid = REVIEWER_IDS.get(reviewer, reviewer).lower()
+    canonical = (VERDICT_DIR / f"{plan_slug}-{rid}.md") if round_n == 1 \
+        else (VERDICT_DIR / f"{plan_slug}-{rid}-R{round_n}.md")
+    want = f"{plan_slug}-{rid}".lower() if round_n == 1 \
+        else f"{plan_slug}-{rid}-r{round_n}".lower()
+    matches = [p for p in VERDICT_DIR.glob("*.md") if p.stem.lower() == want]
+    if matches:
+        return max(matches, key=lambda p: p.stat().st_mtime)
+    return canonical
 
 
 # ── Dispatch helpers ────────────────────────────────────────────────────────

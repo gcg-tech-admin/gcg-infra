@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+ExecStartPre=/bin/mkdir -p /run/gcg-orchestrator
 ExecStart=/opt/gcg/shared/venv/bin/python3 /opt/gcg/shared/scripts/orchestrator_tick.py
 ExecStopPost=/bin/sh -c 'rm -rf /run/gcg-orchestrator/state.lock /run/gcg-orchestrator/state.heartbeat 2>/dev/null || true'
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
