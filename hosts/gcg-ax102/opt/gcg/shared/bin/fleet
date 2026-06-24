@@ -27,6 +27,10 @@
 #   chain <id> <dep_id>           — safely add dep_id to blocked_by for id, REJECT if cycle
 #   qa-pass <id> [reason]         — QA verdict: pass (DB-direct, self-auth via tokens.json)
 #   qa-fail <id> <reason>         — QA verdict: fail (bounces to input-required)
+#   wake <agent> <msg>            — wake agent's MAIN SESSION via /hooks/wake (system event)
+#                                   Use this for council revisions and urgent asks that need
+#                                   full session context. Unlike 'send', this does NOT write
+#                                   to the inbox DB — it POSTs directly to the agent's hook.
 #
 # DB credentials: /opt/gcg/shared/credentials/db/gcg_fleet.pwd
 
@@ -1117,6 +1121,56 @@ SQL
   exit 0
 }
 
+# fleet wake <agent> <msg>
+# Wake an agent's MAIN SESSION via POST /hooks/wake (system event).
+# Unlike 'fleet send', this does NOT write to the inbox DB — it POSTs directly
+# to the agent's /hooks/wake endpoint, targeting the main session specifically.
+# Use for council revisions and any ask that needs full session context.
+cmd_wake() {
+  local agent="${1:?usage: fleet wake <agent> <message>}"; shift
+  local msg="${*:?usage: fleet wake <agent> <message>}"
+  _validate_agent "$agent"
+
+  local cfg="/opt/gcg/openclaw-${agent}/openclaw.json"
+  if [ ! -r "$cfg" ]; then
+    echo "fleet wake: cannot read $cfg" >&2
+    exit 2
+  fi
+
+  local port token
+  port=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print((c.get('gateway') or {}).get('port') or c.get('port') or '')" "$cfg" 2>/dev/null)
+  token=$(python3 -c "import json,sys; cfg=json.load(open(sys.argv[1])); raw=(cfg.get('hooks') or {}).get('token') or ''; print(raw)" "$cfg" 2>/dev/null)
+
+  # Resolve token from dropin if templated
+  case "$token" in
+    *'${'*) 
+      local dropin="/etc/systemd/system/openclaw-${agent}.service.d/20-env-secrets.conf"
+      if [ -r "$dropin" ]; then
+        token=$(sed -n 's/^Environment=HOOKS_TOKEN=//p' "$dropin")
+      fi
+    ;;
+  esac
+
+  if [ -z "$port" ] || [ -z "$token" ]; then
+    echo "fleet wake: missing port or token for $agent" >&2
+    exit 2
+  fi
+
+  local body
+  body=$(python3 -c "import json,sys; print(json.dumps({'text': sys.argv[1], 'mode': 'now'}))" "$msg")
+
+  if curl -fsS --max-time 8 \
+       -X POST "http://127.0.0.1:${port}/hooks/wake" \
+       -H "Authorization: Bearer ${token}" \
+       -H "Content-Type: application/json" \
+       -d "$body" >/dev/null 2>&1; then
+    echo "fleet wake: $agent main session woken"
+  else
+    echo "fleet wake: FAILED to wake $agent (port=${port})" >&2
+    exit 1
+  fi
+}
+
 # ----- dispatch -----
 
 CMD="${1:-list}"
@@ -1146,6 +1200,7 @@ case "$CMD" in
   deploy-gate)  cmd_deploy_gate "$@" ;;
   qa-pass)      cmd_qa_pass "$@" ;;
   qa-fail)      cmd_qa_fail "$@" ;;
+  wake)         cmd_wake "$@" ;;
   help|-h|--help)
     sed -n '2,28p' "$0" ; exit 0 ;;
   *)

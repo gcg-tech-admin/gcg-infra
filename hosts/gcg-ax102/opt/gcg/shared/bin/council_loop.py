@@ -5,11 +5,11 @@ GCG Council Consensus Loop — SELF-DRIVING
 Recursive council review until all 5 reviewers PASS.
 No round limit — loops until full consensus or stuck-detection triggers escalation.
 
-SELF-DRIVING: On round-complete with FAILs, the loop pushes a wake/ask to the
-convener's OpenClaw session (via Phase-1 a2a wake/ask primitive, with cron-wake
-fallback). The convener wakes, reads the REVISE request from its inbox, revises
-the plan, and saves it — the loop auto-detects and re-dispatches. NO human prompt
-required between rounds.
+SELF-DRIVING: On round-complete with FAILs, the loop wakes the convener's MAIN
+OpenClaw session via `fleet wake` (→ /hooks/wake system event), passing the
+aggregated reviewer conditions. The convener wakes with full context, revises
+the plan, and saves it — the loop auto-detects the hash change and re-dispatches.
+NO human prompt and NO inbox poll required between rounds.
 
 Stuck detection: if a reviewer returns IDENTICAL required changes for 2 consecutive rounds
 with no revision touching their issue, they are stuck — escalate to Peter.
@@ -128,40 +128,36 @@ def _load_agent_hooks_config_inner(agent: str) -> dict | None:
 
 
 def push_revise_to_convener(agent: str, message: str, priority: int = 3) -> bool:
-    """PUSH a wake/ask to the convener's OpenClaw session (self-driving loop).
+    """PUSH a wake/ask to the convener's MAIN OpenClaw session (self-driving loop).
 
-    Uses the Phase-1 a2a wake/ask primitive verified on 2026-06-16:
-    a `fleet send` row on the agent_messages bus is delivered by the convener's
-    `gcg-inbox-poll@<agent>.service`, which WAKES the convener's session. The
-    message IS the wake — there is no separate `fleet wake` command on this host
-    (`fleet send` already triggers the recipient's run; see AGENTS.md / FLEET_INBOX).
+    Uses `fleet wake` (→ POST /hooks/wake → system event injected into the agent's
+    MAIN session). This lands the revise request where the convener has full plan
+    context — NOT in an isolated inbox-poll turn. Peter directive 2026-06-23:
+    council revisions go through fleet wake, never an inbox poll / fleet send.
 
-    So this single `fleet send` both ASKS (delivers verdicts + 'revise FAILs +
-    relaunch') and WAKES the convener. The convener's inbox handler revises the
-    plan and `fleet reply`s; the loop auto-detects the revised file.
-
-      - PRIMARY (Phase-1 primitive): fleet send <agent> "<revise msg>" → poller wake
-      - INTERIM FALLBACK (cron-wake): HTTP POST to the convener's /hooks/wake
-        endpoint, for an immediate poke if the bus send fails.
+      - PRIMARY: `fleet wake <agent> "<revise msg>"`
+      - FALLBACK: direct HTTP POST to the convener's /hooks/wake endpoint
+        (same target, used only if the fleet CLI is missing/unreachable).
 
     Returns True if the push was delivered.
     """
-    # ── Phase-1 a2a wake/ask primitive: fleet send → poller wakes the session ──
+    # ── PRIMARY: fleet wake → /hooks/wake → convener's MAIN session ──
     try:
         result = subprocess.run(
-            ["fleet", "send", "--priority", str(priority), agent, message],
-            capture_output=True, text=True, timeout=15
+            ["fleet", "wake", agent, message],
+            capture_output=True, text=True, timeout=15,
+            env={**os.environ, "FLEET_SKIP_CASCADE_GUARD": "1"},
         )
         if result.returncode == 0:
-            print(f"  ⚡ Revise ask pushed via fleet send → {agent} (poller wakes session)")
+            print(f"  ⚡ Revise ask woke {agent}'s MAIN session via fleet wake")
             return True
-        print(f"  ⚠ fleet send returned {result.returncode}: {result.stderr.strip()[:200]}")
+        print(f"  ⚠ fleet wake returned {result.returncode}: {result.stderr.strip()[:200]}")
     except FileNotFoundError:
         print(f"  ⚠ fleet CLI not found on PATH")
     except subprocess.TimeoutExpired:
-        print(f"  ⚠ fleet send timed out")
+        print(f"  ⚠ fleet wake timed out")
 
-    # ── Interim cron-wake fallback: gateway hooks API (immediate poke) ──
+    # ── FALLBACK: direct gateway hooks API POST (same /hooks/wake target) ──
     hooks_cfg = _load_agent_hooks_config(agent)
     if not hooks_cfg:
         print(f"  ⚠ Cannot push to {agent}: fleet send failed and no hooks config found")
@@ -293,6 +289,7 @@ def dispatch_reviewer(
         f"Your role: {role}\n\n"
         f"MANDATORY SEQUENCE:\n"
         f"1. READ workspace/SOUL.md — your identity and review principles.\n"
+        f"1b. APPLY THE PONYTAIL LENS (YAGNI / least-code, MANDATORY every review): hunt over-engineering — unnecessary mechanisms, speculative abstractions, 'might-need-later', anything reuse/delete beats building. Invoke the ponytail skill if installed.\n"
         f"2. READ workspace/memory/review-log.md — scan ALL past entries for patterns applicable to this plan. "
         f"You MUST list applicable patterns in your verdict. 'None applicable' is a valid answer but must be explicit.\n"
         f"3. REVIEW the plan against your role. Read the actual plan file at: {plan_file}\n"
@@ -304,6 +301,8 @@ def dispatch_reviewer(
         f"### Key findings\n"
         f"- [Finding 1]\n"
         f"- [Finding 2]\n\n"
+        f"### Ponytail cuts (MANDATORY — YAGNI/least-code: what to delete or simplify; reuse beats build; write 'None — already minimal' only if truly none)\n"
+        f"- [Over-engineered element \u2192 simpler/reuse alternative, or 'None']\n\n"
         f"### Required changes (FAIL/CONDITIONAL only)\n"
         f"- [ROOT CAUSE + specific change required before PASS — not a symptom fix]\n\n"
         f"5. EMBED to pgvector:\n"

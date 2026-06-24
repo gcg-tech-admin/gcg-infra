@@ -47,8 +47,41 @@ REVIEWER_ROLES = {
 
 REPOKE_MINUTES = 30
 MAX_STUCK_ROUNDS = 3
+MAX_REVISION_ROUNDS = 8
 PLANNER_DEADLINE_HOURS = 2
 ESCALATED_AUTO_ARCHIVE_HOURS = 24
+
+# ── Verdict filename parsing (for historical-verdict globbing) ──────
+
+def _parse_verdict_filename(filename: str, plan_slug: str) -> tuple[str, int]:
+    """Parse reviewer ID and round number from a verdict filename.
+    Returns (reviewer_id, round_number). Round 1 has no -R suffix.
+    Examples: slug-socrates.md → (socrates, 1), slug-NEMESIS-R3.md → (nemesis, 3)
+    """
+    stem = Path(filename).stem.lower()
+    suffix = stem[len(plan_slug.lower()) + 1:]  # +1 for separator hyphen
+    # Try -R{N} or -r{N} round suffix first
+    m = re.match(r'([a-z]+)-[rR](\d+)$', suffix)
+    if m:
+        reviewer = m.group(1)
+        if reviewer in set(REVIEWER_IDS.values()):
+            return reviewer, int(m.group(2))
+        return "unknown", 1
+    # Round 1: no round suffix, just the reviewer id
+    if suffix in set(REVIEWER_IDS.values()):
+        return suffix, 1
+    return "unknown", 1
+
+
+def extract_reviewer_from_filename(filename: str, plan_slug: str) -> str:
+    """Extract reviewer ID from a verdict filename."""
+    return _parse_verdict_filename(filename, plan_slug)[0]
+
+
+def extract_round_from_filename(filename: str, plan_slug: str) -> int:
+    """Extract round number from a verdict filename."""
+    return _parse_verdict_filename(filename, plan_slug)[1]
+
 
 # Guardian that relays terminal gates to Peter. There is NO `peter` inbox poller,
 # so `fleet send peter` is a dead-end — route Peter-facing notices through the
@@ -117,23 +150,25 @@ def extract_reviewed_hash(path: Path) -> str | None:
 
 
 def extract_required_changes(path: Path) -> str:
-    """Extract 'Required changes' section from a FAIL verdict."""
+    """Extract 'Required changes' section from a FAIL verdict.
+
+    Matches any heading level (###/##/# Required changes) or bare 'Required changes'
+    (no leading #), case-insensitive. Falls back to full file body if section not
+    found or empty.
+    """
     try:
         text = path.read_text()
         m = re.search(
-            r"###\s*Required changes[^\n]*\n(.*?)(?=\n###|\n##|\Z)",
-            text, re.DOTALL | re.IGNORECASE
+            r"(?:#{1,3}\s*)?Required\s*changes[^\n]*\n(.*?)(?=\n#{1,3}\s|\Z)",
+            text, re.DOTALL | re.MULTILINE | re.IGNORECASE
         )
-        if m:
+        if m and m.group(1).strip():
             return m.group(1).strip()[:800]
+        # Section not found or empty → fallback to full body
+        return text.strip()[:800]
     except Exception:
         pass
     return "(see verdict file)"
-
-
-def normalize_changes(text: str) -> str:
-    """Normalize required changes text for stuck detection."""
-    return re.sub(r'\s+', ' ', text.strip().lower())
 
 
 def verdict_file(plan_slug: str, reviewer: str, round_n: int) -> Path:
@@ -189,6 +224,7 @@ def dispatch_reviewer(plan_slug: str, plan_path: str, plan_hash: str, goal: str,
         f"Your role: {role}\n\n"
         f"MANDATORY SEQUENCE:\n"
         f"1. READ workspace/SOUL.md — your identity and review principles.\n"
+        f"1b. APPLY THE PONYTAIL LENS (YAGNI / least-code, MANDATORY every review): hunt over-engineering — unnecessary mechanisms, speculative abstractions, 'might-need-later', anything reuse/delete beats building. Invoke the ponytail skill if installed.\n"
         f"2. READ workspace/memory/review-log.md — scan ALL past entries for patterns applicable to this plan. "
         f"You MUST list applicable patterns in your verdict. 'None applicable' is a valid answer but must be explicit.\n"
         f"3. REVIEW the plan against your role. Read the actual plan file at: {plan_path}\n"
@@ -200,6 +236,8 @@ def dispatch_reviewer(plan_slug: str, plan_path: str, plan_hash: str, goal: str,
         f"### Key findings\n"
         f"- [Finding 1]\n"
         f"- [Finding 2]\n\n"
+        f"### Ponytail cuts (MANDATORY — YAGNI/least-code: what to delete or simplify; reuse beats build; write 'None — already minimal' only if truly none)\n"
+        f"- [Over-engineered element \u2192 simpler/reuse alternative, or 'None']\n\n"
         f"### Required changes (FAIL/CONDITIONAL only)\n"
         f"- [ROOT CAUSE + specific change required before PASS — not a symptom fix]\n\n"
         f"5. EMBED to pgvector:\n"
@@ -222,7 +260,12 @@ def dispatch_reviewer(plan_slug: str, plan_path: str, plan_hash: str, goal: str,
 
 def dispatch_planner_revision(planner_agent: str, plan_slug: str, plan_path: str,
                                conditions: list, round_n: int):
-    """Send a revision request to the planner agent (default: daen)."""
+    """Wake the planner agent's MAIN session with the aggregated revision request.
+
+    Uses `fleet wake` (→ POST /hooks/wake → system event into the agent's main
+    session) NOT `fleet send` (→ inbox poll → isolated one-shot turn). The planner
+    needs full session context to revise the plan, so it MUST land in main.
+    Peter directive 2026-06-23: no headless claude -p, no inbox-poll revision."""
     conditions_text = "\n".join(f"- {c}" for c in conditions)
     msg = (
         f"COUNCIL REVISION REQUEST — {plan_slug} (Round {round_n} needs revision)\n\n"
@@ -236,9 +279,9 @@ def dispatch_planner_revision(planner_agent: str, plan_slug: str, plan_path: str
     # Bypass the Cascade-First guard (same as dispatch_reviewer) — the revision request
     # legitimately contains review verbs that otherwise trip the guard (exit 7) and
     # silently kill the loop at the revise step. Hardened 2026-06-18.
-    subprocess.run(["fleet", "send", planner_agent, msg], check=True,
+    subprocess.run(["fleet", "wake", planner_agent, msg], check=True,
                    env={**os.environ, "FLEET_SKIP_CASCADE_GUARD": "1"})
-    print(f"  → {planner_agent}: revision dispatch (round {round_n})")
+    print(f"  → {planner_agent}: revision WAKE → main session (round {round_n})")
 
 
 # ── Gate logic ──────────────────────────────────────────────────────────────
@@ -348,6 +391,12 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
         print(f"❌ Council '{slug}' not found in {COUNCILS_DIR}")
         return "error"
 
+    # ── Stale-clear: lock persisting across ticks = previous tick crashed after
+    # lock-set. The lock is synchronous; any persisted lock is stale by definition.
+    if manifest.get("revision_in_progress"):
+        manifest["revision_in_progress"] = False
+        save_manifest(slug, manifest)
+
     plan_path = manifest.get("plan_path", "")
     plan_hash = manifest.get("plan_hash", "")
     round_n = manifest.get("round", 1)
@@ -436,11 +485,16 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
             print(f"  Planner ({planner_agent}) unresponsive for {elapsed_h:.1f}h — escalating to Peter")
             manifest["status"] = "escalated"
             manifest["escalated_at"] = now.isoformat()
-            # Notify Peter
-            notify_peter(
-                f"🚨 COUNCIL ESCALATION: {slug} — Planner {planner_agent} "
-                f"unresponsive for {elapsed_h:.1f}h (deadline {planner_deadline_h}h). "
-                f"Council stuck in 'revising' since round {round_n}.")
+            # 🔒 IDEMPOTENT NOTIFY: only send ONCE per council.
+            # `escalation_notified` survives cross-manifest resets (ponytail, superseded).
+            if not manifest.get("escalation_notified"):
+                notify_peter(
+                    f"🚨 COUNCIL ESCALATION: {slug} — Planner {planner_agent} "
+                    f"unresponsive for {elapsed_h:.1f}h (deadline {planner_deadline_h}h). "
+                    f"Council stuck in 'revising' since round {round_n}.")
+                manifest["escalation_notified"] = True
+            else:
+                print(f"  (notification already sent for this council — suppressed)")
             save_manifest(slug, manifest)
             return "escalated"
 
@@ -448,7 +502,13 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
         save_manifest(slug, manifest)
         return "revising"
 
-    # ── 4. Handle escalated status — auto-archive after 24h ──
+    # ── 4. Handle superseded status — archive immediately, no more ticks ──
+    if status == "superseded":
+        print(f"  Council superseded — archiving to stop ticks")
+        archive_manifest(slug, "superseded-archived")
+        return "archived"
+
+    # ── 5. Handle escalated status — auto-archive after 24h ──
     if status == "escalated" and escalated_at:
         escalated_dt = datetime.fromisoformat(escalated_at)
         elapsed_h = (now - escalated_dt).total_seconds() / 3600
@@ -574,13 +634,28 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
         stuck_count += 1
         manifest["stuck_count"] = stuck_count
 
-        conditions = []
+        # Historical globbing: gather conditions from ALL prior rounds too.
+        # Match both R1 (slug-reviewer.md, no -R suffix) and R2+ (slug-reviewer-RN.md).
+        all_findings = []
+        for vf_path in sorted(VERDICT_DIR.glob(f'{slug}-*.md')):
+            reviewer, vf_round = _parse_verdict_filename(vf_path.name, slug)
+            if reviewer == 'unknown':
+                continue
+            if vf_round < round_n:
+                v = parse_verdict(vf_path)
+                if v in ('FAIL', 'CONDITIONAL'):
+                    rc = extract_required_changes(vf_path)
+                    all_findings.append(f'[{reviewer}] (R{vf_round} {v}): {rc}')
+
+        # Current-round conditions
         fail_notes = {}
         for r_name, v in verdicts.items():
             vf = verdict_file(slug, r_name.upper(), round_n)
             rc = extract_required_changes(vf)
             fail_notes[r_name] = rc
-            conditions.append(f"[{r_name}] ({v}): {rc}")
+            all_findings.append(f"[{r_name}] ({v}): {rc}")
+
+        conditions = all_findings
 
         if stuck_count >= MAX_STUCK_ROUNDS:
             # 3 stuck → escalate Peter
@@ -599,16 +674,32 @@ def tick(slug: str, goal: str = "", key_finding: str = "", pattern: str = ""):
             return "stuck_escalated"
 
         # Normal revision cycle
+        print(f"\n🔄 Revision needed (stuck_count={stuck_count})")
+
+        # Revision lock: prevent concurrent planner-revision wakes
+        if manifest.get("revision_in_progress"):
+            print(f"  Revision already in progress — skipping tick")
+            return "revising"
+
+        manifest["revision_in_progress"] = True
+        manifest["revision_lock_since"] = now.isoformat()
+        save_manifest(slug, manifest)
+
+        # Wake the planner's MAIN session with the aggregated 5-reviewer conditions.
+        # No headless claude -p, no inbox poll — Peter directive 2026-06-23.
+        # The planner revises in-session and saves; next tick detects the hash
+        # change and opens a new round.
         manifest["status"] = "revising"
         manifest["revising_since"] = now.isoformat()
         manifest["history"].append({
             "round": round_n, "gate": "FAIL",
-            "fails": [r for r, v in verdicts.items() if v != "PASS"]
+            "fails": [r for r, v in verdicts.items() if v != "PASS"],
+            "revision_type": "wake"
         })
         save_manifest(slug, manifest)
-
-        print(f"\n🔄 Revision needed (stuck_count={stuck_count})")
         dispatch_planner_revision(planner_agent, slug, plan_path, conditions, round_n)
+        manifest["revision_in_progress"] = False
+        save_manifest(slug, manifest)
         return "revision_dispatched"
 
     else:

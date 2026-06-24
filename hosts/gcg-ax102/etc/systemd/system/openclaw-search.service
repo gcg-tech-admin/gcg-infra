@@ -1,0 +1,27 @@
+[Unit]
+Description=OpenClaw Agent - Search - Search Agent - Web Research & Scraping
+After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/gcg/openclaw-search
+EnvironmentFile=-/opt/gcg/shared/.env-db-secrets
+EnvironmentFile=-/opt/gcg/openclaw-search/.env
+Environment=FLEET_AGENT_NAME=search
+Environment=HOOK_AGENT_ID=search
+Environment=NODE_OPTIONS=--max-old-space-size=1024
+Environment=NODE_ENV=production
+Environment=OPENCLAW_HOME=/opt/gcg/openclaw-search/state
+Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-search/openclaw.json
+ExecStartPre=/bin/sh -c 'rm -f /opt/gcg/openclaw-search/state/.openclaw/agents/*/sessions/*.jsonl.lock'
+ExecStart=/usr/bin/openclaw gateway
+MemoryHigh=2G
+MemoryMax=4G
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

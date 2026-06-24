@@ -7,7 +7,7 @@
 
 SESSIONS=(
   "daen sub-sergei claude-opus-4-8"
-  "marcus sub-ishan claude-sonnet-4-6"
+  "marcus sub-sonja claude-sonnet-4-6"
   "kenji sub-flore claude-sonnet-4-6"
   "nik sub-sonja claude-sonnet-4-6"
   "vera sub-flore claude-sonnet-4-6"
@@ -33,7 +33,7 @@ create() {
   tmux set-option -t "$sess" history-limit 5000 2>/dev/null || true
   tmux send-keys -t "$sess" "unset ANTHROPIC_API_KEY" C-m
   sleep 0.5
-  tmux send-keys -t "$sess" "HOME=$home IS_SANDBOX=1 DISABLE_AUTOUPDATER=1 claude --model $cmodel" C-m
+  tmux send-keys -t "$sess" "HOME=$home IS_SANDBOX=1 DISABLE_AUTOUPDATER=1 claude --model $cmodel --permission-mode bypassPermissions" C-m
   logger -t gcg-claude-health "recreated $sess (profile=$profile)"
 }
 

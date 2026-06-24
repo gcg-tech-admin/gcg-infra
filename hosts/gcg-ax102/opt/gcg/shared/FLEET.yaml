@@ -29,9 +29,7 @@ restart_policy:
 model_policy:
   banned:
   - openrouter/*
-  banned_note: 'deepseek/deepseek-v4-pro MUST be called with thinking=high (FLEET-WIDE BINDING RULE 2026-05-10).
-
-    Used bare it is on banned list. openrouter/* banned fleet-wide.
+  approved_note: 'deepseek/deepseek-v4-pro APPROVED fleet-wide (Peter 2026-06-23). 1M context, cheap, fast. thinking=high recommended. Only openrouter/* is banned.
 
     '
   subagent_lanes:

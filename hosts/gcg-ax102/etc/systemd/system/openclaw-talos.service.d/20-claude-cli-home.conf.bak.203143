@@ -1,0 +1,2 @@
+[Service]
+Environment="HOME=/opt/gcg/claude-profiles/sub-pierre"

@@ -133,10 +133,14 @@ case "$AGENT" in
 esac
 
 
-# Anthropic auth-profile (api_key) into openclaw auth-profiles.json — tmpfs+symlink for zero-plaintext compliance.
+# Auth-profiles injection into openclaw auth-profiles.json — tmpfs+symlink for zero-plaintext compliance.
 # Bootstrap is single source of 1Password truth; openclaw reads merged profile at process start.
-# GATED 2026-06-16: only injected when ALLOW_ANTHROPIC_KEY is true (DEFAULT-OFF).
-if $ALLOW_ANTHROPIC_KEY && [ -n "$ANTHROPIC_KEY" ]; then
+# Non-Anthropic providers (deepseek, moonshot, google, openai) are ALWAYS injected.
+# Anthropic (api_key) is GATED 2026-06-16: only injected when ALLOW_ANTHROPIC_KEY is true (DEFAULT-OFF).
+# Fix 2026-06-23: decoupled non-Anthropic injection from ALLOW_ANTHROPIC_KEY gate — embedded subagent
+# runs use auth-profiles for provider key lookup, and a broken/missing symlink causes 401 on all
+# non-Anthropic subagent calls for claude-cli agents.
+if [ -n "$DEEPSEEK_KEY" ] || [ -n "$MOONSHOT_KEY" ] || [ -n "$GEMINI_KEY" ] || [ -n "$OPENAI_KEY" ] || ( $ALLOW_ANTHROPIC_KEY && [ -n "$ANTHROPIC_KEY" ] ); then
   for SUBAGENT in main search; do
     AGENT_DIR="/opt/gcg/openclaw-${AGENT}/state/.openclaw/agents/${SUBAGENT}/agent"
     [ -d "$AGENT_DIR" ] || continue
@@ -154,21 +158,26 @@ d['profiles'] = {k:v for k,v in d.get('profiles',{}).items() if v.get('type') !=
 open(tpl_path,'w').write(json.dumps(d, indent=2))
 PYTEMPL
     fi
-    # Build runtime auth-profiles from template + anthropic api_key
-    python3 - "$TEMPLATE" "$TMPFS_AUTH" "$ANTHROPIC_KEY" "$DEEPSEEK_KEY" "$MOONSHOT_KEY" "$GEMINI_KEY" "$OPENAI_KEY" <<'PYBUILD'
+    # Build runtime auth-profiles from template + resolved provider keys
+    python3 - "$TEMPLATE" "$TMPFS_AUTH" "$ANTHROPIC_KEY" "$DEEPSEEK_KEY" "$MOONSHOT_KEY" "$GEMINI_KEY" "$OPENAI_KEY" "$ALLOW_ANTHROPIC_KEY" <<'PYBUILD'
 import json, os, sys
-tpl, tmpfs, anth, deep, moon, gem, oai = sys.argv[1:]
+tpl, tmpfs, anth, deep, moon, gem, oai, allow_anth = sys.argv[1:]
+allow_anth = allow_anth == 'true'
 d = json.load(open(tpl)) if os.path.exists(tpl) else {'version':1,'profiles':{}}
 profs = d.setdefault('profiles',{})
+providers = []
+if allow_anth and anth:
+    providers.append(('anthropic:default', 'anthropic', anth))
 for prov_id, prov_name, key in [
-    ('anthropic:default',  'anthropic', anth),
     ('deepseek:default',   'deepseek',  deep),
     ('moonshot:default',   'moonshot',  moon),
     ('google:default',     'google',    gem),
     ('openai:default',     'openai',    oai),
 ]:
     if key:
-        profs[prov_id] = {'type': 'api_key', 'provider': prov_name, 'apiKey': key}
+        providers.append((prov_id, prov_name, key))
+for prov_id, prov_name, key in providers:
+    profs[prov_id] = {'type': 'api_key', 'provider': prov_name, 'apiKey': key}
 open(tmpfs,'w').write(json.dumps(d, indent=2))
 os.chmod(tmpfs, 0o600)
 PYBUILD
@@ -181,7 +190,7 @@ PYBUILD
       ln -s "$TMPFS_AUTH" "$TARGET"
     fi
   done
-  echo "gcg-secret-bootstrap: $AGENT anthropic profile injected (tmpfs)"
+  echo "gcg-secret-bootstrap: $AGENT auth-profiles injected (tmpfs)"
 fi
 
 echo "gcg-secret-bootstrap: $AGENT env written ($(wc -l < "$RUNTIME_DIR/env") lines)"
