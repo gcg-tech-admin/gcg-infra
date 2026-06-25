@@ -1,20 +1,24 @@
 #!/bin/bash
-# rotate-controller-v2.sh — GCG Subscription Rotator v2.1
-# Atlas, 2026-06-24 — fixed: gateway log scanning, conditional reservations
+# rotate-controller-v2.sh — GCG Subscription Rotator (Ponytail Cut)
+# Atlas, 2026-06-23
 #
 # Usage:
-#   rotate-controller-v2.sh --event-watch    # Journal + gateway log watch (30s)
-#   rotate-controller-v2.sh --status          # Status dashboard (fast)
+#   rotate-controller-v2.sh --event-watch    # Journal watch path (30s timer)
+#   rotate-controller-v2.sh --status          # Status dashboard (fast, no health)
 #   rotate-controller-v2.sh --status-full     # Status with live health checks
 #   rotate-controller-v2.sh --dry-run         # Show what would happen
 #   rotate-controller-v2.sh --scan            # Full scan + rotate
 #   rotate-controller-v2.sh --health-check    # Health check all subs
+#
+# ponytail: ONE script, ~200 lines. No YAML, no yq, no jq state mutation,
+# no separate modules. Dropins on disk ARE the state.
 
 set -euo pipefail
+# ponytail: disable pipefail globally — many helpers use grep -q which exits 1 on no match
 set +o pipefail
 
 # ═══════════════════════════════════════════════════════════════
-# CONFIG
+# CONFIG — bash arrays  # ponytail: no yaml
 # ═══════════════════════════════════════════════════════════════
 
 PROFILES_DIR="/opt/gcg/claude-profiles"
@@ -22,6 +26,7 @@ SYSTEMD_DIR="/etc/systemd/system"
 DEBOUNCE_FILE="/var/tmp/rotate.last_trigger"
 LOG_FILE="/opt/gcg/shared/docs/records/subscription-rotation-log.md"
 
+# ponytail: org map — inline associative array
 declare -A SUB_ORG
 SUB_ORG[sub-sonja]=org_a
 SUB_ORG[sub-vlada]=org_a
@@ -35,7 +40,7 @@ SUB_ORG[sub-ishan]=org_d
 SUB_ORG[sub-vanessa]=org_d
 SUB_ORG[sub-vincent]=org_d
 
-# ponytail: reserved agents only enforced when their reserved sub is HEALTHY
+# ponytail: reserved agents — MUST stay on these subs
 declare -A RESERVED_AGENT_SUB
 RESERVED_AGENT_SUB[daen]=sub-peter
 RESERVED_AGENT_SUB[talos]=sub-peter
@@ -70,6 +75,7 @@ agents_on_sub() {
         sed 's|.*/openclaw-||;s|\.service\.d/20-claude-cli-home\.conf||' | sort | tr '\n' ' '
 }
 
+# Returns: HEALTHY | DEGRADED | DEAD
 health_check() {
     local sub="$1" output has_error=0 has_healthy=0
     output=$(HOME="$PROFILES_DIR/$sub" IS_SANDBOX=1 \
@@ -88,6 +94,7 @@ health_check() {
     fi
 }
 
+# ponytail: debounce via file timestamp, not jq
 debounce_ok() {
     local now
     now=$(date +%s)
@@ -99,17 +106,8 @@ debounce_ok() {
 
 touch_debounce() { touch "$DEBOUNCE_FILE"; }
 
-is_reserved_sub_healthy() {
-    local agent="$1" reserved_sub
-    reserved_sub="${RESERVED_AGENT_SUB[$agent]:-}"
-    [ -z "$reserved_sub" ] && return 1
-    local h
-    h=$(trap - EXIT; health_check "$reserved_sub" 2>/dev/null)
-    [ "$h" = "HEALTHY" ]
-}
-
 # ═══════════════════════════════════════════════════════════════
-# CACHE
+# CACHE — health checks are slow, cache results
 # ═══════════════════════════════════════════════════════════════
 
 cache_all_subs() {
@@ -127,6 +125,7 @@ cache_all_subs() {
     done
 }
 
+# ponytail: fast cache — no health calls, just count agents
 cache_fast() {
     CACHE_DIR=$(mktemp -d /var/tmp/rotate-cache-v2.XXXXXX)
     trap "rm -rf \$CACHE_DIR" EXIT
@@ -156,6 +155,7 @@ cmd_status() {
     echo "Health checks: $mode"
     echo
 
+    # Org summaries
     echo "ORGS:"
     for org in org_a org_b org_c org_d; do
         dead=0; degraded=0; healthy=0; total=0; subs_csv=""
@@ -183,6 +183,7 @@ cmd_status() {
     done
     echo
 
+    # Subs table
     echo "SUBS:"
     printf "  %-20s %6s  %s\n" "SUB (org)" "COUNT" "AGENTS"
     printf "  %-20s %6s  %s\n" "----------" "----" "------"
@@ -214,18 +215,15 @@ find_best_target() {
         [ "$sub" = "sub-" ] && continue
         [ "$sub" = "$current_sub" ] && continue
 
+        # ponytail: skip same-org if current sub is DEAD (prevent cascade)
         if [ "$cur_health" = "DEAD" ] && [ "$(org_of "$sub")" = "$current_org" ]; then
             continue
         fi
 
-        # ponytail: reserved subs only enforce when the agent IS reserved AND the sub IS healthy
+        # ponytail: skip reserved subs (unless this agent IS reserved to it)
         if echo "$RESERVED_SUBS" | grep -qw "$sub"; then
-            if [ -n "${RESERVED_AGENT_SUB[$agent]:-}" ] && \
-               [ "${RESERVED_AGENT_SUB[$agent]}" = "$sub" ] && \
-               [ "$(cat "$CACHE_DIR/$sub.health" 2>/dev/null)" = "HEALTHY" ]; then
-                # Agent is reserved to this sub AND sub is healthy — prefer it but don't force
-                :
-            else
+            if [ -z "${RESERVED_AGENT_SUB[$agent]:-}" ] || \
+               [ "${RESERVED_AGENT_SUB[$agent]}" != "$sub" ]; then
                 continue
             fi
         fi
@@ -235,6 +233,7 @@ find_best_target() {
 
         cnt=$(cat "$CACHE_DIR/$sub.count" 2>/dev/null || echo "99")
         score=$cnt
+        # ponytail: penalty for degraded org
         [ "$h" = "DEGRADED" ] && score=$((cnt + 10))
 
         if [ "$score" -lt "$best_score" ]; then
@@ -263,17 +262,21 @@ rotate_agent() {
         return 0
     fi
 
+    # Backup
     cp "$dropin" "$dropin.bak.$(date +%Y%m%d-%H%M)" || return 1
 
+    # Write new dropin
     cat > "$dropin" << EOF
 [Service]
 Environment=HOME=$PROFILES_DIR/$new_sub
 Environment=IS_SANDBOX=1
 EOF
 
+    # Reload + restart
     systemctl daemon-reload
     systemctl kill -s SIGTERM "openclaw-${agent}" 2>/dev/null || true
 
+    # Wait for restart
     local i
     for i in $(seq 1 30); do
         sleep 2
@@ -292,7 +295,6 @@ EOF
 
 log_rotation() {
     local agent="$1" old_sub="$2" new_sub="$3" reason="$4"
-    mkdir -p "$(dirname "$LOG_FILE")"
     echo "| $(date -u +"%Y-%m-%dT%H:%M:%SZ") | $agent | $old_sub | $new_sub | v2 | $reason | ✅ |" >> "$LOG_FILE"
 }
 
@@ -321,20 +323,9 @@ cmd_scan() {
         while read -r agent; do
             [ -z "$agent" ] && continue
 
-            # ponytail: reserved agents only auto-move if their reserved sub is dead
+            # ponytail: reserved agents never auto-move
             if echo "$RESERVED_AGENTS" | grep -qw "$agent"; then
-                if is_reserved_sub_healthy "$agent"; then
-                    echo "    SKIP $agent (reserved on ${RESERVED_AGENT_SUB[$agent]} — sub is HEALTHY)"
-                else
-                    echo "    ⚠️ $agent reserved to ${RESERVED_AGENT_SUB[$agent]} but it is DEAD — attempting fallback rotation"
-                    new_sub=$(find_best_target "$sub" "$agent")
-                    if [ -z "$new_sub" ]; then
-                        echo "    ❌ $agent: no healthy target available (including reserved sub)"
-                        continue
-                    fi
-                    log_rotation "$agent" "$sub" "$new_sub" "reserved_sub_dead"
-                    rotate_agent "$agent" "$new_sub"
-                fi
+                echo "    SKIP $agent (reserved on ${RESERVED_AGENT_SUB[$agent]}) → ALERT"
                 continue
             fi
 
@@ -353,7 +344,7 @@ cmd_scan() {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# EVENT WATCH — v2.1: scan BOTH journald AND gateway logs
+# EVENT WATCH (30s timer → journald scan)
 # ═══════════════════════════════════════════════════════════════
 
 cmd_event_watch() {
@@ -366,39 +357,21 @@ cmd_event_watch() {
         exit 0
     fi
 
-    local found=0 errors=""
-
-    # Source 1: systemd journal (OpenClaw stdout/stderr)
+    # ponytail: set +e around grep to avoid pipefail triggering on no-matches
+    local errors=""
     set +e
     errors=$(journalctl -S "60 seconds ago" --no-pager \
         -u 'openclaw-*' 2>/dev/null | \
-        grep -iE "rate.limit|spend.cap|spend limit|429|organization.*disabled|billing|session.limit|insufficient.*quota" | \
+        grep -iE "rate.limit|spend.cap|429|organization.*disabled|billing" | \
         head -5)
     set -e
-    [ -n "$errors" ] && found=1
 
-    # Source 2: gateway logs (scan ALL agent gateway logs each tick; debounce already protects)
-    set +e
-    local gw_errors=""
-    for logfile in /opt/gcg/openclaw-*/logs/gateway.log; do
-        [ -f "$logfile" ] || continue
-        local hits
-        hits=$(grep -iE "spend.limit|spend limit|rate.limit|429|billing|organization.*disabled|session.limit|insufficient.*quota" "$logfile" 2>/dev/null | tail -5)
-        [ -n "$hits" ] && gw_errors="${gw_errors}${hits}
-"
-    done
-    set -e
-    if [ -n "$gw_errors" ]; then
-        found=1
-        errors="${errors}${gw_errors}"
-    fi
-
-    if [ "$found" -eq 0 ]; then
+    if [ -z "$errors" ]; then
         exit 0
     fi
 
     touch_debounce
-    echo "[watch $(date)] spend/rate/billing errors detected (journal + gateway logs) → triggering scan"
+    echo "[watch $(date)] rate/spend errors in journal → triggering scan"
     cmd_scan
 }
 
@@ -406,6 +379,7 @@ cmd_event_watch() {
 # OTHER COMMANDS
 # ═══════════════════════════════════════════════════════════════
 
+# ponytail: dry-run does full health + scan, that's the point
 cmd_dry_run() {
     export DRY_RUN=true
     echo "=== DRY RUN (will show all decisions without executing) ==="

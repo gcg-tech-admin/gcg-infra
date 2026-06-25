@@ -377,16 +377,13 @@ cmd_event_watch() {
     set -e
     [ -n "$errors" ] && found=1
 
-    # Source 2: gateway logs (scan ALL agent gateway logs each tick; debounce already protects)
+    # Source 2: gateway logs (where Claude CLI spend cap errors actually appear)
     set +e
     local gw_errors=""
-    for logfile in /opt/gcg/openclaw-*/logs/gateway.log; do
-        [ -f "$logfile" ] || continue
-        local hits
-        hits=$(grep -iE "spend.limit|spend limit|rate.limit|429|billing|organization.*disabled|session.limit|insufficient.*quota" "$logfile" 2>/dev/null | tail -5)
-        [ -n "$hits" ] && gw_errors="${gw_errors}${hits}
-"
-    done
+    gw_errors=$(find /opt/gcg/openclaw-*/logs -name "gateway.log" -newer /var/tmp/rotate.last_trigger 2>/dev/null | \
+        while read -r logfile; do
+            grep -iE "spend.limit|spend limit|rate.limit|429|billing|organization.*disabled|session.limit|insufficient.*quota" "$logfile" 2>/dev/null
+        done | head -10)
     set -e
     if [ -n "$gw_errors" ]; then
         found=1

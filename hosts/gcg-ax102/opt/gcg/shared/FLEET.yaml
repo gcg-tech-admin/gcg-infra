@@ -490,12 +490,12 @@ agents:
     port: 19350
     workspace: /opt/gcg/openclaw-angela/workspace
     agents_md: /opt/gcg/openclaw-angela/workspace/AGENTS.md
-    model_primary: claude-cli/claude-sonnet-4-6
+    model_primary: anthropic/claude-opus-4-8
     model_fallbacks:
     - deepseek/deepseek-v4-pro
     - moonshot/kimi-k2.6
     - google/gemini-3.5-flash
-    expected_model_primary: claude-cli/claude-sonnet-4-6
+    expected_model_primary: anthropic/claude-opus-4-8
     heartbeat:
       every: 1h
       model: deepseek/deepseek-v4-flash

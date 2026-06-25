@@ -1,0 +1,24 @@
+[Unit]
+Description=GCG Beeper Communications Ingestor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n /var/lock/gcg-comms-ingest.lock /usr/bin/python3 /opt/gcg/shared/scripts/communications_ingestor.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gcg-comms-ingest
+User=root
+Group=root
+
+# Security hardening
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/gcg/shared/state /opt/gcg/shared/logs /var/lock
+ReadOnlyPaths=/opt/gcg/shared/scripts /opt/gcg/shared/gcg_tools /opt/gcg/shared/credentials /opt/gcg/shared/secrets
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
