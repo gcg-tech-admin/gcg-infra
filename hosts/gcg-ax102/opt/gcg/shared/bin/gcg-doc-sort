@@ -51,26 +51,32 @@ DOCS_ROOT = Path("/opt/gcg/shared/docs")
 HANDOFFS_ROOT = Path("/opt/gcg/shared/handoffs")
 ARCHIVED_ROOT = DOCS_ROOT / "_archived"
 
-# Canonical buckets per DOC_ONTOLOGY_CANONICAL §2
-BUCKETS = ("architecture", "reference", "handoffs", "reviews")
+# Canonical buckets per DOC_ONTOLOGY_CANONICAL.md v2.0 (2026-05-23)
+BUCKETS = ("architecture", "reference", "decisions", "record", "plans", "handoffs")
 
-# Source-subdir → target-bucket map (per canonical §4)
+# Source-subdir → target-bucket map (per canonical v2.0 §2)
 SUBDIR_MAP = {
-    "architecture":  ("architecture", None),
-    "reference":     ("reference",    None),
-    "compliance":    ("reference",    "compliance"),
-    "council":       ("architecture", "council"),
-    "decisions":     ("architecture", "decision"),
-    "fleet":         ("architecture", "agent-fleet"),  # default; per-doc may override
-    "guides":        ("reference",    None),
-    "playbooks":     ("reference",    None),
-    "proposals":     ("architecture", "proposal"),
-    "research":      ("reference",    "research"),
-    "rollback_refs": ("reference",    "rollback"),
-    "runbooks":      ("reference",    None),
-    "sops":          ("reference",    None),
-    "strategies":    ("architecture", None),
-    "reviews":       ("reviews",      None),
+    # Canonical v2.0 buckets — self-mapping
+    "architecture":          ("architecture", None),
+    "reference":             ("reference",    None),
+    "decisions":             ("decisions", "decision"),
+    "record":                ("record",       None),
+    "plans":                 ("plans",        None),
+    # Active project bucket
+    "superapp-data-model":   ("architecture", "superapp"),
+    # Deprecated dirs — migration targets
+    "compliance":            ("reference",    "compliance"),
+    "council":               ("decisions",    "council"),
+    "fleet":                 ("architecture", "agent-fleet"),
+    "guides":                ("reference",    None),
+    "playbooks":             ("reference",    None),
+    "proposals":             ("plans", "proposal"),
+    "research":              ("record",       "research"),
+    "rollback_refs":         ("reference",    "rollback"),
+    "runbooks":              ("reference",    None),
+    "sops":                  ("reference",    None),
+    "strategies":            ("plans",        None),
+    "reviews":               ("record",       None),
 }
 
 # Top-level handoffs dir (separate from docs/)
