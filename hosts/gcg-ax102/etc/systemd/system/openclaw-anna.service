@@ -14,7 +14,7 @@ WorkingDirectory=/opt/gcg/openclaw-anna
 EnvironmentFile=/opt/gcg/openclaw-anna/.env
 Environment=OPENCLAW_CONFIG_PATH=/opt/gcg/openclaw-anna/openclaw.json
 Environment=OPENCLAW_STATE_DIR=/opt/gcg/openclaw-anna/state
-Environment=NODE_OPTIONS=--max-old-space-size=2048
+Environment=NODE_OPTIONS=--max-old-space-size=5120
 ExecStartPre=/usr/bin/python3 /opt/gcg/shared/scripts/validate-agent-config.py /opt/gcg/openclaw-anna/openclaw.json
 ExecStart=/usr/bin/openclaw gateway
 ExecStopPost=/opt/gcg/shared/scripts/session-pre-stop-flush.sh

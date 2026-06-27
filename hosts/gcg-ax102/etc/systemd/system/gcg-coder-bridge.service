@@ -6,7 +6,7 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/gcg/shared/bin/gcg-coder-bridge
+ExecStart=/opt/gcg/shared/bin/gcg-coder-bridge coder-sonnet
 Restart=always
 RestartSec=5
 # State persists in /var/lib/gcg-coder-bridge (survives service restart)
